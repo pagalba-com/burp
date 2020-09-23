@@ -1,15 +1,26 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "log.h"
+#include "sbuf.h"
+#include "slist.h"
+#include "protocol2/blist.h"
 
 struct slist *slist_alloc(void)
 {
-	return (struct slist *)calloc_w(1, sizeof(struct slist), __func__);
+	struct slist *slist=NULL;
+	if(!(slist=(struct slist *)calloc_w(1, sizeof(struct slist), __func__))
+	  || !(slist->blist=blist_alloc()))
+		slist_free(&slist);
+	return slist;
 }
 
 void slist_free(struct slist **slist)
 {
 	struct sbuf *sb;
 	struct sbuf *shead;
-	if(!slist || !*slist) return;
+	if(!slist || !*slist)
+		return;
+	blist_free(&(*slist)->blist);
 	shead=(*slist)->head;
 	while(shead)
 	{
@@ -29,10 +40,14 @@ void slist_add_sbuf(struct slist *slist, struct sbuf *sb)
 		slist->tail=sb;
 		// Markers might have fallen off the end. Start them again
 		// on the tail.
-		if(!slist->last_requested) slist->last_requested=slist->tail;
-		if(!slist->add_sigs_here) slist->add_sigs_here=slist->tail;
-		if(!slist->blks_to_request) slist->blks_to_request=slist->tail;
-		if(!slist->blks_to_send) slist->blks_to_send=slist->tail;
+		if(!slist->last_requested)
+			slist->last_requested=slist->tail;
+		if(!slist->add_sigs_here)
+			slist->add_sigs_here=slist->tail;
+		if(!slist->blks_to_request)
+			slist->blks_to_request=slist->tail;
+		if(!slist->blks_to_send)
+			slist->blks_to_send=slist->tail;
 	}
 	else
 	{
@@ -46,4 +61,89 @@ void slist_add_sbuf(struct slist *slist, struct sbuf *sb)
 		slist->blks_to_request=sb;
 		slist->blks_to_send=sb;
 	}
+	slist->count++;
+}
+
+static void adjust_dropped_markers(struct slist *slist, struct sbuf *sb)
+{
+        if(sb==slist->tail)
+		slist->tail=sb->next;
+        if(sb==slist->last_requested)
+		slist->last_requested=sb->next;
+        if(sb==slist->add_sigs_here)
+		slist->add_sigs_here=sb->next;
+        if(sb==slist->blks_to_request)
+		slist->blks_to_request=sb->next;
+        if(sb==slist->blks_to_send)
+		slist->blks_to_send=sb->next;
+}
+
+int slist_del_sbuf(struct slist *slist, struct sbuf *sb)
+{
+	struct sbuf *s;
+	if(!slist)
+		return 0;
+	if(sb->protocol2->bstart
+	  || sb->protocol2->bend
+	  || sb->protocol2->bsighead)
+	{
+		logp("Cannot delete sbuf with blk markers: %s\n",
+			iobuf_to_printable(&sb->path));
+		return -1;
+	}
+
+	if(slist->head==sb)
+	{
+		// There is one entry in the list.
+		slist->head=slist->head->next;
+		slist->count--;
+	}
+	else
+	{
+		for(s=slist->head; s; s=s->next)
+		{
+			if(s->next!=sb) continue;
+			s->next=sb->next;
+			if(!sb->next)
+				slist->tail=s;
+			slist->count--;
+			break;
+		}
+	}
+
+        // It is possible for the markers to drop behind.
+	adjust_dropped_markers(slist, sb);
+
+	return 0;
+}
+
+int slist_del_sbuf_by_index(struct slist *slist, uint64_t index)
+{
+	struct sbuf *sb;
+	for(sb=slist->head; sb; sb=sb->next)
+	{
+		if(sb->protocol2->index==index)
+		{
+			if(slist_del_sbuf(slist, sb))
+				return -1;
+			sbuf_free(&sb);
+			break;
+		}
+	}
+	return 0;
+}
+
+void slist_advance(struct slist *slist)
+{
+	struct sbuf *sb;
+	sb=slist->head;
+
+        // It is possible for the markers to drop behind.
+	adjust_dropped_markers(slist, sb);
+
+	slist->head=sb->next;
+
+	slist->count--;
+
+	sbuf_free(&sb);
 }

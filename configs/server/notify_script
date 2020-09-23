@@ -12,7 +12,7 @@ basedir="$1" ; shift
 storagedir="$1" ; shift
 file="$1" ; shift
 brv="$1" ; shift # one of backup/restore/verify/delete/list/unknown
-warnings="$1" ; shift
+warning_count="$1" ; shift
 
 # Arguments given by the user in the conf files come next.
 sendmail="$1" ; shift
@@ -24,8 +24,8 @@ while [ "$#" -gt 0 ] ; do
 	case "$1" in
 		Subject:*)
 			w=""
-			[ -n "$warnings" -a "$warnings" != "0" ] \
-				&& w="($warnings warnings)"
+			[ -n "$warning_count" -a "$warning_count" != "0" ] \
+				&& w="($warning_count warnings)"
 			h="$1"
 			h="${h//%c/$client}"
 			h="${h//%w/$w}"
@@ -69,7 +69,8 @@ elif [ -z "$log" ] ; then
   echo "$headers" && echo && echo "No log found to send in email" | $sendmail
 else
   # The normal case.
-  (echo "$headers" && echo && echo "$id" && echo && echo "$log:" && echo && ($catcmd "$log" 2>/dev/null || cat "$log")) | $sendmail
+  maximum_line_count=1000
+  (echo "$headers" && echo && echo "$id" && echo && echo "Last $maximum_line_count lines of $log:" && echo && ($catcmd "$log" 2>/dev/null || cat "$log") | tail -n "$maximum_line_count") | $sendmail
 fi
 
 exit 0

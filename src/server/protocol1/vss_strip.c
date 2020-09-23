@@ -7,20 +7,9 @@ static const char *prog=NULL;
        __typeof__ (b) _b = (b); \
      _a < _b ? _a : _b; })
 
-// This is the shape of the Windows VSS header structure.
-// It is size 20. Using sizeof(struct bsid) seems to give 24, I guess due to
-// some alignment issue.
-struct bsid {
-        int dwStreamId;
-        int dwStreamAttributes;
-        long Size;
-        int dwStreamNameSize;
-};
-#define bsidsize        20
-
 static void dump_sid(struct bsid *sid)
 {
-	printf("VSS header: %d %d %li %d\n",
+	printf("VSS header: %d %d %" PRId64 " %d\n",
         	sid->dwStreamId,
         	sid->dwStreamAttributes,
         	sid->Size,
@@ -139,7 +128,7 @@ static int main_work(FILE *inp, FILE *outp)
 	return 0;
 }
 
-static void usage()
+static void usage(void)
 {
 	fprintf(stderr, "\n");
 	fprintf(stderr, "usage: %s [options]\n", prog);

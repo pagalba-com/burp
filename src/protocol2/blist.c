@@ -1,4 +1,7 @@
-#include "include.h"
+#include "../burp.h"
+#include "blist.h"
+#include "blk.h"
+#include "../alloc.h"
 
 struct blist *blist_alloc(void)
 {

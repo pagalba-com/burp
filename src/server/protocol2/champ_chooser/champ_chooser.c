@@ -1,36 +1,123 @@
-#include "include.h"
+#include "../../../burp.h"
+#include "../../../alloc.h"
+#include "../../../asfd.h"
+#include "../../../lock.h"
+#include "../../../log.h"
+#include "../../../prepend.h"
+#include "../../../protocol2/blist.h"
+#include "../../../protocol2/blk.h"
+#include "candidate.h"
+#include "champ_chooser.h"
+#include "hash.h"
+#include "incoming.h"
+#include "scores.h"
+#include "sparse.h"
 
-int champ_chooser_init(const char *datadir, struct conf **confs)
+static void try_lock_msg(int seconds)
+{
+	logp("Unable to get sparse lock for %d seconds.\n", seconds);
+}
+
+static int try_to_get_lock(struct lock *lock)
+{
+	// Sleeping for 1800*2 seconds makes 1 hour.
+	// This should be super generous.
+	int lock_tries=0;
+	int lock_tries_max=1800;
+	int sleeptime=2;
+
+	while(1)
+	{
+		lock_get(lock);
+		switch(lock->status)
+		{
+			case GET_LOCK_GOT:
+				logp("locked: sparse index\n");
+				return 0;
+			case GET_LOCK_NOT_GOT:
+				lock_tries++;
+				if(lock_tries>lock_tries_max)
+				{
+					try_lock_msg(lock_tries_max*sleeptime);
+					logp("Giving up.\n");
+					return -1;
+				}
+				// Log every 10 seconds.
+				if(lock_tries%(10/sleeptime))
+				{
+					try_lock_msg(lock_tries*sleeptime);
+				}
+				sleep(sleeptime);
+				continue;
+			case GET_LOCK_ERROR:
+			default:
+				logp("Unable to get global sparse lock.\n");
+				return -1;
+		}
+	}
+	// Never reached.
+	return -1;
+}
+
+struct lock *try_to_get_sparse_lock(const char *sparse_path)
+{
+	char *lockfile=NULL;
+	struct lock *lock=NULL;
+	if(!(lockfile=prepend_n(sparse_path, "lock", strlen("lock"), "."))
+	  || !(lock=lock_alloc_and_init(lockfile))
+	  || try_to_get_lock(lock))
+		lock_free(&lock);
+	free_w(&lockfile);
+	return lock;
+}
+
+static int load_existing_sparse(const char *datadir, struct scores *scores)
 {
 	int ret=-1;
 	struct stat statp;
+	struct lock *lock=NULL;
 	char *sparse_path=NULL;
-
-	// FIX THIS: scores is a global variable.
-	if(!scores && !(scores=scores_alloc())) goto end;
-
 	if(!(sparse_path=prepend_s(datadir, "sparse"))) goto end;
+	// Best not let other things mess with the sparse lock while we are
+	// trying to read it.
+	if(!(lock=try_to_get_sparse_lock(sparse_path)))
+		goto end;
 	if(lstat(sparse_path, &statp))
 	{
 		ret=0;
 		goto end;
 	}
-	ret=candidate_load(NULL, sparse_path, confs);
+	if(candidate_load(NULL, sparse_path, scores))
+		goto end;
+	ret=0;
 end:
-	if(sparse_path) free(sparse_path);
+	free_w(&sparse_path);
+	lock_release(lock);
+	lock_free(&lock);
 	return ret;
 }
 
-#define HOOK_MASK	0xF000000000000000
-
-int is_hook(uint64_t fingerprint)
+struct scores *champ_chooser_init(const char *datadir)
 {
-	return (fingerprint&HOOK_MASK)==HOOK_MASK;
+	struct scores *scores=NULL;
+	if(!(scores=scores_alloc())
+	  || load_existing_sparse(datadir, scores))
+		goto error;
+	return scores;
+error:
+	scores_free(&scores);
+	return NULL;
+}
+
+void champ_chooser_free(struct scores **scores)
+{
+	candidates_free();
+	sparse_delete_all();
+	scores_free(scores);
 }
 
 static int already_got_block(struct asfd *asfd, struct blk *blk)
 {
-	//static char *path;
 	static struct hash_weak *hash_weak;
 
 	// If already got, need to overwrite the references.
@@ -40,8 +127,7 @@ static int already_got_block(struct asfd *asfd, struct blk *blk)
 		if((hash_strong=hash_strong_find(
 			hash_weak, blk->md5sum)))
 		{
-			memcpy(blk->savepath,
-				hash_strong->savepath, SAVE_PATH_LEN);
+			blk->savepath=hash_strong->savepath;
 //printf("FOUND: %s %s\n", blk->weak, blk->strong);
 //printf("F");
 			blk->got=BLK_GOT;
@@ -62,7 +148,7 @@ static int already_got_block(struct asfd *asfd, struct blk *blk)
 
 #define CHAMPS_MAX 10
 
-int deduplicate(struct asfd *asfd, struct conf **confs)
+int deduplicate(struct asfd *asfd, const char *directory, struct scores *scores)
 {
 	struct blk *blk;
 	struct incoming *in=asfd->in;
@@ -75,12 +161,22 @@ int deduplicate(struct asfd *asfd, struct conf **confs)
 
 	incoming_found_reset(in);
 	count=0;
-	while((champ=candidates_choose_champ(in, champ_last)))
+	while(count!=CHAMPS_MAX
+	  && (champ=candidates_choose_champ(in, champ_last, scores)))
 	{
 //		printf("Got champ: %s %d\n", champ->path, *(champ->score));
-		if(hash_load(champ->path, confs)) return -1;
-		if(++count==CHAMPS_MAX) break;
-		champ_last=champ;
+		switch(hash_load(champ->path, directory))
+		{
+			case HASH_RET_OK:
+				count++;
+				champ_last=champ;
+				break;
+			case HASH_RET_PERM:
+				return -1;
+			case HASH_RET_TEMP:
+				champ->deleted=1;
+				break;
+		}
 	}
 
 	blk_count=0;
@@ -104,9 +200,8 @@ int deduplicate(struct asfd *asfd, struct conf **confs)
 //printf("after agb: %lu %d\n", blk->index, blk->got);
 	}
 
-	logp("%s: %04d/%04d - %04d/%04d\n",
+	logp("%s: %04d/%04zu - %04d/%04d\n",
 		asfd->desc, count, candidates_len, in->got, blk_count);
-	//cntr_add_same_val(get_cntr(confs[OPT_CNTR]), CMD_DATA, in->got);
 
 	// Start the incoming array again.
 	in->size=0;

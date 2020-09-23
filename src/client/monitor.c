@@ -1,12 +1,23 @@
-#include "include.h"
+#include "../burp.h"
+#include "../asfd.h"
+#include "../async.h"
+#include "../conf.h"
 #include "../cmd.h"
+#include "../iobuf.h"
+#include "../log.h"
+#include "monitor.h"
 
 static int copy_input_to_output(struct asfd *in, struct asfd *out)
 {
-	return out->write_strn(out, CMD_GEN, in->rbuf->buf, in->rbuf->len);
+	struct iobuf wbuf;
+	iobuf_set(&wbuf, CMD_GEN, in->rbuf->buf, in->rbuf->len);
+	return out->write(out, &wbuf);
 }
 
-static int main_loop(struct async *as, struct conf **confs)
+#ifndef UTEST
+static
+#endif
+int monitor_client_main_loop(struct async *as)
 {
 	struct asfd *asfd;
 	struct asfd *sfd; // Server fd.
@@ -47,26 +58,22 @@ static int main_loop(struct async *as, struct conf **confs)
 	}
 
 error:
-	// FIX THIS: should probably be freeing a bunch of stuff here.
 	return -1;
 }
 
-int do_monitor_client(struct asfd *asfd, struct conf **confs)
+int do_monitor_client(struct asfd *asfd)
 {
 	int ret=-1;
 	struct async *as=asfd->as;
-	int stdinfd=fileno(stdin);
-	int stdoutfd=fileno(stdout);
 logp("in monitor\n");
+
 	// I tried to just printf to stdout, but the strings to print would be
 	// so long that I would start to get printf errors.
 	// Using the asfd stuff works well though.
-	if(!setup_asfd(as, "stdin", &stdinfd, NULL, ASFD_STREAM_LINEBUF,
-		ASFD_FD_CLIENT_MONITOR_READ, -1, confs)
-	  || !setup_asfd(as, "stdout", &stdoutfd, NULL, ASFD_STREAM_LINEBUF,
-		ASFD_FD_CLIENT_MONITOR_WRITE, -1, confs))
+	if(!setup_asfd_stdin(as)
+	 || !setup_asfd_stdout(as))
 		goto end;
-	ret=main_loop(as, confs);
+	ret=monitor_client_main_loop(as);
 end:
 	return ret;
 }

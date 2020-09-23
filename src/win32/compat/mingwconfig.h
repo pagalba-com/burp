@@ -23,8 +23,8 @@
 /* Define if you have GCC */
 #define HAVE_GCC 1
 
-/* Define to 1 if utime.h exists and declares struct utimbuf.  */
-#define HAVE_UTIME_H 1
+/* Define to 1 if struct utimbuf exists.  */
+#define HAVE_STRUCT_UTIMBUF 1
 
 /* Data types */
 #define HAVE_U_INT 1
@@ -67,6 +67,9 @@
 
 /* Define to 1 if you have `alloca', as a function or macro. */
 #define HAVE_ALLOCA 1
+
+/* Define to 1 if librsync supports RS_BLAKE2_SIG_MAGIC */
+#define HAVE_BLAKE2 1
 
 /* Define to 1 if you have the <dirent.h> header file, and it defines `DIR'.
    */
@@ -126,9 +129,6 @@
 
 /* Define to 1 if you have the <pwd.h> header file. */
 /*#define HAVE_PWD_H 1*/
-
-/* Define to 1 if you have the `readdir_r' function. */
-/* #undef HAVE_READDIR_R */
 
 /* Define to 1 if you have the <resolv.h> header file. */
 /*#define HAVE_RESOLV_H 1*/
@@ -311,21 +311,6 @@
 
 /* Define to 1 if your C compiler doesn't accept -c and -o together. */
 /* #undef NO_MINUS_C_MINUS_O */
-
-/* Define to the address where bug reports for this package should be sent. */
-#define PACKAGE_BUGREPORT ""
-
-/* Define to the full name of this package. */
-#define PACKAGE_NAME ""
-
-/* Define to the full name and version of this package. */
-#define PACKAGE_STRING ""
-
-/* Define to the one symbol short name of this package. */
-#define PACKAGE_TARNAME ""
-
-/* Define to the version of this package. */
-#define PACKAGE_VERSION ""
 
 /* Define as the return type of signal handlers (`int' or `void'). */
 #define RETSIGTYPE void

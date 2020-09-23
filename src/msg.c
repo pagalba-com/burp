@@ -1,5 +1,12 @@
-#include "include.h"
+#include "burp.h"
+#include "asfd.h"
+#include "async.h"
+#include "bfile.h"
 #include "cmd.h"
+#include "fzp.h"
+#include "iobuf.h"
+#include "log.h"
+#include "msg.h"
 
 int send_msg_fzp(struct fzp *fzp, enum cmd cmd, const char *buf, size_t s)
 {
@@ -13,14 +20,14 @@ int send_msg_fzp(struct fzp *fzp, enum cmd cmd, const char *buf, size_t s)
 	return 0;
 }
 
-static int do_write(struct asfd *asfd, BFILE *bfd,
-	uint8_t *out, size_t outlen, unsigned long long *sent)
+static int do_write(struct asfd *asfd, struct BFILE *bfd,
+	uint8_t *out, size_t outlen, uint64_t *sent)
 {
 	int ret=0;
 	if((ret=bfd->write(bfd, out, outlen))<=0)
 	{
-		logp("%s: error when appending %d: %d\n",
-			__func__, outlen, ret);
+		logp("%s: error when appending %lu: %d\n",
+			__func__, (unsigned long)outlen, ret);
 		asfd->write_str(asfd, CMD_ERROR, "write failed");
 		return -1;
 	}
@@ -28,8 +35,8 @@ static int do_write(struct asfd *asfd, BFILE *bfd,
 	return 0;
 }
 
-static int do_inflate(struct asfd *asfd, z_stream *zstrm, BFILE *bfd,
-	uint8_t *out, unsigned long long *sent)
+static int do_inflate(struct asfd *asfd, z_stream *zstrm, struct BFILE *bfd,
+	uint8_t *out, uint64_t *sent)
 {
 	int zret=Z_OK;
 	unsigned have=0;
@@ -61,8 +68,8 @@ static int do_inflate(struct asfd *asfd, z_stream *zstrm, BFILE *bfd,
 	return 0;
 }
 
-int transfer_gzfile_in(struct asfd *asfd, const char *path, BFILE *bfd,
-	unsigned long long *rcvd, unsigned long long *sent, struct conf **confs)
+int transfer_gzfile_in(struct asfd *asfd, struct BFILE *bfd,
+	uint64_t *rcvd, uint64_t *sent)
 {
 	int quit=0;
 	int ret=-1;
@@ -88,7 +95,7 @@ int transfer_gzfile_in(struct asfd *asfd, const char *path, BFILE *bfd,
 		if(asfd->read(asfd)) goto end_inflate;
 		(*rcvd)+=rbuf->len;
 
-		//logp("transfer in: %c:%s\n", rbuf->cmd, rbuf->buf);
+		//logp("transfer in: %s\n", iobuf_to_printable(rbuf));
 		switch(rbuf->cmd)
 		{
 			case CMD_APPEND: // append
@@ -110,8 +117,11 @@ int transfer_gzfile_in(struct asfd *asfd, const char *path, BFILE *bfd,
 				goto end_ok;
 			case CMD_MESSAGE:
 			case CMD_WARNING:
-				log_recvd(rbuf, confs, 0);
+			{
+				struct cntr *cntr=NULL;
+				log_recvd(rbuf, cntr, 0);
 				break;
+			}
 			default:
 				iobuf_log_unexpected(rbuf, __func__);
 				goto end_inflate;

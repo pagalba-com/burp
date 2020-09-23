@@ -1,6 +1,8 @@
 #ifndef __DPTH_H
 #define __DPTH_H
 
+#include "../burp.h"
+
 // ext3 maximum number of subdirs is 32000, so leave a little room.
 #define MAX_STORAGE_SUBDIRS	30000
 
@@ -15,20 +17,22 @@ struct dpth_lock
 
 struct dpth
 {
-	// Protocol 1 only uses these.
-	uint16_t prim;
-	uint16_t seco;
-	uint16_t tert;
+	union
+	{
+		uint16_t comp[4];
+		uint64_t savepath;
+	};
 
-	// Protocol 2 also uses these.
-	uint16_t sig;
 	char *base_path;
 	// Whether we need to lock another data file.
 	uint8_t need_data_lock;
 	int max_storage_subdirs;
 	// Currently open data file. Only one is open at a time, while many
 	// may be locked.
-	FILE *fp;
+	struct fzp *fzp;
+	// For keeping track of files that were created, in case the backup
+	// is interrupted and cleanup is required.
+	struct fzp *cfile_fzp;
 	// List of locked data files. 
 	struct dpth_lock *head;
 	struct dpth_lock *tail;

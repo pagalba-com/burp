@@ -1,6 +1,16 @@
-#include "include.h"
+#include "../burp.h"
+#include "../action.h"
+#include "../asfd.h"
+#include "../async.h"
+#include "../cntr.h"
+#include "../conf.h"
+#include "../handy.h"
+#include "../log.h"
+#include "backup_phase1.h"
+#include "cvss.h"
 #include "protocol1/backup_phase2.h"
 #include "protocol2/backup_phase2.h"
+#include "backup.h"
 
 #ifdef HAVE_WIN32
 static void set_priority(int priority, const char *str)
@@ -37,13 +47,14 @@ int do_backup_client(struct asfd *asfd, struct conf **confs, enum action action,
 	int resume)
 {
 	int ret=-1;
+	int breaking=get_int(confs[OPT_BREAKPOINT]);
 
 	if(action==ACTION_ESTIMATE)
 		logp("do estimate client\n");
 	else
 	{
 		logp("do backup client\n");
-		if(get_e_protocol(confs[OPT_PROTOCOL])==PROTO_1)
+		if(get_protocol(confs)==PROTO_1)
 			logp("Using librsync hash %s\n",
 			  rshash_to_str(get_e_rshash(confs[OPT_RSHASH])));
 	}
@@ -51,7 +62,11 @@ int do_backup_client(struct asfd *asfd, struct conf **confs, enum action action,
 #ifdef HAVE_WIN32
 	win32_enable_backup_privileges();
 #ifdef WIN32_VSS
-	if(win32_start_vss(confs)) return ret;
+	if(win32_start_vss(asfd, confs))
+	{
+		log_and_send(asfd, "Problem with VSS\n");
+		return ret;
+	}
 #endif
 	if(action==ACTION_BACKUP_TIMED) set_low_priority();
 #endif
@@ -60,12 +75,12 @@ int do_backup_client(struct asfd *asfd, struct conf **confs, enum action action,
 	// Skip phase1 if the server wanted to resume.
 	if(!resume)
 	{
-		if(get_int(confs[OPT_BREAKPOINT])==1)
+		if(breaking==1)
 		{
-			breakpoint(confs, __func__);
+			breakpoint(breaking, __func__);
 			goto end;
 		}
-		if(backup_phase1_client(asfd, confs, action==ACTION_ESTIMATE))
+		if(backup_phase1_client(asfd, confs))
 			goto end;
 	}
 
@@ -76,18 +91,18 @@ int do_backup_client(struct asfd *asfd, struct conf **confs, enum action action,
 			ret=1;
 			goto end;
 		case ACTION_ESTIMATE:
-			cntr_print(get_cntr(confs[OPT_CNTR]), ACTION_ESTIMATE);
+			cntr_print(get_cntr(confs), ACTION_ESTIMATE);
 			break;
 		default:
 			// Now, the server will be telling us what data we need
 			// to send.
-			if(get_int(confs[OPT_BREAKPOINT])==2)
+			if(breaking==2)
 			{
-				breakpoint(confs, __func__);
+				breakpoint(breaking, __func__);
 				goto end;
 			}
 
-			if(get_e_protocol(confs[OPT_PROTOCOL])==PROTO_1)
+			if(get_protocol(confs)==PROTO_1)
 				ret=backup_phase2_client_protocol1(asfd,
 					confs, resume);
 			else

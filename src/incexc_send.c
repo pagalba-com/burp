@@ -1,5 +1,11 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "asfd.h"
 #include "cmd.h"
+#include "log.h"
+#include "prepend.h"
+#include "strlist.h"
+#include "incexc_send.h"
 
 static int send_incexc_string(struct asfd *asfd,
 	const char *field, const char *str)
@@ -32,10 +38,10 @@ static int send_incexc_uint(struct asfd *asfd, struct conf *conf)
 	return send_incexc_string(asfd, conf->field, tmp);
 }
 
-static int send_incexc_ssize_t(struct asfd *asfd, struct conf *conf)
+static int send_incexc_uint64(struct asfd *asfd, struct conf *conf)
 {
 	char tmp[32]="";
-	snprintf(tmp, sizeof(tmp), "%lu", (long)get_ssize_t(conf));
+	snprintf(tmp, sizeof(tmp), "%" PRIu64, get_uint64_t(conf));
 	return send_incexc_string(asfd, conf->field, tmp);
 }
 
@@ -69,7 +75,7 @@ static int do_sends(struct asfd *asfd, struct conf **confs, int flag)
 					goto end;
 				break;
 			case CT_SSIZE_T:
-				if(send_incexc_ssize_t(asfd, confs[i]))
+				if(send_incexc_uint64(asfd, confs[i]))
 					goto end;
 				break;
 			case CT_FLOAT:
@@ -91,7 +97,7 @@ static int do_request_response(struct asfd *asfd,
 	const char *reqstr, const char *repstr)
 {
 	return (asfd->write_str(asfd, CMD_GEN, reqstr)
-	  || asfd->read_expect(asfd, CMD_GEN, repstr));
+	  || asfd_read_expect(asfd, CMD_GEN, repstr));
 }
 
 int incexc_send_client(struct asfd *asfd, struct conf **confs)

@@ -1,6 +1,19 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "asfd.h"
+#include "async.h"
 #include "cmd.h"
+#include "cntr.h"
+#include "cstat.h"
+#include "fsops.h"
+#include "handy.h"
+#include "iobuf.h"
+#include "log.h"
+#include "times.h"
 
+#include "client/monitor/sel.h"
+#include "client/monitor/json_input.h"
+#include "server/bu_get.h"
 #include "server/monitor/json_output.h"
 
 #include <limits.h>
@@ -8,11 +21,18 @@
 #define CNTR_VERSION		3
 #define CNTR_PATH_BUF_LEN	256
 
-static void cntr_ent_free(struct cntr_ent *cntr_ent)
+static void cntr_ent_free_content(struct cntr_ent *cntr_ent)
 {
 	if(!cntr_ent) return;
-	if(cntr_ent->field) free(cntr_ent->field);
-	if(cntr_ent->label) free(cntr_ent->label);
+	free_w(&cntr_ent->field);
+	free_w(&cntr_ent->label);
+}
+
+static void cntr_ent_free(struct cntr_ent **cntr_ent)
+{
+	if(!cntr_ent || !*cntr_ent) return;
+	cntr_ent_free_content(*cntr_ent);
+	free_v((void **)cntr_ent);
 }
 
 struct cntr *cntr_alloc(void)
@@ -38,7 +58,7 @@ static int add_cntr_ent(struct cntr *cntr, int flags,
 	cntr->ent[(uint8_t)cmd]=cenew;
 	return 0;
 error:
-	cntr_ent_free(cenew);
+	cntr_ent_free(&cenew);
 	return -1;
 }
 
@@ -51,11 +71,11 @@ static size_t calc_max_str_len(struct cntr *cntr, const char *cname)
 	// See cntr_to_str().
 	// First section - name/version/status
 	slen+=strlen(cname);
-	slen+=16; // More than enough space.
+	slen+=32; // More than enough space.
 
 	// Second section.
 	snprintf(ullmax, sizeof(ullmax),
-		" %"PRIu64 "\n", (uint64_t)ULLONG_MAX);
+		" %" PRIu64 "\n", (uint64_t)ULLONG_MAX);
 	for(e=cntr->list; e; e=e->next)
 	{
 		if(e->flags & CNTR_SINGLE_FIELD)
@@ -74,7 +94,7 @@ static size_t calc_max_str_len(struct cntr *cntr, const char *cname)
 	return slen;
 }
 
-int cntr_init(struct cntr *cntr, const char *cname)
+int cntr_init(struct cntr *cntr, const char *cname, pid_t pid)
 {
 	if(!cname)
 	{
@@ -138,32 +158,54 @@ int cntr_init(struct cntr *cntr, const char *cname)
 	)
 		return -1;
 
-	cntr->ent[(uint8_t)CMD_TIMESTAMP]->count=(unsigned long long)time(NULL);
+	cntr->ent[(uint8_t)CMD_TIMESTAMP]->count=(uint64_t)time(NULL);
 
 	cntr->str_max_len=calc_max_str_len(cntr, cname);
 	if(!(cntr->str=(char *)calloc_w(1, cntr->str_max_len, __func__))
 	  || !(cntr->cname=strdup_w(cname, __func__)))
 		return -1;
+	cntr->pid=pid;
 
 	return 0;
 }
 
-void cntr_free(struct cntr **cntr)
+static void cntr_free_content(struct cntr *cntr)
 {
 	struct cntr_ent *e;
 	struct cntr_ent *l=NULL;
-	if(!cntr || !*cntr) return;
-	for(e=(*cntr)->list; e; e=l)
+	for(e=cntr->list; e; e=l)
 	{
 		l=e->next;
-		cntr_ent_free(e);
+		cntr_ent_free(&e);
 	}
-	(*cntr)->list=NULL;
-	free_w(&(*cntr)->str);
+	cntr->list=NULL;
+	free_w(&cntr->str);
+	free_w(&cntr->cname);
+}
+
+void cntr_free(struct cntr **cntr)
+{
+	if(!cntr || !*cntr) return;
+	cntr_free_content(*cntr);
 	free_v((void **)cntr);
 }
 
-const char *bytes_to_human(unsigned long long counter)
+void cntrs_free(struct cntr **cntrs)
+{
+	struct cntr *c;
+	struct cntr *chead;
+	if(!cntrs || !*cntrs) return;
+	chead=*cntrs;
+	while(chead)
+	{
+		c=chead;
+		chead=chead->next;
+		cntr_free(&c);
+	}
+	*cntrs=NULL;
+}
+
+const char *bytes_to_human(uint64_t counter)
 {
 	static char ret[32]="";
 	float div=(float)counter;
@@ -200,37 +242,72 @@ static void table_border(enum action act)
 	if(act==ACTION_BACKUP
 	  || act==ACTION_BACKUP_TIMED)
 	{
-	  logc("% 18s ------------------------------------------------------------\n", "");
+	  logc("%18s ------------------------------------------------------------\n", "");
 	}
 	if(act==ACTION_RESTORE
 	  || act==ACTION_VERIFY)
 	{
-	  logc("% 18s ------------------------------\n", "");
+	  logc("%18s ------------------------------\n", "");
 	}
 }
 
-static void incr_count_val(struct cntr *cntr, char ch, unsigned long long val)
+static void set_count_val(struct cntr *cntr, char ch, uint64_t val)
 {
+	if(!cntr) return;
+	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->count=val;
+}
+
+static void set_changed_val(struct cntr *cntr, char ch, uint64_t val)
+{
+	if(!cntr) return;
+	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->changed=val;
+}
+
+static void set_same_val(struct cntr *cntr, char ch, uint64_t val)
+{
+	if(!cntr) return;
+	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->same=val;
+}
+
+static void set_deleted_val(struct cntr *cntr, char ch, uint64_t val)
+{
+	if(!cntr) return;
+	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->deleted=val;
+}
+
+static void set_phase1_val(struct cntr *cntr, char ch, uint64_t val)
+{
+	if(!cntr) return;
+	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->phase1=val;
+}
+
+static void incr_count_val(struct cntr *cntr, char ch, uint64_t val)
+{
+	if(!cntr) return;
 	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->count+=val;
 }
 
-static void incr_same_val(struct cntr *cntr, char ch, unsigned long long val)
+static void incr_same_val(struct cntr *cntr, char ch, uint64_t val)
 {
+	if(!cntr) return;
 	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->same+=val;
 }
 
-static void incr_changed_val(struct cntr *cntr, char ch, unsigned long long val)
+static void incr_changed_val(struct cntr *cntr, char ch, uint64_t val)
 {
+	if(!cntr) return;
 	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->changed+=val;
 }
 
-static void incr_deleted_val(struct cntr *cntr, char ch, unsigned long long val)
+static void incr_deleted_val(struct cntr *cntr, char ch, uint64_t val)
 {
+	if(!cntr) return;
 	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->deleted+=val;
 }
 
-static void incr_phase1_val(struct cntr *cntr, char ch, unsigned long long val)
+static void incr_phase1_val(struct cntr *cntr, char ch, uint64_t val)
 {
+	if(!cntr) return;
 	if(cntr->ent[(uint8_t)ch]) cntr->ent[(uint8_t)ch]->phase1+=val;
 }
 
@@ -259,9 +336,9 @@ static void incr_phase1(struct cntr *cntr, char ch)
 	return incr_phase1_val(cntr, ch, 1);
 }
 
-static void print_end(unsigned long long val)
+static void print_end(uint64_t val)
 {
-	if(val) logc(" %"PRIu64 "\n", val);
+	if(val) logc(" %" PRIu64 "\n", val);
 }
 
 void cntr_add(struct cntr *c, char ch, int print)
@@ -307,9 +384,14 @@ void cntr_add_phase1(struct cntr *c, char ch, int print)
 	fflush(stdout);
 }
 
-void cntr_add_val(struct cntr *c, char ch, unsigned long long val, int print)
+void cntr_add_val(struct cntr *c, char ch, uint64_t val)
 {
 	incr_count_val(c, ch, val);
+}
+
+void cntr_add_new(struct cntr *c, char ch)
+{
+	cntr_add(c, ch, 0);
 }
 
 void cntr_add_same(struct cntr *c, char ch)
@@ -319,7 +401,7 @@ void cntr_add_same(struct cntr *c, char ch)
 	incr_same(c, CMD_GRAND_TOTAL);
 }
 
-void cntr_add_same_val(struct cntr *c, char ch, unsigned long long val)
+void cntr_add_same_val(struct cntr *c, char ch, uint64_t val)
 {
 	incr_same_val(c, ch, val);
 	incr_same_val(c, CMD_TOTAL, val);
@@ -333,7 +415,7 @@ void cntr_add_changed(struct cntr *c, char ch)
 	incr_changed(c, CMD_GRAND_TOTAL);
 }
 
-void cntr_add_changed_val(struct cntr *c, char ch, unsigned long long val)
+void cntr_add_changed_val(struct cntr *c, char ch, uint64_t val)
 {
 	incr_changed_val(c, ch, val);
 	incr_changed_val(c, CMD_TOTAL, val);
@@ -347,28 +429,36 @@ void cntr_add_deleted(struct cntr *c, char ch)
 	incr_deleted(c, CMD_GRAND_TOTAL);
 }
 
-void cntr_add_bytes(struct cntr *c, unsigned long long bytes)
+void cntr_add_bytes(struct cntr *c, uint64_t bytes)
 {
 	incr_count_val(c, CMD_BYTES, bytes);
 }
 
-void cntr_add_sentbytes(struct cntr *c, unsigned long long bytes)
+static void cntr_set_sentbytes(struct cntr *c, uint64_t bytes)
 {
-	incr_count_val(c, CMD_BYTES_SENT, bytes);
+	set_count_val(c, CMD_BYTES_SENT, bytes);
 }
 
-void cntr_add_recvbytes(struct cntr *c, unsigned long long bytes)
+static void cntr_set_recvbytes(struct cntr *c, uint64_t bytes)
 {
-	incr_count_val(c, CMD_BYTES_RECV, bytes);
+	set_count_val(c, CMD_BYTES_RECV, bytes);
+}
+
+void cntr_set_bytes(struct cntr *c, struct asfd *asfd)
+{
+	if(!asfd)
+		return;
+	cntr_set_sentbytes(c, asfd->sent);
+	cntr_set_recvbytes(c, asfd->rcvd);
 }
 
 static void quint_print(struct cntr_ent *ent, enum action act)
 {
-	unsigned long long a;
-	unsigned long long b;
-	unsigned long long c;
-	unsigned long long d;
-	unsigned long long e;
+	uint64_t a;
+	uint64_t b;
+	uint64_t c;
+	uint64_t d;
+	uint64_t e;
 	if(!ent) return;
 	a=ent->count;
 	b=ent->changed;
@@ -379,37 +469,37 @@ static void quint_print(struct cntr_ent *ent, enum action act)
 	if(!(ent->flags & CNTR_TABULATE)) return;
 
 	if(!e && !a && !b && !c) return;
-	logc("% 18s:", ent->label);
+	logc("%18s:", ent->label);
 	if(act==ACTION_BACKUP
 	  || act==ACTION_BACKUP_TIMED)
 	{
-		logc("% 9llu ", a);
-		logc("% 9llu ", b);
-		logc("% 9llu ", c);
-		logc("% 9llu ", d);
+		logc("%9" PRIu64 " ", a);
+		logc("%9" PRIu64 " ", b);
+		logc("%9" PRIu64 " ", c);
+		logc("%9" PRIu64 " ", d);
 	}
 	if(act==ACTION_RESTORE
 	  || act==ACTION_VERIFY)
 	{
-		logc("% 9s ", "");
-		//logc("% 9s ", "");
-		//logc("% 9s ", "");
-		//logc("% 9s ", "");
+		logc("%9s ", "");
+		//logc("%9s ", "");
+		//logc("%9s ", "");
+		//logc("%9s ", "");
 	}
 	if(act==ACTION_ESTIMATE)
 	{
-		logc("% 9s ", "");
-		logc("% 9s ", "");
-		logc("% 9llu\n", e);
+		logc("%9s ", "");
+		logc("%9s ", "");
+		logc("%9" PRIu64 "\n", e);
 	}
 	else
 	{
-		logc("% 9llu |", a+b+c);
-		logc("% 9llu\n", e);
+		logc("%9" PRIu64 " |", a+b+c);
+		logc("%9" PRIu64 "\n", e);
 	}
 }
 
-static unsigned long long get_count(struct cntr_ent **ent, enum cmd cmd)
+static uint64_t get_count(struct cntr_ent **ent, enum cmd cmd)
 {
 	if(!ent[(uint8_t)cmd]) return 0;
 	return ent[(uint8_t)cmd]->count;
@@ -417,13 +507,13 @@ static unsigned long long get_count(struct cntr_ent **ent, enum cmd cmd)
 
 static void bottom_part(struct cntr *c, enum action act)
 {
-	unsigned long long l;
+	uint64_t l;
 	struct cntr_ent **e=c->ent;
 	logc("\n");
-	logc("             Messages:   % 11llu\n", get_count(e, CMD_MESSAGE));
-	logc("             Warnings:   % 11llu\n", get_count(e, CMD_WARNING));
+	logc("             Messages:   %11" PRIu64 "\n", get_count(e, CMD_MESSAGE));
+	logc("             Warnings:   %11" PRIu64 "\n", get_count(e, CMD_WARNING));
 	logc("\n");
-	logc("      Bytes estimated:   % 11llu", get_count(e, CMD_BYTES_ESTIMATED));
+	logc("      Bytes estimated:   %11" PRIu64, get_count(e, CMD_BYTES_ESTIMATED));
 	logc("%s\n", bytes_to_human(get_count(e, CMD_BYTES_ESTIMATED)));
 
 	if(act==ACTION_ESTIMATE) return;
@@ -432,65 +522,65 @@ static void bottom_part(struct cntr *c, enum action act)
 	  || act==ACTION_BACKUP_TIMED)
 	{
 		l=get_count(e, CMD_BYTES);
-		logc("      Bytes in backup:   % 11llu", l);
+		logc("      Bytes in backup:   %11" PRIu64, l);
 		logc("%s\n", bytes_to_human(l));
 	}
 	if(act==ACTION_RESTORE)
 	{
 		l=get_count(e, CMD_BYTES);
-		logc("      Bytes attempted:   % 11llu", l);
+		logc("      Bytes attempted:   %11" PRIu64, l);
 		logc("%s\n", bytes_to_human(l));
 	}
 	if(act==ACTION_VERIFY)
 	{
 		l=get_count(e, CMD_BYTES);
-		logc("        Bytes checked:   % 11llu", l);
+		logc("        Bytes checked:   %11" PRIu64, l);
 		logc("%s\n", bytes_to_human(l));
 	}
 
-	if(act==ACTION_BACKUP
-	  || act==ACTION_BACKUP_TIMED)
-	{
-		l=get_count(e, CMD_BYTES_RECV);
-		logc("       Bytes received:   % 11llu", l);
-		logc("%s\n", bytes_to_human(l));
-	}
-	if(act==ACTION_BACKUP 
-	  || act==ACTION_BACKUP_TIMED
-	  || act==ACTION_RESTORE)
-	{
-		l=get_count(e, CMD_BYTES_SENT);
-		logc("           Bytes sent:   % 11llu", l);
-		logc("%s\n", bytes_to_human(l));
-	}
+	l=get_count(e, CMD_BYTES_RECV);
+	logc("       Bytes received:   %11" PRIu64, l);
+	logc("%s\n", bytes_to_human(l));
+
+	l=get_count(e, CMD_BYTES_SENT);
+	logc("           Bytes sent:   %11" PRIu64, l);
+	logc("%s\n", bytes_to_human(l));
 }
 
 void cntr_print(struct cntr *cntr, enum action act)
 {
 	struct cntr_ent *e;
-	time_t now=time(NULL);
-	time_t start=(time_t)cntr->ent[(uint8_t)CMD_TIMESTAMP]->count;
-	cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count=(unsigned long long)now;
+	time_t now;
+	time_t start;
+	char time_start_str[32];
+	char time_end_str[32];
+	if(!cntr) return;
+
+	now=time(NULL);
+	start=(time_t)cntr->ent[(uint8_t)CMD_TIMESTAMP]->count;
+	cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count=(uint64_t)now;
 
 	border();
-	logc("Start time: %s\n", getdatestr(start));
-	logc("  End time: %s\n", getdatestr(now));
+	encode_time(start, time_start_str);
+	encode_time(now, time_end_str);
+	logc("Start time: %s\n", time_start_str);
+	logc("  End time: %s\n", time_end_str);
 	logc("Time taken: %s\n", time_taken(now-start));
 	if(act==ACTION_BACKUP
 	  || act==ACTION_BACKUP_TIMED)
 	{
-	  logc("% 18s % 9s % 9s % 9s % 9s % 9s |% 9s\n",
-	    " ", "New", "Changed", "Unchanged", "Deleted", "Total", "Scanned");
+	  logc("%18s %9s %9s %9s %9s %9s |%9s\n",
+	    " ", "New", "Changed", "Duplicate", "Deleted", "Total", "Scanned");
 	}
 	if(act==ACTION_RESTORE
 	  || act==ACTION_VERIFY)
 	{
-	  logc("% 18s % 9s % 9s |% 9s\n",
+	  logc("%18s %9s %9s |%9s\n",
 	    " ", "", "Attempted", "Expected");
 	}
 	if(act==ACTION_ESTIMATE)
 	{
-	  logc("% 18s % 9s % 9s %9s\n",
+	  logc("%18s %9s %9s %9s\n",
 	    " ", "", "", "Scanned");
 	}
 	table_border(act);
@@ -505,19 +595,21 @@ void cntr_print(struct cntr *cntr, enum action act)
 }
 
 #ifndef HAVE_WIN32
-#ifndef UTEST
 
 int cntr_stats_to_file(struct cntr *cntr,
-	const char *directory, enum action act, struct conf **confs)
+	const char *directory, enum action act)
 {
 	int ret=-1;
 	int fd=-1;
 	char *path=NULL;
+	char *pathtmp=NULL;
 	const char *fname=NULL;
 	struct async *as=NULL;
 	struct asfd *wfd=NULL;
+	if(!cntr)
+		return 0;
 	cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count
-		=(unsigned long long)time(NULL);
+		=(uint64_t)time(NULL);
 
 	if(act==ACTION_BACKUP
 	  ||  act==ACTION_BACKUP_TIMED)
@@ -529,54 +621,52 @@ int cntr_stats_to_file(struct cntr *cntr,
 	else
 		return 0;
 
-	if(!(path=prepend_s(directory, fname)))
+	if(!(path=prepend_s(directory, fname))
+	  || !(pathtmp=prepend(path, ".tmp")))
 		goto end;
-	if((fd=open(path, O_WRONLY|O_CREAT, 0666))<0)
+	if((fd=open(
+		pathtmp,
+#ifdef O_NOFOLLOW
+		O_NOFOLLOW|
+#endif
+		O_WRONLY|O_CREAT,
+		0666))<0)
 	{
 		logp("Could not open %s for writing in %s: %s\n",
-			path, __func__, strerror(errno));
+			pathtmp, __func__, strerror(errno));
 		goto end;
 	}
-	// FIX THIS:
-	// Pretty heavy duty to set up all this async stuff just so that the
-	// json stuff can write to a simple file.
+
 	if(!(as=async_alloc())
 	  || as->init(as, 0)
-	  || !(wfd=asfd_alloc())
-	  || wfd->init(wfd, "stats file",
-		as, fd, NULL, ASFD_STREAM_LINEBUF, confs))
-			goto end;
-	as->asfd_add(as, wfd);
-	fd=-1;
-	if(json_cntr_to_file(wfd, cntr))
+	  || !(wfd=setup_asfd_linebuf_write(as, "stats file", &fd)))
+	{
+		close_fd(&fd);
 		goto end;
+	}
 
-// FIX THIS: make this use the json output stuff.
-// Need to add the following few fields to the cntrs somehow.
-/*
-	fprintf(fp, "client_version:%s\n",
-		conf->peer_version?conf->peer_version:"");
-	fprintf(fp, "server_version:%s\n", VERSION);
-	fprintf(fp, "client_is_windows:%d\n", conf->client_is_windows);
-	for(e=cntr->list; e; e=e->next)
-		quint_print_to_file(fp, e, act);
-*/
+	if(json_cntr(wfd, cntr))
+		goto end;
 
 	ret=0;
 end:
-	close_fd(&fd);
-	free_w(&path);
 	async_free(&as);
 	asfd_free(&wfd);
+	if(!ret && do_rename(pathtmp, path))
+		ret=-1;
+
+	free_w(&path);
+	free_w(&pathtmp);
 	return ret;
 }
 
 #endif
-#endif
 
 void cntr_print_end(struct cntr *cntr)
 {
-	struct cntr_ent *grand_total_ent=cntr->ent[CMD_GRAND_TOTAL];
+	struct cntr_ent *grand_total_ent;
+	if(!cntr) return;
+	grand_total_ent=cntr->ent[CMD_GRAND_TOTAL];
 	if(grand_total_ent)
 	{
 		print_end(grand_total_ent->count);
@@ -586,7 +676,9 @@ void cntr_print_end(struct cntr *cntr)
 
 void cntr_print_end_phase1(struct cntr *cntr)
 {
-	struct cntr_ent *grand_total_ent=cntr->ent[CMD_GRAND_TOTAL];
+	struct cntr_ent *grand_total_ent;
+	if(!cntr) return;
+	grand_total_ent=cntr->ent[CMD_GRAND_TOTAL];
 	if(grand_total_ent)
 	{
 		print_end(grand_total_ent->phase1);
@@ -604,19 +696,25 @@ size_t cntr_to_str(struct cntr *cntr, const char *path)
 
 	cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count=time(NULL);
 
-	snprintf(str, cntr->str_max_len-1, "%s\t%d\t%d\t",
-		cntr->cname, CNTR_VERSION, cntr->cntr_status);
+	snprintf(str, cntr->str_max_len-1, "cntr\t%s.%d.%d\t%d\t%d\t",
+		cntr->cname, cntr->pid, cntr->bno,
+		CNTR_VERSION, cntr->cntr_status);
 
 	for(e=cntr->list; e; e=e->next)
 	{
 		if(e->flags & CNTR_SINGLE_FIELD)
-			snprintf(tmp,
-				sizeof(tmp), "%c%llu\t", e->cmd, e->count);
+			snprintf(tmp, sizeof(tmp),
+				"%c%" PRIu64"\t", e->cmd, e->count);
 		else
-			snprintf(tmp,
-				sizeof(tmp), "%c%llu/%llu/%llu/%llu/%llu\t",
-				e->cmd, e->count, e->same,
-				e->changed, e->deleted, e->phase1);
+			snprintf(tmp, sizeof(tmp),
+			"%c%" PRIu64
+			"/%" PRIu64
+			"/%" PRIu64
+			"/%" PRIu64
+			"/%" PRIu64
+			"\t",
+				e->cmd, e->count, e->changed,
+				e->same, e->deleted, e->phase1);
 		strcat(str, tmp);
 	}
 
@@ -668,7 +766,7 @@ static int extract_ul(const char *value, struct cntr_ent *ent)
 		// Single field.
 		ent->count=strtoull(as, NULL, 10);
 	}
-	free(copy);
+	free_w(&copy);
 	return 0;
 }
 
@@ -684,7 +782,7 @@ static char *get_backup_str(const char *s, int *deletable)
 		snprintf(str, sizeof(str), "never");
 	else
 	{
-		unsigned long backupnum=0;
+		uint64_t backupnum=0;
 		backupnum=strtoul(s, NULL, 10);
 		snprintf(str, sizeof(str),
 			"%07lu %s", backupnum, getdatestr(atol(dp+1)));
@@ -705,10 +803,9 @@ static int add_to_backup_list(struct strlist **backups, const char *tok)
 }
 */
 
-static int extract_cntrs(struct cstat *cstat, char **path)
+static int extract_cntrs(struct cntr *cntr, char **path)
 {
 	char *tok;
-	struct cntr *cntr=cstat->cntr;
 	while((tok=strtok(NULL, "\t\n")))
 	{
 		switch(tok[0])
@@ -729,7 +826,35 @@ static int extract_cntrs(struct cstat *cstat, char **path)
 	return 0;
 }
 
-int str_to_cntr(const char *str, struct cstat *cstat, char **path)
+int extract_client_pid_bno(char *buf, char **cname, pid_t *pid, int *bno)
+{
+	char *cp=NULL;
+	char *pp=NULL;
+
+	// Extract the client name.
+	if((cp=strchr(buf, '\t')))
+		*cp='\0';
+	if(!(*cname=strdup_w(buf, __func__)))
+		return -1;
+	if(cp)
+		*cp='\t';
+
+	// Extract the bno.
+	if((pp=strrchr(*cname, '.')))
+	{
+		*pp='\0';
+		*bno=(int)atoi(pp+1);
+		// Extract the pid.
+		if((pp=strrchr(*cname, '.')))
+		{
+			*pp='\0';
+			*pid=(pid_t)atoi(pp+1);
+		}
+	}
+	return 0;
+}
+
+int str_to_cntr(const char *str, struct cntr *cntr, char **path)
 {
 	int ret=-1;
 	char *tok=NULL;
@@ -740,9 +865,24 @@ int str_to_cntr(const char *str, struct cstat *cstat, char **path)
 
 	if((tok=strtok(copy, "\t\n")))
 	{
+		int bno=0;
+		pid_t pid=-1;
 		char *tmp=NULL;
-		// First token is the client name. Do not need that here.
-		// Second is the cntr version.
+		char *cname=NULL;
+		// First token is 'cntr'.
+		// Second is client name/pid/bno.
+		if(!(tmp=strtok(NULL, "\t\n")))
+		{
+			logp("Parsing problem in %s: null client\n",
+				__func__);
+			goto end;
+		}
+		if(extract_client_pid_bno(tmp, &cname, &pid, &bno))
+			goto end;
+		free_w(&cname);
+		cntr->pid=pid;
+		cntr->bno=bno;
+		// Third is the cntr version.
 		if(!(tmp=strtok(NULL, "\t\n")))
 		{
 			logp("Parsing problem in %s: null version\n",
@@ -754,16 +894,16 @@ int str_to_cntr(const char *str, struct cstat *cstat, char **path)
 			ret=0;
 			goto end;
 		}
-		// Third is cstat_status.
+		// Fourth is cntr_status.
 		if(!(tmp=strtok(NULL, "\t\n")))
 		{
-			logp("Parsing problem in %s: null cstat_status\n",
+			logp("Parsing problem in %s: null cntr_status\n",
 				__func__);
 			goto end;
 		}
-		cstat->cntr->cntr_status=(enum cntr_status)atoi(tmp);
+		cntr->cntr_status=(enum cntr_status)atoi(tmp);
 
-		if(extract_cntrs(cstat, path)) goto end;
+		if(extract_cntrs(cntr, path)) goto end;
 	}
 
 	ret=0;
@@ -773,36 +913,127 @@ end:
 }
 
 #ifndef HAVE_WIN32
-int cntr_send(struct cntr *cntr)
+int cntr_send_bu(struct asfd *asfd, struct bu *bu, struct conf **confs,
+	enum cntr_status cntr_status)
 {
-/*
-	size_t l;
-	char buf[4096]="";
-	l=cntr_to_str(get_cntr(confs[OPT_CNTR]), STATUS_RUNNING, " ");
-	if(async_write_strn(CMD_GEN, buf, l))
+	int ret=-1;
+	uint16_t flags;
+	struct cstat *clist=NULL;
+	struct cstat *cstat=NULL;
+
+        if(!get_int(confs[OPT_SEND_CLIENT_CNTR]))
+		return 0;
+
+	flags=bu->flags;
+
+	// Want to setup a cstat and a bu so that we can piggy-back on the
+	// status monitor cntr json code.
+
+	if(!(cstat=cstat_alloc())
+	  || cstat_init(cstat,
+		get_string(confs[OPT_CNAME]), NULL/*clientconfdir*/))
+			goto end;
+	cstat->cntrs=get_cntr(confs);
+	cstat->protocol=get_protocol(confs);
+	cstat->cntrs->cntr_status=cntr_status;
+	cstat->run_status=RUN_STATUS_RUNNING;
+
+	// Hacky provocation to get the json stuff to send counters in the
+	// case where we are actually doing a restore.
+	bu->flags|=BU_WORKING;
+	cstat->bu=bu;
+
+	clist=cstat;
+
+	ret=json_send(asfd,
+		clist,
+		cstat,
+		bu,
+		NULL /* logfile */,
+		NULL /* browse */,
+		0 /* use_cache */,
+		version_to_long(get_string(confs[OPT_PEER_VERSION])));
+end:
+	cstat->bu=NULL; // 'bu' was not ours to mess with.
+	cstat->cntrs=NULL; // 'cntrs' was not ours to mess with.
+	bu->flags=flags; // Set flags back to what the were before.
+	cstat_free(&cstat);
+	return ret;
+}
+
+int cntr_send_sdirs(struct asfd *asfd,
+	struct sdirs *sdirs, struct conf **confs, enum cntr_status cntr_status)
+{
+	int ret=-1;
+	struct bu *bu=NULL;
+	struct bu *bu_list=NULL;
+
+	// FIX THIS:
+	// It would be better just to set up the correct 'bu' entry instead
+	// of loading everything and then looking through the list.
+	if(bu_get_list_with_working(sdirs, &bu_list))
+		goto end;
+	for(bu=bu_list; bu; bu=bu->next)
+		if((bu->flags & BU_WORKING)
+		  || (bu->flags & BU_FINISHING))
+			break;
+	if(!bu)
 	{
-		logp("Error when sending counters to client.\n");
-		return -1;
+		logp("could not find working or finishing backup in %s\n",
+			__func__);
+		goto end;
 	}
-*/
-	return 0;
+	ret=cntr_send_bu(asfd, bu, confs, cntr_status);
+end:
+	bu_list_free(&bu_list);
+	return ret;
 }
 #endif
 
 static enum asl_ret cntr_recv_func(struct asfd *asfd,
-	struct conf **confs, void *param)
+	struct conf **confs,
+	void *param)
 {
-/*
-	if(str_to_cntr(asfd->rbuf->buf, NULL, NULL, NULL, NULL,
-		conf->p1cntr, get_cntr(confs[OPT_CNTR]), NULL))
-			return ASL_END_ERROR;
-*/
-	return ASL_END_OK;
+	struct sel *sel=(struct sel *)param;
+	switch(json_input(asfd, sel))
+	{
+		case 0: return ASL_CONTINUE;
+		case 1:
+		case 2: return ASL_END_OK;
+		default: return ASL_END_ERROR;
+	}
 }
 
 int cntr_recv(struct asfd *asfd, struct conf **confs)
 {
-	return asfd->simple_loop(asfd, confs, NULL, __func__, cntr_recv_func);
+	int ret=-1;
+	struct sel *sel=NULL;
+	struct cntr_ent *e;
+	struct cntr *cntr=get_cntr(confs);
+
+	if(!(sel=sel_alloc()))
+		goto end;
+	if(!get_int(confs[OPT_SEND_CLIENT_CNTR]))
+		goto ok;
+	if(json_input_init())
+		goto end;
+	if(asfd->simple_loop(asfd, confs, sel, __func__, cntr_recv_func)
+	  || !sel->clist || !sel->clist->cntrs)
+		goto end;
+	for(e=sel->clist->cntrs->list; e; e=e->next)
+	{
+		set_count_val(cntr, e->cmd, e->count);
+		set_changed_val(cntr, e->cmd, e->changed);
+		set_same_val(cntr, e->cmd, e->same);
+		set_deleted_val(cntr, e->cmd, e->deleted);
+		set_phase1_val(cntr, e->cmd, e->phase1);
+	}
+ok:
+	ret=0;
+end:
+	json_input_free();
+	sel_free(&sel);
+	return ret;
 }
 
 const char *cntr_status_to_str(struct cntr *cntr)
@@ -843,4 +1074,37 @@ enum cntr_status cntr_str_to_status(const char *str)
 	else if(!strcmp(str, CNTR_STATUS_STR_DIFFING))
 		return CNTR_STATUS_DIFFING;
 	return CNTR_STATUS_UNSET;
+}
+
+const char *cntr_status_to_action_str(struct cntr *cntr)
+{
+	switch(cntr->cntr_status)
+	{
+		case CNTR_STATUS_SCANNING:
+		case CNTR_STATUS_BACKUP:
+		case CNTR_STATUS_MERGING:
+		case CNTR_STATUS_SHUFFLING:
+			return "backup";
+		case CNTR_STATUS_LISTING:
+			return "list";
+		case CNTR_STATUS_RESTORING:
+			return "restore";
+		case CNTR_STATUS_VERIFYING:
+			return "verify";
+		case CNTR_STATUS_DELETING:
+			return "delete";
+		case CNTR_STATUS_DIFFING:
+			return "diff";
+		default:
+			return "unknown";
+	}
+}
+
+int check_fail_on_warning(int fail_on_warning, struct cntr_ent *warn_ent)
+{
+	if(!fail_on_warning || !warn_ent || !warn_ent->count)
+		return 0;
+	logp("fail_on_warning is set and warning count is %" PRIu64 "\n",
+		warn_ent->count);
+	return -1;
 }

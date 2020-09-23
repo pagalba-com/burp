@@ -1,50 +1,70 @@
-#include "include.h"
-
-#include <dirent.h>
+#include "../../burp.h"
+#include "../../alloc.h"
+#include "../../cntr.h"
+#include "../../conf.h"
+#include "../../cstat.h"
+#include "../../fsops.h"
+#include "../../fzp.h"
+#include "../../log.h"
+#include "../../prepend.h"
+#include "../child.h"
+#include "link.h"
 
 int recursive_hardlink(const char *src, const char *dst, struct conf **confs)
 {
-	int n=-1;
-	int ret=0;
-	struct dirent **dir;
+	int ret=-1;
+	DIR *dirp=NULL;
 	char *tmp=NULL;
 	char *fullpatha=NULL;
 	char *fullpathb=NULL;
-	//logp("in rec hl: %s %s\n", src, dst);
-	if(!(tmp=prepend_s(dst, "dummy"))) return -1;
+	struct dirent *entry=NULL;
+
+	if(!(tmp=prepend_s(dst, "dummy")))
+		goto end;
 	if(mkpath(&tmp, dst))
 	{
 		logp("could not mkpath for %s\n", tmp);
-		free_w(&tmp);
-		return -1;
+		goto end;
 	}
-	free_w(&tmp);
 
-	if((n=scandir(src, &dir, 0, 0))<0)
+	if(!(dirp=opendir(src)))
 	{
-		logp("recursive_hardlink scandir %s: %s\n",
-			src, strerror(errno));
-		return -1;
+		logp("opendir %s in %s: %s\n",
+			src, __func__, strerror(errno));
+		goto end;
 	}
-	while(n--)
+
+	while(1)
 	{
 		struct stat statp;
-		if(dir[n]->d_ino==0
-		  || !strcmp(dir[n]->d_name, ".")
-		  || !strcmp(dir[n]->d_name, ".."))
-			{ free(dir[n]); continue; }
+
+		errno=0;
+		if(!(entry=readdir(dirp)))
+		{
+			if(errno)
+			{
+				logp("error in readdir in %s: %s\n",
+					__func__, strerror(errno));
+				goto end;
+			}
+			break;
+		}
+
+		if(!filter_dot(entry))
+			continue;
+
 		free_w(&fullpatha);
 		free_w(&fullpathb);
-		if(!(fullpatha=prepend_s(src, dir[n]->d_name))
-		  || !(fullpathb=prepend_s(dst, dir[n]->d_name)))
-			break;
+		if(!(fullpatha=prepend_s(src, entry->d_name))
+		  || !(fullpathb=prepend_s(dst, entry->d_name)))
+			goto end;
 
 #ifdef _DIRENT_HAVE_D_TYPE
 // Faster evaluation on most systems.
-		if(dir[n]->d_type==DT_DIR)
+		if(entry->d_type==DT_DIR)
 		{
 			if(recursive_hardlink(fullpatha, fullpathb, confs))
-				break;
+				goto end;
 		}
 		else
 #endif
@@ -57,27 +77,25 @@ int recursive_hardlink(const char *src, const char *dst, struct conf **confs)
 		else if(S_ISDIR(statp.st_mode))
 		{
 			if(recursive_hardlink(fullpatha, fullpathb, confs))
-				break;
+				goto end;
 		}
 		else
 		{
 			//logp("hardlinking %s to %s\n", fullpathb, fullpatha);
-			if(write_status(CNTR_STATUS_SHUFFLING, fullpathb, confs)
+			if(timed_operation_status_only(CNTR_STATUS_SHUFFLING,
+				fullpathb, confs)
 			  || do_link(fullpatha, fullpathb, &statp, confs,
 				0 /* do not overwrite target */))
-				break;
+					goto end;
 		}
-		free(dir[n]);
 	}
-	if(n>0)
-	{
-		ret=-1;
-		for(; n>0; n--) free(dir[n]);
-	}
-	free(dir);
 
+	ret=0;
+end:
+	if(dirp) closedir(dirp);
 	free_w(&fullpatha);
 	free_w(&fullpathb);
+	free_w(&tmp);
 
 	return ret;
 }
@@ -88,27 +106,28 @@ static int duplicate_file(const char *oldpath, const char *newpath)
 	int ret=-1;
 	size_t s=0;
 	size_t t=0;
-	FILE *op=NULL;
-	FILE *np=NULL;
+	struct fzp *op=NULL;
+	struct fzp *np=NULL;
 	char buf[DUP_CHUNK]="";
-	if(!(op=open_file(oldpath, "rb"))
-	  || !(np=open_file(newpath, "wb")))
+	if(!(op=fzp_open(oldpath, "rb"))
+	  || !(np=fzp_open(newpath, "wb")))
 		goto end;
 
-	while((s=fread(buf, 1, DUP_CHUNK, op))>0)
+	while((s=fzp_read(op, buf, DUP_CHUNK))>0)
 	{
-		t=fwrite(buf, 1, s, np);
+		t=fzp_write(np, buf, s);
 		if(t!=s)
 		{
-			logp("could not write all bytes: %d!=%d\n", s, t);
+			logp("could not write all bytes: %lu!=%lu\n",
+				(unsigned long)s, (unsigned long)t);
 			goto end;
 		}
 	}
 
 	ret=0;
 end:
-	close_fp(&np);
-	close_fp(&op);
+	fzp_close(&np);
+	fzp_close(&op);
 	if(ret) logp("could not duplicate %s to %s\n", oldpath, newpath);
 	return ret;
 }
@@ -117,7 +136,8 @@ int do_link(const char *oldpath, const char *newpath, struct stat *statp,
 	struct conf **confs, uint8_t overwrite)
 {
 	/* Avoid creating too many hardlinks */
-	if(statp->st_nlink >= (unsigned int)get_int(confs[OPT_MAX_HARDLINKS]))
+	if(confs
+	  && statp->st_nlink >= (unsigned int)get_int(confs[OPT_MAX_HARDLINKS]))
 	{
 		return duplicate_file(oldpath, newpath);
 	}

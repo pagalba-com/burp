@@ -1,4 +1,6 @@
-#include "include.h"
+#include "../burp.h"
+#include "sbuf_protocol2.h"
+#include "../alloc.h"
 
 struct protocol2 *sbuf_protocol2_alloc(void)
 {
@@ -10,7 +12,7 @@ struct protocol2 *sbuf_protocol2_alloc(void)
 	return protocol2;
 }
 
-void sbuf_protocol2_free_content(struct protocol2 *protocol2)
+void sbuf_protocol2_free_content(void)
 {
 	return; // Nothing to do.
 }

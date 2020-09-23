@@ -2,12 +2,16 @@
 #define _MSG_PROTOCOL1_H
 
 #include <zlib.h>
-#include "include.h"
+#include "../bfile.h"
 
 extern int transfer_gzfile_inl(struct asfd *asfd,
-	struct sbuf *sb, const char *path, BFILE *bfd,
-	unsigned long long *rcvd, unsigned long long *sent,
+#ifdef HAVE_WIN32
+	struct sbuf *sb,
+#endif
+	struct BFILE *bfd,
+	uint64_t *rcvd, uint64_t *sent,
 	const char *encpassword, int enccompressed,
-	struct conf **conf, char **metadata);
+	struct cntr *cntr, char **metadata,
+	int key_deriv, uint64_t salt);
 
 #endif

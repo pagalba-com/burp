@@ -1,5 +1,13 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "asfd.h"
+#include "async.h"
 #include "cmd.h"
+#include "fsops.h"
+#include "handy.h"
+#include "iobuf.h"
+#include "log.h"
+#include "server/protocol2/champ_chooser/incoming.h"
 
 // For IPTOS / IPTOS_THROUGHPUT.
 #ifdef HAVE_WIN32
@@ -9,12 +17,12 @@
 #endif
 
 #ifdef HAVE_NCURSES_H
-#include "ncurses.h"
+#include <ncurses.h>
+#elif HAVE_NCURSES_NCURSES_H
+#include <ncurses/ncurses.h>
 #endif
 
 #include "protocol2/blist.h"
-
-static size_t bufmaxsize=(ASYNC_BUF_LEN*2)+32;
 
 static void truncate_readbuf(struct asfd *asfd)
 {
@@ -22,16 +30,27 @@ static void truncate_readbuf(struct asfd *asfd)
 	asfd->readbuflen=0;
 }
 
-static int asfd_alloc_buf(char **buf)
+static int asfd_alloc_buf(struct asfd *asfd, char **buf)
 {
-	if(!*buf && !(*buf=(char *)calloc_w(1, bufmaxsize, __func__)))
+	if(!*buf && !(*buf=(char *)calloc_w(1, asfd->bufmaxsize, __func__)))
 		return -1;
 	return 0;
 }
 
 static int extract_buf(struct asfd *asfd,
-	unsigned int len, unsigned int offset)
+	size_t len, size_t offset)
 {
+	if(offset+len>=asfd->bufmaxsize)
+	{
+		logp("%s: offset(%lu)+len(%lu)>=asfd->bufmaxsize(%lu) in %s!",
+			asfd->desc,
+			(unsigned long)offset,
+			(unsigned long)len,
+			(unsigned long)asfd->bufmaxsize,
+			__func__);
+		return -1;
+	}
+
 	if(!(asfd->rbuf->buf=(char *)malloc_w(len+1, __func__)))
 		return -1;
 	if(!(memcpy(asfd->rbuf->buf, asfd->readbuf+offset, len)))
@@ -51,7 +70,7 @@ static int extract_buf(struct asfd *asfd,
 	return 0;
 }
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 static int parse_readbuf_ncurses(struct asfd *asfd)
 {
 	if(!asfd->readbuflen) return 0;
@@ -92,19 +111,25 @@ static int parse_readbuf_line_buf(struct asfd *asfd)
 
 static int parse_readbuf_standard(struct asfd *asfd)
 {
-	enum cmd cmdtmp=CMD_ERROR;
 	unsigned int s=0;
+	char command;
 	if(asfd->readbuflen<5) return 0;
-	if((sscanf(asfd->readbuf, "%c%04X", (char *)&cmdtmp, &s))!=2)
+	if((sscanf(asfd->readbuf, "%c%04X", &command, &s))!=2)
 	{
 		logp("%s: sscanf of '%s' failed in %s\n",
 			asfd->desc, asfd->readbuf, __func__);
 		return -1;
 	}
+	if(s>=asfd->bufmaxsize)
+	{
+		logp("%s: given buffer length '%d', which is too big!\n",
+			asfd->desc, s);
+		return -1;
+	}
 	if(asfd->readbuflen>=s+5)
 	{
-		asfd->rbuf->cmd=cmdtmp;
-		if(extract_buf(asfd, s, 5))
+		asfd->rbuf->cmd=(enum cmd)command;
+		if(extract_buf(asfd, (size_t)s, 5))
 			return -1;
 	}
 	return 0;
@@ -123,7 +148,7 @@ static int asfd_parse_readbuf(struct asfd *asfd)
 	return 0;
 }
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 static int asfd_do_read_ncurses(struct asfd *asfd)
 {
 	static int i;
@@ -133,7 +158,7 @@ static int asfd_do_read_ncurses(struct asfd *asfd)
 	return 0;
 }
 
-static int asfd_do_write_ncurses(struct asfd *asfd)
+static int asfd_do_write_ncurses(__attribute__ ((unused)) struct asfd *asfd)
 {
 	logp("This function should not have been called: %s\n", __func__);
 	return -1;
@@ -144,7 +169,7 @@ static int asfd_do_read(struct asfd *asfd)
 {
 	ssize_t r;
 	r=read(asfd->fd,
-		asfd->readbuf+asfd->readbuflen, bufmaxsize-asfd->readbuflen);
+	  asfd->readbuf+asfd->readbuflen, asfd->bufmaxsize-asfd->readbuflen);
 	if(r<0)
 	{
 		if(errno==EAGAIN || errno==EINTR)
@@ -160,10 +185,17 @@ static int asfd_do_read(struct asfd *asfd)
 		goto error;
 	}
 	asfd->readbuflen+=r;
+	asfd->rcvd+=r;
 	return 0;
 error:
 	truncate_readbuf(asfd);
 	return -1;
+}
+
+static void peer_msg(void)
+{
+	logp("This is probably caused by the peer exiting.\n");
+	logp("Please check the peer's logs.\n");
 }
 
 static int asfd_do_read_ssl(struct asfd *asfd)
@@ -174,14 +206,17 @@ static int asfd_do_read_ssl(struct asfd *asfd)
 	asfd->read_blocked_on_write=0;
 
 	ERR_clear_error();
-	r=SSL_read(asfd->ssl,
-		asfd->readbuf+asfd->readbuflen, bufmaxsize-asfd->readbuflen);
+	r=SSL_read(
+		asfd->ssl,
+		asfd->readbuf+asfd->readbuflen,
+		asfd->bufmaxsize-asfd->readbuflen
+	);
 
 	switch((e=SSL_get_error(asfd->ssl, r)))
 	{
 		case SSL_ERROR_NONE:
 			asfd->readbuflen+=r;
-			asfd->readbuf[asfd->readbuflen]='\0';
+			asfd->rcvd+=r;
 			break;
 		case SSL_ERROR_ZERO_RETURN:
 			// End of data.
@@ -196,14 +231,16 @@ static int asfd_do_read_ssl(struct asfd *asfd)
 		case SSL_ERROR_SYSCALL:
 			if(errno==EAGAIN || errno==EINTR)
 				break;
-			logp("%s: Got SSL_ERROR_SYSCALL\n",
+			logp("%s: Got network read error\n",
 				asfd->desc);
 			// Fall through to read problem
 		default:
+			asfd->errors++;
 			logp_ssl_err(
-				"%s: SSL read problem in %s: %d - %d=%s\n",
+				"%s: network read problem in %s: %d - %d=%s\n",
 				asfd->desc, __func__,
 				e, errno, strerror(errno));
+			peer_msg();
 			goto error;
 	}
 	return 0;
@@ -260,14 +297,17 @@ static int asfd_do_write(struct asfd *asfd)
 			return 0;
 		logp("%s: Got error in %s, (%d=%s)\n", __func__,
 			asfd->desc, errno, strerror(errno));
+		asfd->errors++;
 		return -1;
 	}
 	else if(!w)
 	{
 		logp("%s: Wrote nothing in %s\n", asfd->desc, __func__);
+		asfd->errors++;
 		return -1;
 	}
 	if(asfd->ratelimit) asfd->rlbytes+=w;
+	asfd->sent+=w;
 /*
 {
 char buf[100000]="";
@@ -306,6 +346,7 @@ printf("wrote %d: %s\n", w, buf);
 			memmove(asfd->writebuf,
 				asfd->writebuf+w, asfd->writebuflen-w);
 			asfd->writebuflen-=w;
+			asfd->sent+=w;
 			break;
 		case SSL_ERROR_WANT_WRITE:
 			break;
@@ -315,14 +356,16 @@ printf("wrote %d: %s\n", w, buf);
 		case SSL_ERROR_SYSCALL:
 			if(errno==EAGAIN || errno==EINTR)
 				break;
-			logp("%s: Got SSL_ERROR_SYSCALL\n",
+			logp("%s: Got network write error\n",
 				asfd->desc);
-			// Fall through to read problem
+			// Fall through to write problem
 		default:
+			asfd->errors++;
 			logp_ssl_err(
-				"%s: SSL write problem in %s: %d - %d=%s\n",
+				"%s: network write problem in %s: %d - %d=%s\n",
 				asfd->desc, __func__,
 				e, errno, strerror(errno));
+			peer_msg();
 			return -1;
 	}
 	return 0;
@@ -346,7 +389,7 @@ static enum append_ret asfd_append_all_to_write_buffer(struct asfd *asfd,
 		{
 			size_t sblen=0;
 			char sbuf[10]="";
-			if(asfd->writebuflen+6+(wbuf->len) >= bufmaxsize-1)
+			if(asfd->writebuflen+6+(wbuf->len)>=asfd->bufmaxsize-1)
 				return APPEND_BLOCKED;
 
 			snprintf(sbuf, sizeof(sbuf), "%c%04X",
@@ -356,7 +399,7 @@ static enum append_ret asfd_append_all_to_write_buffer(struct asfd *asfd,
 			break;
 		}
 		case ASFD_STREAM_LINEBUF:
-			if(asfd->writebuflen+wbuf->len >= bufmaxsize-1)
+			if(asfd->writebuflen+wbuf->len>=asfd->bufmaxsize-1)
 				return APPEND_BLOCKED;
 			break;
 		case ASFD_STREAM_NCURSES_STDIN:
@@ -366,30 +409,46 @@ static enum append_ret asfd_append_all_to_write_buffer(struct asfd *asfd,
 			return APPEND_ERROR;
 	}
 	append_to_write_buffer(asfd, wbuf->buf, wbuf->len);
-//printf("append %d: %c:%s\n", wbuf->len, wbuf->cmd, wbuf->buf);
+//printf("append %s\n", iobuf_to_printable(wbuf));
 	wbuf->len=0;
 	return APPEND_OK;
 }
 
+#ifdef IPTOS_THROUGHPUT
+static int asfd_connection_af(struct asfd *asfd)
+{
+	struct sockaddr_storage s;
+	socklen_t slen = sizeof(s);
+
+	memset(&s, 0, sizeof(s));
+	if(getsockname(asfd->fd, (struct sockaddr *)&s, &slen)<0)
+		return 0;
+	return s.ss_family;
+}
+#endif
+
 static int asfd_set_bulk_packets(struct asfd *asfd)
 {
-#ifdef IP_TOS
-#ifndef IPTOS_THROUGHPUT
-// Windows/mingw64 does not define this, but it is just a bit in the packet
-// header. Set it ourselves. According to what I have read on forums, the
-// Windows machine may have some system wide policy that resets the bits.
-// At least the burp code will be doing the right thing by setting it, even
-// if Windows decides to remove it.
-#define IPTOS_THROUGHPUT 0x08
-#endif
+#ifdef IPTOS_THROUGHPUT
 	int opt=IPTOS_THROUGHPUT;
 	if(asfd->fd<0) return -1;
-	if(setsockopt(asfd->fd,
-		IPPROTO_IP, IP_TOS, (char *)&opt, sizeof(opt))<0)
+
+	switch(asfd_connection_af(asfd))
 	{
-		logp("%s: error: setsockopt IPTOS_THROUGHPUT: %s\n",
-			asfd->desc, strerror(errno));
-		return -1;
+		case AF_INET:
+			if(setsockopt(asfd->fd, IPPROTO_IP, IP_TOS,
+				(char *)&opt, sizeof(opt))>=0)
+					break;
+			logp("%s: error: set IPTOS throughput: %s\n",
+				asfd->desc, strerror(errno));
+			return -1;
+		case AF_INET6:
+			if(setsockopt(asfd->fd, IPPROTO_IPV6, IPV6_TCLASS,
+				(char *)&opt, sizeof(opt))>=0)
+					break;
+			logp("%s: error: set IPV6_TCLASS throughput: %s\n",
+				asfd->desc, strerror(errno));
+			return -1;
 	}
 #endif
 	return 0;
@@ -399,19 +458,24 @@ static int asfd_read(struct asfd *asfd)
 {
 	if(asfd->as->doing_estimate) return 0;
 	while(!asfd->rbuf->buf)
-		if(asfd->as->read_write(asfd->as)) return -1;
+	{
+		if(asfd->errors)
+			return -1;
+		if(asfd->as->read_write(asfd->as))
+			return -1;
+	}
 	return 0;
 }
 
-static int asfd_read_expect(struct asfd *asfd, enum cmd cmd, const char *expect)
+int asfd_read_expect(struct asfd *asfd, enum cmd cmd, const char *expect)
 {
 	int ret=0;
 	if(asfd->read(asfd)) return -1;
 	if(asfd->rbuf->cmd!=cmd || strcmp(asfd->rbuf->buf, expect))
 	{
-		logp("%s: expected '%c:%s', got '%c:%s'\n",
+		logp("%s: expected '%c:%s', got '%s'\n",
 			asfd->desc, cmd, expect,
-			asfd->rbuf->cmd, asfd->rbuf->buf);
+			iobuf_to_printable(asfd->rbuf));
 		ret=-1;
 	}
 	iobuf_free_content(asfd->rbuf);
@@ -423,6 +487,8 @@ static int asfd_write(struct asfd *asfd, struct iobuf *wbuf)
 	if(asfd->as->doing_estimate) return 0;
 	while(wbuf->len)
 	{
+		if(asfd->errors)
+			return -1;
 		if(asfd->append_all_to_write_buffer(asfd, wbuf)==APPEND_ERROR)
 			return -1;
 		if(asfd->as->write(asfd->as)) return -1;
@@ -430,22 +496,19 @@ static int asfd_write(struct asfd *asfd, struct iobuf *wbuf)
 	return 0;
 }
 
-static int asfd_write_strn(struct asfd *asfd,
-	enum cmd wcmd, const char *wsrc, size_t len)
+static int asfd_write_str(struct asfd *asfd, enum cmd wcmd, const char *wsrc)
 {
 	struct iobuf wbuf;
 	wbuf.cmd=wcmd;
 	wbuf.buf=(char *)wsrc;
-	wbuf.len=len;
+	wbuf.len=strlen(wsrc);
 	return asfd->write(asfd, &wbuf);
 }
 
-static int asfd_write_str(struct asfd *asfd, enum cmd wcmd, const char *wsrc)
-{
-	return asfd_write_strn(asfd, wcmd, wsrc, strlen(wsrc));
-}
-
-static int asfd_simple_loop(struct asfd *asfd,
+#ifndef UTEST
+static
+#endif
+int asfd_simple_loop(struct asfd *asfd,
 	struct conf **confs, void *param, const char *caller,
   enum asl_ret callback(struct asfd *asfd, struct conf **confs, void *param))
 {
@@ -454,12 +517,15 @@ static int asfd_simple_loop(struct asfd *asfd,
 	{
 		iobuf_free_content(rbuf);
 		if(asfd->read(asfd)) goto error;
+		if(!rbuf->buf) continue;
 		if(rbuf->cmd!=CMD_GEN)
 		{
 			if(rbuf->cmd==CMD_WARNING
 			  || rbuf->cmd==CMD_MESSAGE)
 			{
-				log_recvd(rbuf, confs, 0);
+				struct cntr *cntr=NULL;
+				if(confs) cntr=get_cntr(confs);
+				log_recvd(rbuf, cntr, 0);
 			}
 			else if(rbuf->cmd==CMD_INTERRUPT)
 			{
@@ -467,7 +533,7 @@ static int asfd_simple_loop(struct asfd *asfd,
 			}
 			else
 			{
-				logp("%s: unexpected command in %s(), called from %s(): %c:%s\n", asfd->desc, __func__, caller, rbuf->cmd, rbuf->buf);
+				logp("%s: unexpected command in %s(), called from %s(): %s\n", asfd->desc, __func__, caller, iobuf_to_printable(rbuf));
 				goto error;
 			}
 			continue;
@@ -491,24 +557,42 @@ error:
 	return -1;
 }
 
+static void asfd_set_timeout(struct asfd *asfd, int max_network_timeout)
+{
+	asfd->max_network_timeout=max_network_timeout;
+	asfd->network_timeout=asfd->max_network_timeout;
+}
+
+static char *get_asfd_desc(const char *desc, int fd)
+{
+	char r[256]="";
+	snprintf(r, sizeof(r), "%s %d", desc, fd);
+	return strdup_w(r, __func__);
+}
 
 static int asfd_init(struct asfd *asfd, const char *desc,
-	struct async *as, int afd, SSL *assl,
-	enum asfd_streamtype streamtype, struct conf **confs)
+	struct async *as, int afd, const char *listen,
+	SSL *assl, enum asfd_streamtype streamtype)
 {
 	asfd->as=as;
 	asfd->fd=afd;
 	asfd->ssl=assl;
 	asfd->streamtype=streamtype;
-	asfd->max_network_timeout=get_int(confs[OPT_NETWORK_TIMEOUT]);
-	asfd->network_timeout=asfd->max_network_timeout;
-	asfd->ratelimit=get_float(confs[OPT_RATELIMIT]);
 	asfd->rlsleeptime=10000;
 	asfd->pid=-1;
+	asfd->attempt_reads=1;
+	asfd->bufmaxsize=(ASYNC_BUF_LEN*2)+32;
+#ifdef HAVE_WIN32
+	// Windows craps out if you try to read stdin into a buffer that is
+	// too big!
+	if(asfd->fd==fileno(stdin))
+		asfd->bufmaxsize=4096;
+#endif
 
 	asfd->parse_readbuf=asfd_parse_readbuf;
 	asfd->append_all_to_write_buffer=asfd_append_all_to_write_buffer;
 	asfd->set_bulk_packets=asfd_set_bulk_packets;
+	asfd->set_timeout=asfd_set_timeout;
 	if(asfd->ssl)
 	{
 		asfd->do_read=asfd_do_read_ssl;
@@ -518,7 +602,7 @@ static int asfd_init(struct asfd *asfd, const char *desc,
 	{
 		asfd->do_read=asfd_do_read;
 		asfd->do_write=asfd_do_write;
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		if(asfd->streamtype==ASFD_STREAM_NCURSES_STDIN)
 		{
 			asfd->do_read=asfd_do_read_ncurses;
@@ -527,11 +611,9 @@ static int asfd_init(struct asfd *asfd, const char *desc,
 #endif
 	}
 	asfd->read=asfd_read;
-	asfd->read_expect=asfd_read_expect;
 	asfd->simple_loop=asfd_simple_loop;
 	asfd->write=asfd_write;
 	asfd->write_str=asfd_write_str;
-	asfd->write_strn=asfd_write_strn;
 
 	switch(asfd->streamtype)
 	{
@@ -541,7 +623,7 @@ static int asfd_init(struct asfd *asfd, const char *desc,
 		case ASFD_STREAM_LINEBUF:
 			asfd->parse_readbuf_specific=parse_readbuf_line_buf;
 			break;
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		case ASFD_STREAM_NCURSES_STDIN:
 			asfd->parse_readbuf_specific=parse_readbuf_ncurses;
 			break;
@@ -553,9 +635,10 @@ static int asfd_init(struct asfd *asfd, const char *desc,
 	}
 
 	if(!(asfd->rbuf=iobuf_alloc())
-	  || asfd_alloc_buf(&asfd->readbuf)
-	  || asfd_alloc_buf(&asfd->writebuf)
-	  || !(asfd->desc=strdup_w(desc, __func__)))
+	  || asfd_alloc_buf(asfd, &asfd->readbuf)
+	  || asfd_alloc_buf(asfd, &asfd->writebuf)
+	  || !(asfd->desc=get_asfd_desc(desc, asfd->fd))
+	  || !(asfd->listen=strdup_w(listen, __func__)))
 		return -1;
 	return 0;
 }
@@ -563,9 +646,9 @@ static int asfd_init(struct asfd *asfd, const char *desc,
 struct asfd *asfd_alloc(void)
 {
 	struct asfd *asfd;
-	if(!(asfd=(struct asfd *)calloc_w(1, sizeof(struct asfd), __func__)))
-		return NULL;
-	asfd->init=asfd_init;
+	asfd=(struct asfd *)calloc_w(1, sizeof(struct asfd), __func__);
+	if(asfd)
+		asfd->fd=-1;
 	return asfd;
 }
 
@@ -574,17 +657,16 @@ void asfd_close(struct asfd *asfd)
 	if(!asfd) return;
 	if(asfd->ssl && asfd->fd>=0)
 	{
-		int r;
 		set_blocking(asfd->fd);
 		// I do not think this SSL_shutdown stuff works right.
 		// Ignore it for now.
 #ifndef HAVE_WIN32
 		signal(SIGPIPE, SIG_IGN);
 #endif
-		if(!(r=SSL_shutdown(asfd->ssl)))
+		if(!SSL_shutdown(asfd->ssl))
 		{
 			shutdown(asfd->fd, 1);
-			r=SSL_shutdown(asfd->ssl);
+			SSL_shutdown(asfd->ssl);
 		}
 	}
 	if(asfd->ssl)
@@ -595,35 +677,42 @@ void asfd_close(struct asfd *asfd)
 	close_fd(&asfd->fd);
 }
 
+static void asfd_free_content(struct asfd *asfd)
+{
+	asfd_close(asfd);
+	iobuf_free(&asfd->rbuf);
+	free_w(&asfd->readbuf);
+	free_w(&asfd->writebuf);
+	free_w(&asfd->desc);
+	free_w(&asfd->client);
+	free_w(&asfd->listen);
+	incoming_free(&asfd->in);
+	blist_free(&asfd->blist);
+}
+
 void asfd_free(struct asfd **asfd)
 {
 	if(!asfd || !*asfd) return;
-	asfd_close(*asfd);
-	iobuf_free(&((*asfd)->rbuf));
-	free_w(&((*asfd)->readbuf));
-	free_w(&((*asfd)->writebuf));
-	free_w(&((*asfd)->desc));
-	// FIX THIS: free incoming?
-	blist_free(&((*asfd)->blist));
+	asfd_free_content(*asfd);
 	free_v((void **)asfd);
 }
 
-struct asfd *setup_asfd(struct async *as, const char *desc, int *fd, SSL *ssl,
-	enum asfd_streamtype asfd_streamtype, enum asfd_fdtype fdtype,
-	pid_t pid, struct conf **conf)
+static struct asfd *do_setup_asfd(struct async *as,
+	const char *desc, int *fd, const char *listen,
+	SSL *ssl, enum asfd_streamtype streamtype)
 {
 	struct asfd *asfd=NULL;
+
 	if(!fd || *fd<0)
 	{
 		logp("Given invalid descriptor in %s\n", __func__);
 		goto error;
 	}
+
 	set_non_blocking(*fd);
 	if(!(asfd=asfd_alloc())
-	  || asfd->init(asfd, desc, as, *fd, ssl, asfd_streamtype, conf))
+	  || asfd_init(asfd, desc, as, *fd, listen, ssl, streamtype))
 		goto error;
-	asfd->fdtype=fdtype;
-	asfd->pid=pid;
 	*fd=-1;
 	as->asfd_add(as, asfd);
 	return asfd;
@@ -631,3 +720,120 @@ error:
 	asfd_free(&asfd);
 	return NULL;
 }
+
+struct asfd *setup_asfd_ssl(struct async *as,
+	const char *desc, int *fd, SSL *ssl)
+{
+	return do_setup_asfd(as, desc, fd, /*listen*/"",
+		ssl, ASFD_STREAM_STANDARD);
+}
+
+struct asfd *setup_asfd(struct async *as,
+	const char *desc, int *fd, const char *listen)
+{
+	return do_setup_asfd(as, desc, fd, listen,
+		/*ssl*/NULL, ASFD_STREAM_STANDARD);
+}
+
+static struct asfd *setup_asfd_linebuf(struct async *as,
+	const char *desc, int *fd)
+{
+	return do_setup_asfd(as, desc, fd, /*listen*/"",
+		/*ssl*/NULL, ASFD_STREAM_LINEBUF);
+}
+
+struct asfd *setup_asfd_linebuf_read(struct async *as,
+	const char *desc, int *fd)
+{
+	return setup_asfd_linebuf(as, desc, fd);
+}
+
+struct asfd *setup_asfd_linebuf_write(struct async *as,
+	const char *desc, int *fd)
+{
+	struct asfd *asfd;
+	if((asfd=setup_asfd_linebuf(as, desc, fd)))
+		asfd->attempt_reads=0;
+	return asfd;
+}
+
+static struct asfd *fileno_error(const char *func)
+{
+	logp("fileno error in %s: %s\n", func, strerror(errno));
+	return NULL;
+}
+
+struct asfd *setup_asfd_stdin(struct async *as)
+{
+	int fd=fileno(stdin);
+	if(fd<0)
+		return fileno_error(__func__);
+	return setup_asfd_linebuf_read(as, "stdin", &fd);
+}
+
+struct asfd *setup_asfd_stdout(struct async *as)
+{
+	int fd=fileno(stdout);
+	if(fd<0)
+		return fileno_error(__func__);
+	return setup_asfd_linebuf_write(as, "stdout", &fd);
+}
+
+struct asfd *setup_asfd_ncurses_stdin(struct async *as)
+{
+	int fd=fileno(stdin);
+	if(fd<0)
+		return fileno_error(__func__);
+	return do_setup_asfd(as, "stdin", &fd, /*listen*/"",
+		/*ssl=*/NULL, ASFD_STREAM_NCURSES_STDIN);
+}
+
+// Want to make sure that we are listening for reads too - this will let us
+// exit promptly if the client was killed.
+static int read_and_write(struct asfd *asfd)
+{
+	// Protect against getting stuck in loops where we are trying to
+	// flush buffers, but keep getting the same error.
+	if(asfd->as->read_write(asfd->as))
+		return -1;
+	if(!asfd->rbuf->buf) return 0;
+	iobuf_log_unexpected(asfd->rbuf, __func__);
+	return -1;
+}
+
+int asfd_flush_asio(struct asfd *asfd)
+{
+	while(asfd && asfd->writebuflen>0)
+	{
+		if(asfd->errors)
+			return -1;
+		if(read_and_write(asfd))
+			return -1;
+	}
+	return 0;
+}
+
+int asfd_write_wrapper(struct asfd *asfd, struct iobuf *wbuf)
+{
+	while(1)
+	{
+		if(asfd->errors)
+			return -1;
+		switch(asfd->append_all_to_write_buffer(asfd, wbuf))
+		{
+			case APPEND_OK: return 0;
+			case APPEND_BLOCKED: break;
+			default: return -1;
+		}
+		if(read_and_write(asfd)) return -1;
+	}
+	return 0;
+}
+
+int asfd_write_wrapper_str(struct asfd *asfd, enum cmd wcmd, const char *wsrc)
+{
+	static struct iobuf wbuf;
+	iobuf_from_str(&wbuf, wcmd, (char *)wsrc);
+	return asfd_write_wrapper(asfd, &wbuf);
+}
+

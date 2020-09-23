@@ -1,7 +1,3 @@
-#
-# Makefile for win32 burp executables
-# Using MinGW cross-compiler on GNU/Linux
-
 include ../Makefile.inc
 
 INCLUDES = \
@@ -10,34 +6,21 @@ INCLUDES = \
 	$(INCLUDE_OPENSSL)
 
 DEFINES = \
-	$(HAVES)
+	$(HAVES) \
+	$(PACKAGE_DEFINES)
 
 vpath %.c $(BUILDDIR)/compat
 vpath %.cpp $(BUILDDIR)/compat
 
 ######################################################################
 
-# Files files in src/lib
+# Files files in src/win32/compat
 
 COMPAT_OBJS = \
 	$(OBJDIR)/compat.o \
 	$(OBJDIR)/mem_pool.o \
 	$(OBJDIR)/print.o \
 	$(OBJDIR)/winapi.o
-
-#	$(OBJDIR)/getopt.o \
-
-FIND_OBJS = 
-
-LIB_OBJS = 
-
-DLL_OBJS = \
-	$(COMPAT_OBJS) $(FIND_OBJS) $(LIB_OBJS)
-
-STATIC_OBJS = 
-
-ALL_OBJS = \
-	$(DLL_OBJS) $(STATIC_OBJS)
 
 LIBS_DLL = \
 	$(LIBS_SSL) \
@@ -55,30 +38,31 @@ LIBS_DLL = \
 
 .PHONY: all clean
 
-all: $(BINDIR)/burp.dll $(LIBDIR)/libburp.a
+all: $(BINDIR)/compat.dll $(LIBDIR)/libcompat.a
 
 clean:
 	@echo "Cleaning `pwd`"
-	$(call clean_obj,$(ALL_OBJS))
-	$(call clean_exe,$(BINDIR)/burp.dll)
-	$(ECHO_CMD)rm -f $(OBJDIR)/burp.a $(LIBDIR)/libburp.a
+	$(call clean_obj,$(COMPAT_OBJS))
+	$(call clean_exe,$(BINDIR)/compat.dll)
+	$(ECHO_CMD)rm -f $(OBJDIR)/burp.a
+	$(ECHO_CMD)rm -f $(OBJDIR)/libcompat.a
 	$(ECHO_CMD)rm -rf $(OBJDIRS)
 
 #
 # Rules for generating from ../lib
 #
 
-$(LIBDIR)/libburp.a: DLL_DEFINE=USING_DLL
+$(LIBDIR)/libcompat.a: DLL_DEFINE=USING_DLL
 
-$(LIBDIR)/libburp.a: $(BINDIR)/burp.dll $(STATIC_OBJS)
+$(LIBDIR)/libcompat.a: $(BINDIR)/compat.dll $(STATIC_OBJS)
 	@echo "Updating archive $@"
 	$(call checkdir,$@)
 	$(ECHO_CMD)cp $(OBJDIR)/burp.a $@
 	$(ECHO_CMD)$(AR) rsv $@ $(filter %.o,$^)
 
-$(BINDIR)/burp.dll: DLL_DEFINE=BUILDING_DLL
+$(BINDIR)/compat.dll: DLL_DEFINE=BUILDING_DLL
 
-$(BINDIR)/burp.dll: $(DLL_OBJS) burp$(WIN_VERSION).def
+$(BINDIR)/compat.dll: $(COMPAT_OBJS) compat$(WIN_VERSION).def
 	@echo "Linkinga $@"
 	$(call checkdir,$@)
 	$(ECHO_CMD)$(CXX) $(LDFLAGS) -mdll -mwindows -Wl,--out-implib,$(OBJDIR)/burp.a $^ $(LIBS_DLL) -o $@

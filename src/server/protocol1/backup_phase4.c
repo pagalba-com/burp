@@ -1,43 +1,58 @@
-#include "include.h"
+#include "../../burp.h"
+#include "../../alloc.h"
+#include "../../asfd.h"
+#include "../../async.h"
 #include "../../cmd.h"
+#include "../../cntr.h"
+#include "../../conf.h"
+#include "../../cstat.h"
+#include "../../fsops.h"
+#include "../../fzp.h"
+#include "../../handy.h"
+#include "../../log.h"
+#include "../../prepend.h"
+#include "../../sbuf.h"
+#include "../../strlist.h"
+#include "../child.h"
+#include "../compress.h"
 #include "../timestamp.h"
+#include "blocklen.h"
+#include "deleteme.h"
 #include "fdirs.h"
+#include "link.h"
+#include "zlibio.h"
+#include "backup_phase4.h"
 
-#include <netdb.h>
 #include <librsync.h>
-#include <dirent.h>
 
 // Also used by restore.c.
 // FIX THIS: This stuff is very similar to make_rev_delta, can maybe share
 // some code.
-int do_patch(struct asfd *asfd, const char *dst, const char *del,
-	const char *upd, bool gzupd, int compression, struct conf **cconfs)
+int do_patch(const char *dst, const char *del,
+	const char *upd, bool gzupd, int compression)
 {
 	struct fzp *dstp=NULL;
 	struct fzp *delfzp=NULL;
 	struct fzp *upfzp=NULL;
 	rs_result result=RS_IO_ERROR;
 
-	//logp("patching...\n");
-
 	if(!(dstp=fzp_open(dst, "rb"))) goto end;
 
-	if(dpth_protocol1_is_compressed(compression, del))
-		delfzp=fzp_gzopen(del, "rb");
-	else
-		delfzp=fzp_open(del, "rb");
-
-	if(!delfzp) goto end;
+	if(!(delfzp=fzp_gzopen(del, "rb")))
+		goto end;
 
 	if(gzupd)
-		upfzp=fzp_gzopen(upd, comp_level(cconfs));
+		upfzp=fzp_gzopen(upd, comp_level(compression));
 	else
 		upfzp=fzp_open(upd, "wb");
 
 	if(!upfzp) goto end;
 
-	result=rs_patch_gzfile(asfd,
-		dstp, delfzp, upfzp, NULL, get_cntr(cconfs[OPT_CNTR]));
+	if((result=rs_patch_gzfile(dstp, delfzp, upfzp))!=RS_DONE)
+	{
+		logp("rs_patch_gzfile returned %d %s\n",
+			result, rs_strerror(result));
+	}
 end:
 	fzp_close(&dstp);
 	fzp_close(&delfzp);
@@ -49,15 +64,11 @@ end:
 	return result;
 }
 
-// Help librsync-1.0.0
-#ifndef RS_DEFAULT_STRONG_LEN
-#define RS_DEFAULT_STRONG_LEN	8
-#endif
-
 static int make_rev_sig(const char *dst, const char *sig, const char *endfile,
 	int compression, struct conf **confs)
 {
 	int ret=-1;
+	rs_result result;
 	struct fzp *dstfzp=NULL;
 	struct fzp *sigp=NULL;
 //logp("make rev sig: %s %s\n", dst, sig);
@@ -68,12 +79,17 @@ static int make_rev_sig(const char *dst, const char *sig, const char *endfile,
 		dstfzp=fzp_open(dst, "rb");
 
 	if(!dstfzp
-	  || !(sigp=fzp_open(sig, "wb"))
-	  || rs_sig_gzfile(NULL, dstfzp, sigp,
+	  || !(sigp=fzp_open(sig, "wb")))
+		goto end;
+	
+	if((result=rs_sig_gzfile(dstfzp, sigp,
 		get_librsync_block_len(endfile),
-		RS_DEFAULT_STRONG_LEN,
-		NULL, confs)!=RS_DONE)
-			goto end;
+		PROTO1_RS_STRONG_LEN, confs)!=RS_DONE))
+	{
+		logp("rs_sig_gzfile returned %d %s\n",
+			result, rs_strerror(result));
+		goto end;
+	}
 	ret=0;
 end:
 //logp("end of make rev sig\n");
@@ -90,6 +106,7 @@ static int make_rev_delta(const char *src, const char *sig, const char *del,
 	int compression, struct conf **cconfs)
 {
 	int ret=-1;
+	rs_result result;
 	struct fzp *srcfzp=NULL;
 	struct fzp *delfzp=NULL;
 	struct fzp *sigp=NULL;
@@ -98,9 +115,18 @@ static int make_rev_delta(const char *src, const char *sig, const char *del,
 //logp("make rev delta: %s %s %s\n", src, sig, del);
 	if(!(sigp=fzp_open(sig, "rb"))) goto end;
 
-	if(rs_loadsig_fzp(sigp, &sumset, NULL)!=RS_DONE
-	  || rs_build_hash_table(sumset)!=RS_DONE)
+	if((result=rs_loadsig_fzp(sigp, &sumset))!=RS_DONE)
+	{
+		logp("rs_loadsig_fzp returned %d %s\n",
+			result, rs_strerror(result));
 		goto end;
+	}
+	if((result=rs_build_hash_table(sumset))!=RS_DONE)
+	{
+		logp("rs_build_hash_table returned %d %s\n",
+			result, rs_strerror(result));
+		goto end;
+	}
 
 //logp("make rev deltb: %s %s %s\n", src, sig, del);
 
@@ -112,14 +138,18 @@ static int make_rev_delta(const char *src, const char *sig, const char *del,
 	if(!srcfzp) goto end;
 
 	if(get_int(cconfs[OPT_COMPRESSION]))
-		delfzp=fzp_gzopen(del, comp_level(cconfs));
+		delfzp=fzp_gzopen(del,
+			comp_level(get_int(cconfs[OPT_COMPRESSION])));
 	else
 		delfzp=fzp_open(del, "wb");
 	if(!delfzp) goto end;
 
-	if(rs_delta_gzfile(NULL, sumset, srcfzp,
-		delfzp, NULL, get_cntr(cconfs[OPT_CNTR]))!=RS_DONE)
-			goto end;
+	if((result=rs_delta_gzfile(sumset, srcfzp, delfzp))!=RS_DONE)
+	{
+		logp("rs_delta_gzfile returned %d %s\n",
+			result, rs_strerror(result));
+		goto end;
+	}
 	ret=0;
 end:
 	if(sumset) rs_free_sumset(sumset);
@@ -157,7 +187,7 @@ static int gen_rev_delta(const char *sigpath, const char *deltadir,
 		goto end;
 	}
 	else if(make_rev_sig(finpath, sigpath,
-		sb->protocol1->endfile.buf, sb->compression, cconfs))
+		sb->endfile.buf, sb->compression, cconfs))
 	{
 		logp("could not make signature from: %s\n", finpath);
 		goto end;
@@ -172,12 +202,12 @@ static int gen_rev_delta(const char *sigpath, const char *deltadir,
 
 	ret=0;
 end:
-	if(delpath) free(delpath);
+	free_w(&delpath);
 	return ret;
 }
 
 static int inflate_oldfile(const char *opath, const char *infpath,
-	struct stat *statp, struct conf **confs)
+	struct stat *statp, struct cntr *cntr)
 {
 	int ret=0;
 
@@ -192,7 +222,7 @@ static int inflate_oldfile(const char *opath, const char *infpath,
 		if(fzp_close(&dest))
 			logp("error closing %s in %s\n", infpath, __func__);
 	}
-	else if(zlib_inflate(NULL, opath, infpath, confs))
+	else if(zlib_inflate(NULL, opath, infpath, cntr))
 	{
 		logp("zlib_inflate returned error\n");
 		ret=-1;
@@ -213,13 +243,125 @@ static int inflate_or_link_oldfile(const char *oldpath, const char *infpath,
 	}
 
 	if(dpth_protocol1_is_compressed(compression, oldpath))
-		return inflate_oldfile(oldpath, infpath, &statp, cconfs);
+		return inflate_oldfile(oldpath, infpath, &statp,
+			get_cntr(cconfs));
 
 	// If it was not a compressed file, just hard link it.
 	// It is possible that infpath already exists, if the server
 	// was interrupted on a previous run just after this point.
 	return do_link(oldpath, infpath, &statp, cconfs,
 		1 /* allow overwrite of infpath */);
+}
+
+static int forward_patch_and_reverse_diff(
+	struct fdirs *fdirs,
+	struct fzp **delfp,
+	const char *deltabdir,
+	const char *deltafdir,
+	const char *deltafpath,
+	const char *sigpath,
+	const char *oldpath,
+	const char *newpath,
+	const char *datapth,
+	const char *finpath,
+	int hardlinked_current,
+	struct sbuf *sb,
+	struct conf **cconfs
+)
+{
+	int lrs;
+	int ret=-1;
+	char *infpath=NULL;
+
+	// Got a forward patch to do.
+	// First, need to gunzip the old file, otherwise the librsync patch
+	// will take forever, because it will be doing seeks all over the
+	// place, and gzseeks are slow.
+	if(!(infpath=prepend_s(deltafdir, "inflate")))
+	{
+		log_out_of_memory(__func__);
+		goto end;
+	}
+
+	//logp("Fixing up: %s\n", datapth);
+	if(inflate_or_link_oldfile(oldpath, infpath, sb->compression, cconfs))
+	{
+		logp("error when inflating old file: %s\n", oldpath);
+		goto end;
+	}
+
+	if((lrs=do_patch(infpath, deltafpath, newpath,
+		sb->compression, sb->compression /* from manifest */)))
+	{
+		logp("WARNING: librsync error when patching %s: %d\n",
+			oldpath, lrs);
+		cntr_add(get_cntr(cconfs), CMD_WARNING, 1);
+		// Try to carry on with the rest of the backup regardless.
+		// Remove anything that got written.
+		unlink(newpath);
+
+		// First, note that we want to remove this entry from
+		// the manifest.
+		if(!*delfp
+		  && !(*delfp=fzp_open(fdirs->deletionsfile, "ab")))
+		{
+			// Could not mark this file as deleted. Fatal.
+			goto end;
+		}
+		if(sbuf_to_manifest(sb, *delfp))
+			goto end;
+		if(fzp_flush(*delfp))
+		{
+			logp("error fflushing deletions file in %s: %s\n",
+				__func__, strerror(errno));
+			goto end;
+		}
+		ret=0;
+		goto end;
+	}
+
+	// Need to generate a reverse diff, unless we are keeping a hardlinked
+	// archive.
+	if(!hardlinked_current)
+	{
+		if(gen_rev_delta(sigpath, deltabdir,
+			oldpath, newpath, datapth, sb, cconfs))
+				goto end;
+	}
+
+	// Power interruptions should be recoverable. If it happens before this
+	// point, the data jiggle for this file has to be done again.
+	// Once finpath is in place, no more jiggle is required.
+
+	// Use the fresh new file.
+	// Rename race condition is of no consequence, because finpath will
+	// just get recreated automatically.
+	if(do_rename(newpath, finpath))
+		goto end;
+
+	// Remove the forward delta, as it is no longer needed. There is a
+	// reverse diff and the finished finished file is in place.
+	//logp("Deleting delta.forward...\n");
+	unlink(deltafpath);
+
+	// Remove the old file. If a power cut happens just before this, the
+	// old file will hang around forever.
+	// FIX THIS: maybe put in something to detect this.
+	// ie, both a reverse delta and the old file exist.
+	if(!hardlinked_current)
+	{
+		//logp("Deleting oldpath...\n");
+		unlink(oldpath);
+	}
+
+	ret=0;
+end:
+	if(infpath)
+	{
+		unlink(infpath);
+		free_w(&infpath);
+	}
+	return ret;
 }
 
 static int jiggle(struct sdirs *sdirs, struct fdirs *fdirs, struct sbuf *sb,
@@ -232,6 +374,7 @@ static int jiggle(struct sdirs *sdirs, struct fdirs *fdirs, struct sbuf *sb,
 	char *newpath=NULL;
 	char *finpath=NULL;
 	char *deltafpath=NULL;
+	char *relinkpath=NULL;
 	const char *datapth=sb->protocol1->datapth.buf;
 
 	// If the previous backup was a hardlinked_archive, there will not be
@@ -246,132 +389,53 @@ static int jiggle(struct sdirs *sdirs, struct fdirs *fdirs, struct sbuf *sb,
 
 	if(!lstat(finpath, &statp) && S_ISREG(statp.st_mode))
 	{
-		// Looks like an interrupted jiggle
-		// did this file already.
+		// Looks like an interrupted jiggle did this file already.
 		static int donemsg=0;
-		if(!lstat(deltafpath, &statp) && S_ISREG(statp.st_mode))
-		{
-			logp("deleting unneeded forward delta: %s\n",
+		if(!unlink(deltafpath))
+			logp("deleted unneeded forward delta: %s\n",
 				deltafpath);
-			unlink(deltafpath);
-		}
 		if(!donemsg)
 		{
 			logp("skipping already present file: %s\n", finpath);
 			logp("to save log space, skips of other already present files will not be logged\n");
 			donemsg++;
 		}
+		ret=0;
+		goto end;
 	}
-	else if(mkpath(&finpath, fdirs->datadir))
+
+	if(mkpath(&finpath, fdirs->datadir))
 	{
 		logp("could not create path for: %s\n", finpath);
 		goto end;
 	}
-	else if(mkpath(&newpath, fdirs->datadirtmp))
+
+	if(!lstat(deltafpath, &statp) && S_ISREG(statp.st_mode))
 	{
-		logp("could not create path for: %s\n", newpath);
+		if(mkpath(&newpath, fdirs->datadirtmp))
+		{
+			logp("could not create path for: %s\n", newpath);
+			goto end;
+		}
+		ret=forward_patch_and_reverse_diff(
+			fdirs,
+			delfp,
+			deltabdir,
+			deltafdir,
+			deltafpath,
+			sigpath,
+			oldpath,
+			newpath,
+			datapth,
+			finpath,
+			hardlinked_current,
+			sb,
+			cconfs
+		);
 		goto end;
 	}
-	else if(!lstat(deltafpath, &statp) && S_ISREG(statp.st_mode))
-	{
-		int lrs;
-		char *infpath=NULL;
 
-		// Got a forward patch to do.
-		// First, need to gunzip the old file,
-		// otherwise the librsync patch will take
-		// forever, because it will be doing seeks
-		// all over the place, and gzseeks are slow.
-	  	if(!(infpath=prepend_s(deltafdir, "inflate")))
-		{
-			log_out_of_memory(__func__);
-			goto end;
-		}
-
-		//logp("Fixing up: %s\n", datapth);
-		if(inflate_or_link_oldfile(oldpath, infpath,
-			sb->compression, cconfs))
-		{
-			logp("error when inflating old file: %s\n", oldpath);
-			free(infpath);
-			goto end;
-		}
-
-		if((lrs=do_patch(NULL, infpath, deltafpath, newpath,
-			get_int(cconfs[OPT_COMPRESSION]),
-			sb->compression /* from the manifest */, cconfs)))
-		{
-			logp("WARNING: librsync error when patching %s: %d\n",
-				oldpath, lrs);
-			cntr_add(get_cntr(cconfs[OPT_CNTR]), CMD_WARNING, 1);
-			// Try to carry on with the rest of the backup
-			// regardless.
-			//ret=-1;
-			// Remove anything that got written.
-			unlink(newpath);
-			unlink(infpath);
-			free(infpath);
-
-			// First, note that we want to remove this entry from
-			// the manifest.
-			if(!*delfp
-			  && !(*delfp=fzp_open(fdirs->deletionsfile, "ab")))
-			{
-				// Could not mark this file as deleted. Fatal.
-				goto end;
-			}
-			if(sbufl_to_manifest(sb, *delfp))
-				goto end;
-			if(fzp_flush(*delfp))
-			{
-				logp("error fflushing deletions file in %s: %s\n", __func__, strerror(errno));
-				goto end;
-			}
-	
-			ret=0;
-			goto end;
-		}
-
-		// Get rid of the inflated old file.
-		unlink(infpath);
-		free(infpath);
-
-		// Need to generate a reverse diff, unless we are keeping a
-		// hardlinked archive.
-		if(!hardlinked_current)
-		{
-			if(gen_rev_delta(sigpath, deltabdir,
-				oldpath, newpath, datapth, sb, cconfs))
-					goto end;
-		}
-
-		// Power interruptions should be recoverable. If it happens
-		// before this point, the data jiggle for this file has to be
-		// done again.
-		// Once finpath is in place, no more jiggle is required.
-
-		// Use the fresh new file.
-		// Rename race condition is of no consequence, because finpath
-		// will just get recreated automatically.
-		if(do_rename(newpath, finpath))
-			goto end;
-
-		// Remove the forward delta, as it is no longer needed. There
-		// is a reverse diff and the finished finished file is in place.
-		//logp("Deleting delta.forward...\n");
-		unlink(deltafpath);
-
-		// Remove the old file. If a power cut happens just before
-		// this, the old file will hang around forever.
-		// FIX THIS: maybe put in something to detect this.
-		// ie, both a reverse delta and the old file exist.
-		if(!hardlinked_current)
-		{
-			//logp("Deleting oldpath...\n");
-			unlink(oldpath);
-		}
-	}
-	else if(!lstat(newpath, &statp) && S_ISREG(statp.st_mode))
+	if(!lstat(newpath, &statp) && S_ISREG(statp.st_mode))
 	{
 		// Use the fresh new file.
 		// This needs to happen after checking
@@ -382,10 +446,11 @@ static int jiggle(struct sdirs *sdirs, struct fdirs *fdirs, struct sbuf *sb,
 		// will just get recreated automatically.
 
 		//logp("Using newly received file\n");
-		if(do_rename(newpath, finpath))
-			goto end;
+		ret=do_rename(newpath, finpath);
+		goto end;
 	}
-	else if(!lstat(oldpath, &statp) && S_ISREG(statp.st_mode))
+
+	if(!lstat(oldpath, &statp) && S_ISREG(statp.st_mode))
 	{
 		// Use the old unchanged file.
 		// Hard link it first.
@@ -403,19 +468,28 @@ static int jiggle(struct sdirs *sdirs, struct fdirs *fdirs, struct sbuf *sb,
 				unlink(oldpath);
 			}
 		}
-	}
-	else
-	{
-		logp("could not find: %s\n", oldpath);
+		ret=0;
 		goto end;
 	}
 
-	ret=0;
+	if(!(relinkpath=prepend_s(sdirs->relink, datapth)))
+		goto end;
+	if(!lstat(relinkpath, &statp) && S_ISREG(statp.st_mode))
+	{
+		// Use the relinked path - something that used to be a hardlink
+		// but is now the original file because the file that we
+		// originally hardlinked to has been deleted.
+		ret=do_rename(relinkpath, finpath);
+		goto end;
+	}
+
+	logp("could not find: %s\n", oldpath);
 end:
 	free_w(&oldpath);
 	free_w(&newpath);
 	free_w(&finpath);
 	free_w(&deltafpath);
+	free_w(&relinkpath);
 	return ret;
 }
 
@@ -424,7 +498,7 @@ end:
    based on the first 'keep' value. This is so that we have more choice
    of backups to delete than just the oldest.
 */
-static int need_hardlinked_archive(struct conf **cconfs, unsigned long bno)
+static int need_hardlinked_archive(struct conf **cconfs, uint64_t bno)
 {
 	int kp=0;
 	int ret=0;
@@ -444,11 +518,11 @@ static int need_hardlinked_archive(struct conf **cconfs, unsigned long bno)
 	// periodically hardlink, based on the first 'keep' value.
 	kp=keep->flag;
 
-	logp("First keep value: %d, backup: %lu (%lu-1=%lu)\n",
+	logp("First keep value: %d, backup: %" PRIu64 " (%" PRIu64 "-1=%" PRIu64 ")\n",
 			kp, bno, bno, bno-1);
 
 	ret=(bno-1)%kp;
-	logp("New backup is %sa hardlinked_archive (%lu%%%d=%d)\n",
+	logp("New backup is %sa hardlinked_archive (%" PRIu64 "%%%d=%d)\n",
 		ret?"not ":"", bno-1, kp, ret);
 
 	return !ret;
@@ -476,22 +550,23 @@ static int maybe_delete_files_from_manifest(const char *manifesttmp,
 
         if(!(dfp=fzp_open(fdirs->deletionsfile, "rb"))
 	  || !(omzp=fzp_gzopen(fdirs->manifest, "rb"))
-	  || !(nmzp=fzp_gzopen(manifesttmp, comp_level(cconfs)))
-	  || !(db=sbuf_alloc(cconfs))
-	  || !(mb=sbuf_alloc(cconfs)))
+	  || !(nmzp=fzp_gzopen(manifesttmp,
+		comp_level(get_int(cconfs[OPT_COMPRESSION]))))
+	  || !(db=sbuf_alloc(PROTO_1))
+	  || !(mb=sbuf_alloc(PROTO_1)))
 		goto end;
 
 	while(omzp || dfp)
 	{
 		if(dfp && !db->path.buf
-		  && (ars=sbufl_fill(db, NULL, dfp, cconfs)))
+		  && (ars=sbuf_fill_from_file(db, dfp, NULL)))
 		{
 			if(ars<0) goto end;
 			// ars==1 means it ended ok.
 			fzp_close(&dfp);
 		}
 		if(omzp && !mb->path.buf
-		  && (ars=sbufl_fill(mb, NULL, omzp, cconfs)))
+		  && (ars=sbuf_fill_from_file(mb, omzp, NULL)))
 		{
 			if(ars<0) goto end;
 			// ars==1 means it ended ok.
@@ -500,14 +575,14 @@ static int maybe_delete_files_from_manifest(const char *manifesttmp,
 
 		if(mb->path.buf && !db->path.buf)
 		{
-			if(sbufl_to_manifest(mb, nmzp)) goto end;
+			if(sbuf_to_manifest(mb, nmzp)) goto end;
 			sbuf_free_content(mb);
 		}
 		else if(!mb->path.buf && db->path.buf)
 		{
 			sbuf_free_content(db);
 		}
-		else if(!mb->path.buf && !db->path.buf) 
+		else if(!mb->path.buf && !db->path.buf)
 		{
 			continue;
 		}
@@ -520,7 +595,7 @@ static int maybe_delete_files_from_manifest(const char *manifesttmp,
 		else if(pcmp<0)
 		{
 			// Behind in manifest. Write.
-			if(sbufl_to_manifest(mb, nmzp)) goto end;
+			if(sbuf_to_manifest(mb, nmzp)) goto end;
 			sbuf_free_content(mb);
 		}
 		else
@@ -556,9 +631,9 @@ end:
 }
 
 /* Need to make all the stuff that this does atomic so that existing backups
-   never get broken, even if somebody turns the power off on the server. */ 
+   never get broken, even if somebody turns the power off on the server. */
 static int atomic_data_jiggle(struct sdirs *sdirs, struct fdirs *fdirs,
-	int hardlinked_current, struct conf **cconfs, unsigned long bno)
+	int hardlinked_current, struct conf **cconfs)
 {
 	int ret=-1;
 	char *datapth=NULL;
@@ -592,7 +667,7 @@ static int atomic_data_jiggle(struct sdirs *sdirs, struct fdirs *fdirs,
 	if(!(deltabdir=prepend_s(fdirs->currentdup, "deltas.reverse"))
 	  || !(deltafdir=prepend_s(sdirs->finishing, "deltas.forward"))
 	  || !(sigpath=prepend_s(fdirs->currentdup, "sig.tmp"))
-	  || !(sb=sbuf_alloc(cconfs)))
+	  || !(sb=sbuf_alloc(PROTO_1)))
 	{
 		log_out_of_memory(__func__);
 		goto error;
@@ -602,7 +677,7 @@ static int atomic_data_jiggle(struct sdirs *sdirs, struct fdirs *fdirs,
 
 	while(1)
 	{
-		switch(sbufl_fill(sb, NULL, zp, cconfs))
+		switch(sbuf_fill_from_file(sb, zp, NULL))
 		{
 			case 0: break;
 			case 1: goto end;
@@ -610,7 +685,7 @@ static int atomic_data_jiggle(struct sdirs *sdirs, struct fdirs *fdirs,
 		}
 		if(sb->protocol1->datapth.buf)
 		{
-			if(write_status(CNTR_STATUS_SHUFFLING,
+			if(timed_operation_status_only(CNTR_STATUS_SHUFFLING,
 				sb->protocol1->datapth.buf, cconfs)
 			  || jiggle(sdirs, fdirs, sb, hardlinked_current,
 				deltabdir, deltafdir,
@@ -633,8 +708,7 @@ end:
 
 	// Remove the temporary data directory, we have probably removed
 	// useful files from it.
-	sync(); // try to help CIFS
-	recursive_delete(deltafdir, NULL, 0 /* do not del files */);
+	recursive_delete_dirs_only(deltafdir);
 
 	ret=0;
 error:
@@ -653,28 +727,25 @@ int backup_phase4_server_protocol1(struct sdirs *sdirs, struct conf **cconfs)
 {
 	int ret=-1;
 	struct stat statp;
-	ssize_t len=0;
 	char realcurrent[256]="";
-	unsigned long bno=0;
+	uint64_t bno=0;
 	int hardlinked_current=0;
 	char tstmp[64]="";
 	int previous_backup=0;
 	struct fdirs *fdirs=NULL;
 
-	if((len=readlink(sdirs->current, realcurrent, sizeof(realcurrent)-1))<0)
-		len=0;
-	realcurrent[len]='\0';
+	readlink_w(sdirs->current, realcurrent, sizeof(realcurrent));
 
 	if(!(fdirs=fdirs_alloc())
 	  || fdirs_init(fdirs, sdirs, realcurrent))
 		goto end;
 
-	if(set_logfp(fdirs->logpath, cconfs))
+	if(log_fzp_set(fdirs->logpath, cconfs))
 		goto end;
 
 	logp("Begin phase4 (shuffle files)\n");
 
-	if(write_status(CNTR_STATUS_SHUFFLING, NULL, cconfs))
+	if(timed_operation_status_only(CNTR_STATUS_SHUFFLING, NULL, cconfs))
 		goto end;
 
 	if(!lstat(sdirs->current, &statp)) // Had a previous backup.
@@ -703,8 +774,7 @@ int backup_phase4_server_protocol1(struct sdirs *sdirs, struct conf **cconfs)
 			{
 				logp("Removing previous directory: %s\n",
 					fdirs->currentduptmp);
-				if(recursive_delete(fdirs->currentduptmp,
-					NULL, 1 /* del files */))
+				if(recursive_delete(fdirs->currentduptmp))
 				{
 					logp("Could not delete %s\n",
 						fdirs->currentduptmp);
@@ -728,7 +798,7 @@ int backup_phase4_server_protocol1(struct sdirs *sdirs, struct conf **cconfs)
 		goto end;
 	}
 	// Get the backup number.
-	bno=strtoul(tstmp, NULL, 10);
+	bno=strtoull(tstmp, NULL, 10);
 
 	// Determine whether the new backup should be a hardlinked
 	// archive or not, from the confs and the backup number...
@@ -752,19 +822,19 @@ int backup_phase4_server_protocol1(struct sdirs *sdirs, struct conf **cconfs)
 	else
 		unlink(fdirs->hlinked);
 
-	if(atomic_data_jiggle(sdirs, fdirs, hardlinked_current, cconfs, bno))
+	if(atomic_data_jiggle(sdirs, fdirs, hardlinked_current, cconfs))
 	{
 		logp("could not finish up backup.\n");
 		goto end;
 	}
 
-	if(write_status(CNTR_STATUS_SHUFFLING,
+	if(timed_operation_status_only(CNTR_STATUS_SHUFFLING,
 		"deleting temporary files", cconfs))
 			goto end;
 
 	// Remove the temporary data directory, we have now removed
 	// everything useful from it.
-	recursive_delete(fdirs->datadirtmp, NULL, 1 /* del files */);
+	recursive_delete(fdirs->datadirtmp);
 
 	// Clean up the currentdata directory - this is now the 'old'
 	// currentdata directory. Any files that were deleted from
@@ -772,21 +842,21 @@ int backup_phase4_server_protocol1(struct sdirs *sdirs, struct conf **cconfs)
 	// with the option that makes it not delete files.
 	// This will have the effect of getting rid of unnecessary
 	// directories.
-	sync(); // try to help CIFS
-	recursive_delete(fdirs->currentdupdata, NULL, 0 /* do not del files */);
+	recursive_delete_dirs_only_no_warnings(fdirs->currentdupdata);
+	recursive_delete_dirs_only_no_warnings(sdirs->relink);
 
 	// Rename the old current to something that we know to delete.
 	if(previous_backup && !hardlinked_current)
 	{
-		if(deleteme_move(sdirs->client,
-			fdirs->fullrealcurrent, realcurrent, cconfs)
+		if(deleteme_move(sdirs,
+			fdirs->fullrealcurrent, realcurrent)
 		// I have tested that potential race conditions on the
 		// rename() are automatically recoverable here.
 		  || do_rename(fdirs->currentdup, fdirs->fullrealcurrent))
 			goto end;
 	}
 
-	if(deleteme_maybe_delete(cconfs, sdirs->client))
+	if(deleteme_maybe_delete(cconfs, sdirs))
 		goto end;
 
 	logp("End phase4 (shuffle files)\n");

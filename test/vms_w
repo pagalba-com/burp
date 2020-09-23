@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# Some useful wrapping to help the vms test script with automatic builds and
+# testing.
+set -eufx
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+version="$(grep AC_INIT "$SCRIPT_DIR/../configure.ac" \
+	| cut -f 2 -d ',' | tr -d '[]')"
+tarfile='burp.tar.bz2'
+dir="burp-$version"
+
+if [ "$1" = "burp-main" ] ; then
+	test/vms_main $tarfile
+elif [ "$1" = "burp-i386" ] ; then
+	test/vms_i386 $tarfile $dir
+elif [ "$1" = "burp-freebsd" ] ; then
+	test/vms_freebsd $tarfile $dir
+elif [ "$1" = "burp-netbsd" ] ; then
+	test/vms_netbsd $tarfile $dir
+else
+	echo "Do not know what sort of build to do"
+	exit 1
+fi
+
+exit 0

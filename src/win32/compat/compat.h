@@ -137,7 +137,7 @@ struct dirent
 	uint64_t d_ino;
 	uint32_t d_off;
 	uint16_t d_reclen;
-	char d_name[256];
+	char d_name[MAX_PATH_UTF8];
 };
 typedef void DIR;
 
@@ -268,9 +268,8 @@ int win32_ioctl(int fd, unsigned long int req, ...);
 
 int fcntl(int fd, int cmd, long arg);
 int fstat(intptr_t fd, struct stat *sb);
+int stat(intptr_t fd, struct stat *sb);
 
-int inet_aton(const char *cp, struct in_addr *inp);
-int kill(int pid, int signo);
 int pipe(int []);
 int fork();
 int waitpid(int, int *, int);
@@ -286,8 +285,7 @@ int waitpid(int, int *, int);
 #define HAVE_OLD_SOCKOPT
 
 struct timespec;
-int readdir(unsigned int fd, struct dirent *dirp, unsigned int count);
-int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result);
+struct dirent *readdir(DIR *dirp);
 long int random(void);
 void srandom(unsigned int seed);
 int lstat(const char *, struct stat *);
@@ -340,11 +338,9 @@ extern "C" void syslog(int type, const char *fmt, ...);
 
 #define getcwd win32_getcwd
 #define chdir win32_chdir
-#define fputs win32_fputs
 char *win32_getcwd(char *buf, int maxlen);
 int win32_chdir(const char *buf);
 int win32_mkdir(const char *buf);
-int win32_fputs(const char *string, FILE *stream);
 int win32_unlink(const char *filename);
 int win32_chmod(const char *, mode_t, int64_t);
 
@@ -375,7 +371,7 @@ void openlog(const char *ident, int option, int facility);
 	#define ffs __builtin_ffs
 #endif
 
-int win32_utime(const char *fname, struct utimbuf *times);
+int win32_utime(const char *fname, struct stat *statp);
 
 int win32_ftruncate(int fd, int64_t length);
 
@@ -383,3 +379,8 @@ int win32_ftruncate(int fd, int64_t length);
 #define ftruncate win32_ftruncate
 
 #endif
+
+int win32_getfsname(const char *file, char *fsname, size_t fsname_size);
+
+char *realpath(const char *path, char *resolved_path);
+char *get_fixed_drives(void);

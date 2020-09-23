@@ -1,36 +1,57 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "asfd.h"
+#include "conf.h"
+#include "fzp.h"
+#include "forkchild.h"
+#include "handy.h"
+#include "log.h"
+#include "strlist.h"
+#include "run_script.h"
 
 #ifndef HAVE_WIN32
 
-static int log_script_output(struct asfd *asfd, FILE **fp, struct conf **confs,
+static int log_script_output(struct asfd *asfd, struct fzp **fzp,
+	struct conf **confs,
 	int do_logp, int log_remote, int is_stderr, char **logbuf)
 {
 	char buf[256]="";
-	if(!fp || !*fp) return 0;
-	if(fgets(buf, sizeof(buf), *fp))
+	if(!fzp || !*fzp) return 0;
+	if(fzp_gets(*fzp, buf, sizeof(buf)))
 	{
 		if(logbuf && astrcat(logbuf, buf, __func__)) return -1;
 		if(log_remote)
 		{
 			// logm and low will also log to stdout.
-			if(is_stderr) logw(asfd, confs, "%s", buf);
-			else logm(asfd, confs, "%s", buf);
+			if(is_stderr) logw(asfd, confs?get_cntr(confs):NULL,
+				"%s", buf);
+			else
+				logm(asfd, confs, "%s", buf);
 		}
 		else
 		{
-			// logc does not print a prefix
-			if(do_logp) logp("%s", buf);
-			else logc("%s", buf);
+			if(do_logp)
+			{
+				if(is_stderr)
+					logp("WARNING: %s", buf);
+				else
+					logp("MESSAGE: %s", buf);
+			}
+			else
+			{
+				// logc does not print a prefix
+				logc("%s", buf);
+			}
 		}
 	}
-	if(feof(*fp)) close_fp(fp);
+	if(fzp_eof(*fzp)) fzp_close(fzp);
 	return 0;
 }
 
 static int got_sigchld=0;
 static int run_script_status=-1;
 
-static void run_script_sigchld_handler(int sig)
+static void run_script_sigchld_handler(__attribute__ ((unused)) int sig)
 {
 	//printf("in run_script_sigchld_handler\n");
 	got_sigchld=1;
@@ -38,16 +59,18 @@ static void run_script_sigchld_handler(int sig)
 	waitpid(-1, &run_script_status, 0);
 }
 
-static int run_script_select(struct asfd *asfd, FILE **sout, FILE **serr,
+static int run_script_select(struct asfd *asfd,
+	struct fzp **sout, struct fzp **serr,
 	struct conf **confs, int do_logp, int log_remote, char **logbuf)
 {
 	int mfd=-1;
 	fd_set fsr;
 	struct timeval tval;
-	int soutfd=fileno(*sout);
-	int serrfd=fileno(*serr);
-	setlinebuf(*sout);
-	setlinebuf(*serr);
+	int soutfd=fzp_fileno(*sout);
+	int serrfd=fzp_fileno(*serr);
+	// FIX THIS: convert to asfd?
+	fzp_setlinebuf(*sout);
+	fzp_setlinebuf(*serr);
 	set_non_blocking(soutfd);
 	set_non_blocking(serrfd);
 
@@ -101,17 +124,19 @@ int run_script_to_buf(struct asfd *asfd,
 	int a=0;
 	int l=0;
 	pid_t p;
-	FILE *serr=NULL;
-	FILE *sout=NULL;
+	struct fzp *serr=NULL;
+	struct fzp *sout=NULL;
 	char *cmd[64]={ NULL };
+	const int maxcmd = sizeof(cmd) / sizeof(cmd[0]);
 	struct strlist *sl;
 #ifndef HAVE_WIN32
+	struct cntr *cntr=NULL;
 	int s=0;
 #endif
 	if(!args || !args[0]) return 0;
 
-	for(a=0; args[a]; a++) cmd[l++]=(char *)args[a];
-	for(sl=userargs; sl; sl=sl->next) cmd[l++]=sl->path;
+	for(a=0; args[a] && l < (maxcmd - 1); a++) cmd[l++]=(char *)args[a];
+	for(sl=userargs; sl && l < (maxcmd - 1); sl=sl->next) cmd[l++]=sl->path;
 	cmd[l++]=NULL;
 
 #ifndef HAVE_WIN32
@@ -142,12 +167,14 @@ int run_script_to_buf(struct asfd *asfd,
 
 	if(s) return -1;
 
+	if(confs) cntr=get_cntr(confs);
+
 	if(WIFEXITED(run_script_status))
 	{
 		int ret=WEXITSTATUS(run_script_status);
 		logp("%s returned: %d\n", cmd[0], ret);
 		if(log_remote && confs && ret)
-			logw(asfd, confs, "%s returned: %d\n", cmd[0], ret);
+			logw(asfd, cntr, "%s returned: %d\n", cmd[0], ret);
 		return ret;
 	}
 	else if(WIFSIGNALED(run_script_status))
@@ -155,13 +182,13 @@ int run_script_to_buf(struct asfd *asfd,
 		logp("%s terminated on signal %d\n",
 			cmd[0], WTERMSIG(run_script_status));
 		if(log_remote && confs)
-			logw(asfd, confs, "%s terminated on signal %d\n",
+			logw(asfd, cntr, "%s terminated on signal %d\n",
 				cmd[0], WTERMSIG(run_script_status));
 	}
 	else
 	{
 		logp("Strange return when trying to run %s\n", cmd[0]);
-		if(log_remote && confs) logw(asfd, confs,
+		if(log_remote && confs) logw(asfd, cntr,
 			"Strange return when trying to run %s\n", cmd[0]);
 	}
 	return -1;

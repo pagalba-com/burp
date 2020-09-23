@@ -1,9 +1,18 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "asfd.h"
+#include "async.h"
 #include "cmd.h"
+#include "cntr.h"
+#include "iobuf.h"
+#include "log.h"
+#include "strlist.h"
+#include "times.h"
 
 const char *prog="unknown";
+const char *prog_long="unknown";
 
-static FILE *logfp=NULL;
+static struct fzp *logfzp=NULL;
 // Start with all logging on, so that something is said when initial startup
 // goes wrong - for example, reading the conf file.
 static int do_syslog=1;
@@ -12,35 +21,25 @@ static int do_progress_counter=1;
 static int syslog_opened=0;
 static int json=0;
 
-void init_log(char *progname)
+void log_init(char *progname)
 {
+	prog_long=progname;
 	if((prog=strrchr(progname, '/'))) prog++;
 	else prog=progname;
 }
 
-static char *gettm(void)
-{
-        time_t t=0;
-        const struct tm *ctm=NULL;
-        static char tmbuf[32]="";
-
-        time(&t);
-        ctm=localtime(&t);
-	// Windows does not like the %T strftime format option - you get
-	// complaints under gdb.
-        strftime(tmbuf, sizeof(tmbuf), "%Y-%m-%d %H:%M:%S", ctm);
-	return tmbuf;
-}
-
 void logp(const char *fmt, ...)
 {
+#ifndef UTEST
 	int pid;
 	char buf[512]="";
 	va_list ap;
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	pid=(int)getpid();
-	if(logfp) fprintf(logfp, "%s: %s[%d] %s", gettm(), prog, pid, buf);
+	if(logfzp)
+		fzp_printf(logfzp, "%s: %s[%d] %s",
+			gettimenow(), prog, pid, buf);
 	else
 	{
 		if(do_syslog)
@@ -49,18 +48,27 @@ void logp(const char *fmt, ...)
 		{
 			if(json)
 			{
-				char *cp=NULL;
-				if((cp=strrchr(buf, '\n'))) *cp='\0';
+				char *cp;
 				// To help programs parsing the monitor output,
 				// log things with simple JSON.
+				// So do simple character substitution to have
+				// a better chance of valid JSON.
+				for(cp=buf; *cp; cp++)
+				{
+					if(*cp=='"')
+						*cp='\'';
+					else if(!isprint(*cp))
+						*cp='.';
+				}
 				fprintf(stdout, "{ \"logline\": \"%s\" }\n", buf);
 			}
 			else
 				fprintf(stdout, "%s: %s[%d] %s",
-					gettm(), prog, pid, buf);
+					gettimenow(), prog, pid, buf);
 		}
 	}
 	va_end(ap);
+#endif
 }
 
 void logp_ssl_err(const char *fmt, ...)
@@ -71,7 +79,7 @@ void logp_ssl_err(const char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	logp("%s", buf);
-	if(logfp) ERR_print_errors_fp(logfp);
+	if(logfzp) fzp_ERR_print_errors_fp(logfzp);
 	else
 	{
 		if(do_syslog)
@@ -101,7 +109,8 @@ void logc(const char *fmt, ...)
 	va_list ap;
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
-	if(logfp) fprintf(logfp, "%s", buf); // for the server side
+	if(logfzp)
+		fzp_printf(logfzp, "%s", buf); // for the server side
 	else
 	{
 		if(do_progress_counter
@@ -111,22 +120,34 @@ void logc(const char *fmt, ...)
 	va_end(ap);
 }
 
+void logfmt(const char *fmt, ...)
+{
+#ifndef UTEST
+	if(do_stdout)
+	{
+		char buf[512]="";
+		va_list ap;
+		va_start(ap, fmt);
+		vsnprintf(buf, sizeof(buf), fmt, ap);
+		fprintf(stdout, "%s", buf);
+	}
+#endif
+}
+
 const char *progname(void)
 {
 	return prog;
 }
 
-int set_logfp(const char *path, struct conf **confs)
+int log_fzp_set(const char *path, struct conf **confs)
 {
-	close_fp(&logfp);
+	fzp_close(&logfzp);
 	if(path)
 	{
 		logp("Logging to %s\n", path);
-		if(!(logfp=open_file(path, "ab"))) return -1;
+		if(!(logfzp=fzp_open(path, "ab"))) return -1;
 	}
-#ifndef HAVE_WIN32
-	if(logfp) setlinebuf(logfp);
-#endif
+	if(logfzp) fzp_setlinebuf(logfzp);
 	do_syslog=get_int(confs[OPT_SYSLOG]);
 	do_stdout=get_int(confs[OPT_STDOUT]);
 	do_progress_counter=get_int(confs[OPT_PROGRESS_COUNTER]);
@@ -144,15 +165,10 @@ int set_logfp(const char *path, struct conf **confs)
 	return 0;
 }
 
-void set_logfp_direct(FILE *fp)
+void log_fzp_set_direct(struct fzp *fzp)
 {
-	close_fp(&logfp);
-	logfp=fp;
-}
-
-FILE *get_logfp(void)
-{
-	return logfp;
+	fzp_close(&logfzp);
+	logfzp=fzp;
 }
 
 void log_out_of_memory(const char *function)
@@ -166,9 +182,13 @@ void log_restore_settings(struct conf **cconfs, int srestore)
 	struct strlist *l;
 	logp("Restore settings:\n");
 	if(get_string(cconfs[OPT_ORIG_CLIENT]))
-		logp("orig_client = %s\n", get_string(cconfs[OPT_ORIG_CLIENT]));
+		logp("orig_client = '%s'\n",
+			get_string(cconfs[OPT_ORIG_CLIENT]));
 	if(get_string(cconfs[OPT_BACKUP]))
-		logp("backup = %s\n", get_string(cconfs[OPT_BACKUP]));
+		logp("backup = '%s'\n",
+			get_string(cconfs[OPT_BACKUP]));
+	logp("restore_list = %s\n",
+		get_string(cconfs[OPT_RESTORE_LIST])?"true":"false");
 	if(srestore)
 	{
 		// This are unknown unless doing a server initiated restore.
@@ -176,11 +196,15 @@ void log_restore_settings(struct conf **cconfs, int srestore)
 		logp("strip = %d\n", get_int(cconfs[OPT_STRIP]));
 	}
 	if(get_string(cconfs[OPT_RESTOREPREFIX]))
-	  logp("restoreprefix = %s\n", get_string(cconfs[OPT_RESTOREPREFIX]));
+		logp("restoreprefix = '%s'\n",
+			get_string(cconfs[OPT_RESTOREPREFIX]));
+	if(get_string(cconfs[OPT_STRIP_FROM_PATH]))
+		logp("stripfrompath = '%s'\n",
+			get_string(cconfs[OPT_STRIP_FROM_PATH]));
 	if(get_string(cconfs[OPT_REGEX]))
-		logp("regex = %s\n", get_string(cconfs[OPT_REGEX]));
+		logp("regex = '%s'\n", get_string(cconfs[OPT_REGEX]));
 	for(l=get_strlist(cconfs[OPT_INCLUDE]); l; l=l->next)
-		logp("include = %s\n", l->path);
+		logp("include = '%s'\n", l->path);
 }
 
 int logm(struct asfd *asfd, struct conf **confs, const char *fmt, ...)
@@ -199,41 +223,45 @@ int logm(struct asfd *asfd, struct conf **confs, const char *fmt, ...)
 		logp("MESSAGE: %s", buf);
 	}
 	va_end(ap);
-	if(confs) cntr_add(get_cntr(confs[OPT_CNTR]), CMD_MESSAGE, 1);
+	if(confs) cntr_add(get_cntr(confs), CMD_MESSAGE, 1);
 	return r;
 }
 
-int logw(struct asfd *asfd, struct conf **confs, const char *fmt, ...)
+int logw(struct asfd *asfd, struct cntr *cntr, const char *fmt, ...)
 {
 	int r=0;
 	char buf[512]="";
 	va_list ap;
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
-	if(asfd && asfd->as->doing_estimate) printf("\nWARNING: %s", buf);
+	if(asfd
+	  && asfd->as
+	  && asfd->as->doing_estimate)
+		printf("\nWARNING: %s", buf);
 	else
 	{
-		if(asfd) r=asfd->write_str(asfd, CMD_WARNING, buf);
+		if(asfd)
+			r=asfd->write_str(asfd, CMD_WARNING, buf);
 		logp("WARNING: %s", buf);
 	}
 	va_end(ap);
-	if(confs) cntr_add(get_cntr(confs[OPT_CNTR]), CMD_WARNING, 1);
+	cntr_add(cntr, CMD_WARNING, 1);
 	return r;
 }
 
 void log_and_send(struct asfd *asfd, const char *msg)
 {
 	logp("%s\n", msg);
-	if(asfd && asfd->fd>0)
+	if(asfd)
 		asfd->write_str(asfd, CMD_ERROR, msg);
 }
 
-void log_and_send_oom(struct asfd *asfd, const char *function)
+void log_and_send_oom(struct asfd *asfd)
 {
 	char m[256]="";
         snprintf(m, sizeof(m), "out of memory in %s()\n", __func__);
         logp("%s", m);
-        if(asfd && asfd->fd>0)
+        if(asfd)
 		asfd->write_str(asfd, CMD_ERROR, m);
 }
 
@@ -244,7 +272,7 @@ void log_set_json(int value)
 
 void log_oom_w(const char *func, const char *orig_func)
 {
-	logp("out of memory in %s, called from %s\n", __func__, func);
+	logp("out of memory in %s, called from %s\n", func, orig_func);
 }
 
 int log_incexcs_buf(const char *incexc)
@@ -268,8 +296,9 @@ int log_incexcs_buf(const char *incexc)
 	return 0;
 }
 
-void log_recvd(struct iobuf *iobuf, struct conf **confs, int print)
+void log_recvd(struct iobuf *iobuf, struct cntr *cntr, int print)
 {
+	int l;
 	const char *prefix="unset";
 	switch(iobuf->cmd)
 	{
@@ -277,6 +306,13 @@ void log_recvd(struct iobuf *iobuf, struct conf **confs, int print)
 		case CMD_WARNING: prefix="WARNING"; break;
 		default: break;
 	}
-	logp("%s: %s", prefix, iobuf->buf);
-	if(confs) cntr_add(get_cntr(confs[OPT_CNTR]), iobuf->cmd, print);
+	// Strip any trailing newlines.
+	for(l=iobuf->len-1; l>=0; l--)
+	{
+		if(iobuf->buf[l]!='\n')
+			break;
+		iobuf->buf[l]='\0';
+	}
+	logp("%s: %s\n", prefix, iobuf->buf);
+	cntr_add(cntr, iobuf->cmd, print);
 }

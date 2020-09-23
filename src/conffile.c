@@ -9,8 +9,16 @@
 #include "pathcmp.h"
 #include "prepend.h"
 #include "strlist.h"
-#include "server/timestamp.h"
+#include "times.h"
 #include "client/glob_windows.h"
+#include "conffile.h"
+
+static struct strlist *cli_overrides=NULL;
+
+void conf_set_cli_overrides(struct strlist *overrides)
+{
+	cli_overrides=overrides;
+}
 
 // This will strip off everything after the last quote. So, configs like this
 // should work:
@@ -21,12 +29,16 @@ static int remove_quotes(const char *f, char **v, char quote)
 	char *dp=NULL;
 	char *sp=NULL;
 	char *copy=NULL;
+	int ret=1;
 
 	// If it does not start with a quote, leave it alone.
 	if(**v!=quote) return 0;
 
 	if(!(copy=strdup_w(*v, __func__)))
-		return -1;
+	{
+		ret=-1;
+		goto end;
+	}
 
 	for(dp=*v, sp=copy+1; *sp; sp++)
 	{
@@ -38,7 +50,7 @@ static int remove_quotes(const char *f, char **v, char quote)
 			// Do not complain about trailing comments.
 			if(*sp && *sp!='#')
 				logp("ignoring trailing characters after quote in config '%s = %s'\n", f, copy);
-			return 1;
+			goto end;
 		}
 		else if(*sp=='\\')
 		{
@@ -57,11 +69,13 @@ static int remove_quotes(const char *f, char **v, char quote)
 	}
 	logp("Did not find closing quote in config '%s = %s'\n", f, copy);
 	*dp='\0';
-	return 1;
+end:
+	free_w(&copy);
+	return ret;
 }
 
 // Get field and value pair.
-int conf_get_pair(char buf[], char **f, char **v)
+int conf_get_pair(char buf[], char **f, char **v, int *r)
 {
 	char *cp=NULL;
 	char *eq=NULL;
@@ -79,7 +93,11 @@ int conf_get_pair(char buf[], char **f, char **v)
 	*eq='\0';
 
 	// Strip white space from before the equals sign.
-	for(cp=eq-1; *cp && isspace(*cp); cp--) *cp='\0';
+	for(cp=eq-1; *cp && (isspace(*cp) || *cp == ':'); cp--)
+	{
+		if(*cp == ':') *r=1;
+		*cp='\0';
+	}
 	// Skip white space after the equals sign.
 	for(cp=eq+1; *cp && isspace(*cp); cp++) { }
 	*v=cp;
@@ -105,40 +123,13 @@ int conf_get_pair(char buf[], char **f, char **v)
 	return 0;
 }
 
-static int path_checks(const char *path, const char *err_msg)
-{
-	const char *p=NULL;
-	for(p=path; *p; p++)
-	{
-		if(*p!='.' || *(p+1)!='.') continue;
-		if((p==path || *(p-1)=='/') && (*(p+2)=='/' || !*(p+2)))
-		{
-			logp(err_msg);
-			return -1;
-		}
-	}
-// This is being run on the server too, where you can enter paths for the
-// clients, so need to allow windows style paths for windows and unix.
-	if((!isalpha(*path) || *(path+1)!=':')
-#ifndef HAVE_WIN32
-	  // Windows does not need to check for unix style paths.
-	  && *path!='/'
-#endif
-	)
-	{
-		logp(err_msg);
-		return -1;
-	}
-	return 0;
-}
-
 static int conf_error(const char *conf_path, int line)
 {
 	logp("%s: parse error on line %d\n", conf_path, line);
 	return -1;
 }
 
-static int get_file_size(const char *v, ssize_t *dest, const char *conf_path, int line)
+int get_file_size(const char *v, uint64_t *dest, const char *conf_path, int line)
 {
 	// Store in bytes, allow k/m/g.
 	const char *cp=NULL;
@@ -176,28 +167,40 @@ struct fstype
 	uint64_t flag;
 };
 
+// Sorted in magic number order.
 static struct fstype fstypes[]={
-	{ "debugfs",		0x64626720 },
 	{ "devfs",		0x00001373 },
 	{ "devpts",		0x00001CD1 },
+	{ "smbfs",		0x0000517B },
+	{ "nfs",		0x00006969 },
+	{ "romfs",		0x00007275 },
+	{ "iso9660",		0x00009660 },
 	{ "devtmpfs",		0x00009FA0 },
+	{ "proc",		0x00009FA0 },
+	{ "usbdevfs",		0x00009FA2 },
 	{ "ext2",		0x0000EF53 },
 	{ "ext3",		0x0000EF53 },
 	{ "ext4",		0x0000EF53 },
-	{ "iso9660",		0x00009660 },
-	{ "jfs",		0x3153464A },
-	{ "nfs",		0x00006969 },
-	{ "ntfs",		0x5346544E },
-	{ "proc",		0x00009fa0 },
-	{ "reiserfs",		0x52654973 },
-	{ "securityfs",		0x73636673 },
-	{ "sysfs",		0x62656572 },
-	{ "smbfs",		0x0000517B },
-	{ "usbdevfs",		0x00009fa2 },
-	{ "xfs",		0x58465342 },
-	{ "ramfs",		0x858458f6 },
-	{ "romfs",		0x00007275 },
+	{ "ecryptfs",		0x0000F15F },
+	{ "cgroup",		0x0027E0EB },
+	{ "ceph",		0x00C36400 },
 	{ "tmpfs",		0x01021994 },
+	{ "zfs",		0x2FC12FC1 },
+	{ "jfs",		0x3153464A },
+	{ "autofs",		0x42494E4D },
+	{ "reiserfs",		0x52654973 },
+	{ "ntfs",		0x5346544E },
+	{ "xfs",		0x58465342 },
+	{ "sysfs",		0x62656572 },
+	{ "debugfs",		0x64626720 },
+	{ "fusectl", 		0x65735543 },
+	{ "fuse.lxcfs",		0x65735546 },
+	{ "securityfs",		0x73636673 },
+	{ "ramfs",		0x858458F6 },
+	{ "btrfs",		0x9123683E },
+	{ "hugetlbfs",		0x958458F6 },
+	{ "smb2",		0xFE534D42 },
+	{ "cifs",		0xFF534D42 },
 	{ NULL,			0 },
 };
 /* Use this C code to figure out what f_type gets set to.
@@ -257,6 +260,7 @@ static int get_compression(const char *v)
 static int load_conf_field_and_value(struct conf **c,
 	const char *f, // field
 	const char *v, // value
+	int reset, // reset flag
 	const char *conf_path,
 	int line)
 {
@@ -306,10 +310,10 @@ static int load_conf_field_and_value(struct conf **c,
 						strtol(v, NULL, 8));
 				case CT_SSIZE_T:
 				{
-					ssize_t s=0;
+					uint64_t s=0;
 					return
 					 get_file_size(v, &s, conf_path, line)
-					  || set_ssize_t(c[i], s);
+					  || set_uint64_t(c[i], s);
 				}
 				case CT_E_BURP_MODE:
 					return set_e_burp_mode(c[i],
@@ -321,6 +325,7 @@ static int load_conf_field_and_value(struct conf **c,
 					return set_e_recovery_method(c[i],
 						str_to_recovery_method(v));
 				case CT_STRLIST:
+					if (reset) set_strlist(c[i], 0);
 					return add_to_strlist(c[i], v,
 					  !strcmp(c[i]->field, "include"));
 				case CT_E_RSHASH:
@@ -375,6 +380,8 @@ static int deal_with_dot_inclusion(const char *conf_path,
 	for(i=0; (unsigned int)i<globbuf.gl_pathc; i++)
 		if((ret=conf_load_lines_from_file(globbuf.gl_pathv[i], confs)))
 			goto end;
+
+	globfree(&globbuf);
 #else
 	ret=conf_load_lines_from_file(*extrafile, confs);
 #endif
@@ -388,6 +395,7 @@ static int conf_parse_line(struct conf **confs, const char *conf_path,
 	char buf[], int line)
 {
 	int ret=-1;
+	int r=0;
 	char *f=NULL; // field
 	char *v=NULL; // value
 	char *extrafile=NULL;
@@ -406,9 +414,9 @@ static int conf_parse_line(struct conf **confs, const char *conf_path,
 		goto end;
 	}
 
-	if(conf_get_pair(buf, &f, &v)) goto end;
+	if(conf_get_pair(buf, &f, &v, &r)) goto end;
 	if(f && v
-	  && load_conf_field_and_value(confs, f, v, conf_path, line))
+	  && load_conf_field_and_value(confs, f, v, r, conf_path, line))
 		goto end;
 	ret=0;
 end:
@@ -422,22 +430,18 @@ static void conf_problem(const char *conf_path, const char *msg, int *r)
 	(*r)--;
 }
 
-#ifdef HAVE_IPV6
-// These should work for IPv4 connections too.
-#define DEFAULT_ADDRESS_MAIN	"::"
-#define DEFAULT_ADDRESS_STATUS	"::1"
-#else
-// Fall back to IPv4 address if IPv6 is not compiled in.
-#define DEFAULT_ADDRESS_MAIN	"0.0.0.0"
-#define DEFAULT_ADDRESS_STATUS	"127.0.0.1"
-#endif
+static void burp_ca_conf_problem(const char *conf_path,
+	const char *field, int *r)
+{
+	char msg[128]="";
+	snprintf(msg, sizeof(msg), "ca_%s_ca set, but %s not set\n",
+		PACKAGE_TARNAME, field);
+	conf_problem(conf_path, msg, r);
+}
 
 static int server_conf_checks(struct conf **c, const char *path, int *r)
 {
 	// FIX THIS: Most of this could be done by flags.
-	if(!get_string(c[OPT_ADDRESS])
-	  && set_string(c[OPT_ADDRESS], DEFAULT_ADDRESS_MAIN))
-			return -1;
 	if(!get_string(c[OPT_DIRECTORY]))
 		conf_problem(path, "directory unset", r);
 	if(!get_string(c[OPT_DEDUP_GROUP]))
@@ -451,23 +455,11 @@ static int server_conf_checks(struct conf **c, const char *path, int *r)
 	if(get_string(c[OPT_ENCRYPTION_PASSWORD]))
 		conf_problem(path,
 		  "encryption_password should not be set on the server!", r);
-	if(!get_string(c[OPT_STATUS_ADDRESS])
-	  && set_string(c[OPT_STATUS_ADDRESS], DEFAULT_ADDRESS_STATUS))
-			return -1;
-	if(!get_string(c[OPT_STATUS_PORT])) // carry on if not set.
-		logp("%s: status_port unset", path);
-	if(!get_int(c[OPT_MAX_CHILDREN]))
-		conf_problem(path, "max_children unset", r);
-	if(!get_int(c[OPT_MAX_STATUS_CHILDREN]))
-		conf_problem(path, "max_status_children unset", r);
 	if(!get_strlist(c[OPT_KEEP]))
 		conf_problem(path, "keep unset", r);
 	if(get_int(c[OPT_MAX_HARDLINKS])<2)
 		conf_problem(path, "max_hardlinks too low", r);
-	if(get_int(c[OPT_MAX_CHILDREN])<=0)
-		conf_problem(path, "max_children too low", r);
-	if(get_int(c[OPT_MAX_STATUS_CHILDREN])<=0)
-		conf_problem(path, "max_status_children too low", r);
+
 	if(get_int(c[OPT_MAX_STORAGE_SUBDIRS])<=1000)
 		conf_problem(path, "max_storage_subdirs too low", r);
 	if(!get_string(c[OPT_TIMESTAMP_FORMAT])
@@ -476,19 +468,29 @@ static int server_conf_checks(struct conf **c, const char *path, int *r)
 	if(get_string(c[OPT_CA_CONF]))
 	{
 		int ca_err=0;
-		if(!get_string(c[OPT_CA_NAME]))
+		const char *ca_name=get_string(c[OPT_CA_NAME]);
+		const char *ca_server_name=get_string(c[OPT_CA_SERVER_NAME]);
+		if(!ca_name)
 		{
 			logp("ca_conf set, but ca_name not set\n");
 			ca_err++;
 		}
-		if(!get_string(c[OPT_CA_SERVER_NAME]))
+		if(!ca_server_name)
 		{
 			logp("ca_conf set, but ca_server_name not set\n");
 			ca_err++;
 		}
+		if(ca_name
+		  && ca_server_name
+		  && !strcmp(ca_name, ca_server_name))
+		{
+			logp("ca_name and ca_server_name cannot be the same\n");
+			ca_err++;
+		}
 		if(!get_string(c[OPT_CA_BURP_CA]))
 		{
-			logp("ca_conf set, but ca_burp_ca not set\n");
+			logp("ca_conf set, but ca_%s_ca not set\n",
+				PACKAGE_TARNAME);
 			ca_err++;
 		}
 		if(!get_string(c[OPT_SSL_DHFILE]))
@@ -515,9 +517,11 @@ static int server_conf_checks(struct conf **c, const char *path, int *r)
 	}
 	if(get_string(c[OPT_MANUAL_DELETE]))
 	{
-		if(path_checks(get_string(c[OPT_MANUAL_DELETE]),
-			"ERROR: Please use an absolute manual_delete path.\n"))
-				return -1;
+		if(!is_absolute(get_string(c[OPT_MANUAL_DELETE])))
+		{
+			logp("ERROR: Please use an absolute manual_delete path.\n");
+			return -1;
+		}
 	}
 
 	return 0;
@@ -540,21 +544,34 @@ static char *extract_cn(X509_NAME *subj)
 	  || !(e=X509_NAME_get_entry(subj, index))
 	  || !(d=X509_NAME_ENTRY_get_data(e)))
 		return NULL;
-	return (char *)ASN1_STRING_data(d);
+#if OPENSSL_VERSION_NUMBER < 0x1010000fL || defined(LIBRESSL_VERSION_NUMBER)
+		return (char *)ASN1_STRING_data(d);
+#else
+		return (char *)ASN1_STRING_get0_data(d);
+#endif
+}
+
+static void mangle_cname(char **cname, struct conf **c)
+{
+	if(!get_int(c[OPT_CNAME_FQDN]))
+		strip_fqdn(cname);
+	if(get_int(c[OPT_CNAME_LOWERCASE]))
+		strlwr(*cname);
 }
 
 static int get_cname_from_ssl_cert(struct conf **c)
 {
 	int ret=-1;
-	FILE *fp=NULL;
+	struct fzp *fzp=NULL;
 	X509 *cert=NULL;
 	X509_NAME *subj=NULL;
 	char *path=get_string(c[OPT_SSL_CERT]);
 	const char *cn=NULL;
+	char *copy=NULL;
 
-	if(!path || !(fp=open_file(path, "rb"))) return 0;
+	if(!path || !(fzp=fzp_open(path, "rb"))) return 0;
 
-	if(!(cert=PEM_read_X509(fp, NULL, NULL, NULL)))
+	if(!(cert=fzp_PEM_read_X509(fzp)))
 	{
 		logp("unable to parse %s in: %s\n", path, __func__);
 		goto end;
@@ -570,14 +587,20 @@ static int get_cname_from_ssl_cert(struct conf **c)
 		logp("could not get CN from %s\n", path);
 		goto end;
 	}
-	if(set_string(c[OPT_CNAME], cn))
+	if(!(copy=strdup_w(cn, __func__)))
+		goto end;
+	mangle_cname(&copy, c);
+	if(set_string(c[OPT_CNAME], copy))
 		goto end;
 	logp("cname from cert: %s\n", cn);
+	if(strcmp(copy, cn))
+		logp("cname mangled to: %s\n", copy);
 
 	ret=0;
 end:
 	if(cert) X509_free(cert);
-	if(fp) fclose(fp);
+	fzp_close(&fzp);
+	free_w(&copy);
 	return ret;
 }
 
@@ -591,8 +614,9 @@ static int get_fqdn(struct conf **c)
 	int ret=-1;
 	int gai_result;
 	struct addrinfo hints;
-	struct addrinfo *info;
+	struct addrinfo *info=NULL;
 	char hostname[1024]="";
+	char *fqdn=NULL;
 	hostname[1023] = '\0';
 	if(gethostname(hostname, 1023))
 	{
@@ -605,28 +629,37 @@ static int get_fqdn(struct conf **c)
 	hints.ai_socktype=SOCK_STREAM;
 	hints.ai_flags=AI_CANONNAME;
 
-	if((gai_result=getaddrinfo(hostname, "http", &hints, &info)))
+	if((gai_result=getaddrinfo(hostname, NULL, &hints, &info)))
 	{
 		logp("getaddrinfo in %s: %s\n", __func__,
 			gai_strerror(gai_result));
-		goto end;
+		logp("Using %s\n", hostname);
+		if(!(fqdn=strdup_w(hostname, __func__)))
+			goto end;
 	}
-
-	//for(p=info; p; p=p->ai_next)
-	// Just use the first one.
-	if(!info)
+	else
 	{
-		logp("Got no hostname in %s\n", __func__);
-		goto end;
+		//for(p=info; p; p=p->ai_next)
+		// Just use the first one.
+		if(!info)
+		{
+			logp("Got no hostname in %s\n", __func__);
+			goto end;
+		}
+		if(!(fqdn=strdup_w(info->ai_canonname, __func__)))
+			goto end;
 	}
 
-	if(set_string(c[OPT_CNAME], info->ai_canonname))
+	mangle_cname(&fqdn, c);
+
+	if(set_string(c[OPT_CNAME], fqdn))
 		goto end;
 	logp("cname from hostname: %s\n", get_string(c[OPT_CNAME]));
 
 	ret=0;
 end:
-	freeaddrinfo(info);
+	if(info) freeaddrinfo(info);
+	free_w(&fqdn);
 	return ret;
 }
 
@@ -650,15 +683,20 @@ static int general_conf_checks(struct conf **c, const char *path, int *r)
 
 static int client_conf_checks(struct conf **c, const char *path, int *r)
 {
+	int ret=-1;
+	char *copy=NULL;
 	const char *autoupgrade_os=get_string(c[OPT_AUTOUPGRADE_OS]);
+
 	if(!get_string(c[OPT_CNAME]))
 	{
-		if(get_cname_from_ssl_cert(c)) return -1;
+		if(get_cname_from_ssl_cert(c))
+			goto end;
 		// There was no error. This is probably a new install.
 		// Try getting the fqdn and using that.
 		if(!get_string(c[OPT_CNAME]))
 		{
-			if(get_fqdn(c)) return -1;
+			if(get_fqdn(c))
+				goto end;
 			if(!get_string(c[OPT_CNAME]))
 				conf_problem(path, "client name unset", r);
 		}
@@ -667,41 +705,41 @@ static int client_conf_checks(struct conf **c, const char *path, int *r)
 	{
 		logp("password not set, falling back to \"password\"\n");
 		if(set_string(c[OPT_PASSWORD], "password"))
-			return -1;
+			goto end;
 	}
 	if(!get_string(c[OPT_SERVER]))
 		conf_problem(path, "server unset", r);
-	if(!get_string(c[OPT_STATUS_PORT])) // carry on if not set.
-		logp("%s: status_port unset\n", path);
 	if(!get_string(c[OPT_SSL_PEER_CN]))
 	{
 		const char *server=get_string(c[OPT_SERVER]);
 		logp("ssl_peer_cn unset\n");
-		if(!server)
+		if(server)
 		{
-			logp("falling back to '%s'\n", server);
-			if(set_string(c[OPT_SSL_PEER_CN], server))
-				return -1;
+			char *cp=NULL;
+			if(!(copy=strdup_w(server, __func__)))
+				goto end;
+			
+			if((cp=strchr(copy, ':')))
+				*cp='\0';
+			logp("falling back to '%s'\n", copy);
+			if(set_string(c[OPT_SSL_PEER_CN], copy))
+				goto end;
 		}
 	}
 	if(autoupgrade_os
 	  && strstr(autoupgrade_os, ".."))
 		conf_problem(path,
 			"autoupgrade_os must not contain a '..' component", r);
-	if(!get_string(c[OPT_CA_BURP_CA]))
+	if(get_string(c[OPT_CA_BURP_CA]))
 	{
 		if(!get_string(c[OPT_CA_CSR_DIR]))
-			conf_problem(path,
-				"ca_burp_ca set, but ca_csr_dir not set\n", r);
+			burp_ca_conf_problem(path, "ca_csr_dir", r);
 		if(!get_string(c[OPT_SSL_CERT_CA]))
-			conf_problem(path,
-				"ca_burp_ca set, but ssl_cert_ca not set\n", r);
+			burp_ca_conf_problem(path, "ssl_cert_ca", r);
 		if(!get_string(c[OPT_SSL_CERT]))
-			conf_problem(path,
-				"ca_burp_ca set, but ssl_cert not set\n", r);
+			burp_ca_conf_problem(path, "ssl_cert", r);
 		if(!get_string(c[OPT_SSL_KEY]))
-			conf_problem(path,
-				"ca_burp_ca set, but ssl_key not set\n", r);
+			burp_ca_conf_problem(path, "ssl_key", r);
 	}
 
 	if(!r)
@@ -714,14 +752,18 @@ static int client_conf_checks(struct conf **c, const char *path, int *r)
 		for(l=get_strlist(c[OPT_STARTDIR]); l; l=l->next)
 			if(l->flag) logp("%s\n", l->path);
 	}
-	return 0;
+
+	ret=0;
+end:
+	free_w(&copy);
+	return ret;
 }
 
 static int finalise_keep_args(struct conf **c)
 {
 	struct strlist *k;
 	struct strlist *last=NULL;
-	unsigned long long mult=1;
+	uint64_t mult=1;
 	for(k=get_strlist(c[OPT_KEEP]); k; k=k->next)
 	{
 		if(!(k->flag=atoi(k->path)))
@@ -754,9 +796,11 @@ static int incexc_munge(struct conf **c, struct strlist *s)
 #ifdef HAVE_WIN32
 	convert_backslashes(&s->path);
 #endif
-	if(path_checks(s->path,
-		"ERROR: Please use absolute include/exclude paths.\n"))
-			return -1;
+	if(!is_absolute(s->path))
+	{
+		logp("ERROR: Please use absolute include/exclude paths.\n");
+		return -1;
+	}
 	if(add_to_strlist(c[OPT_INCEXCDIR], s->path, s->flag))
 		return -1;
 	return 0;
@@ -770,6 +814,12 @@ static int finalise_incexc_dirs(struct conf **c)
 		if(incexc_munge(c, s)) return -1;
 	for(s=get_strlist(c[OPT_EXCLUDE]); s; s=s->next)
 		if(incexc_munge(c, s)) return -1;
+	if(get_strlist(c[OPT_INCREG]) &&
+	   !(get_strlist(c[OPT_INCLUDE]) || get_strlist(c[OPT_INCGLOB])))
+	{
+		logp("Need at least one 'include' or 'include_glob' for the 'include_regex' to work.\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -778,6 +828,27 @@ static int add_to_cross_filesystem(struct conf **c, const char *path)
 	if(strlist_find(get_strlist(c[OPT_FSCHGDIR]), path, 0))
 		return 0;
 	return add_to_strlist(c[OPT_FSCHGDIR], path, 0);
+}
+
+static int check_start_dirs_and_seed(struct conf **c)
+{
+	int errors=0;
+	struct strlist *s=NULL;
+	const char *src=get_string(c[OPT_SEED_SRC]);
+	if(!src)
+		return 0;
+
+	for(s=get_strlist(c[OPT_STARTDIR]); s; s=s->next)
+	{
+		if(!is_subdir(src, s->path))
+		{
+			logp("ERROR: Starting directories need to be within %s:%s: %s\n",
+				c[OPT_SEED_SRC]->field, src, s->path);
+			errors++;
+		}
+	}
+
+	return errors;
 }
 
 // This decides which directories to start backing up, and which
@@ -796,9 +867,11 @@ static int finalise_start_dirs(struct conf **c)
 #ifdef HAVE_WIN32
 		convert_backslashes(&s->path);
 #endif
-		if(path_checks(s->path,
-			"ERROR: Please use absolute include/exclude paths.\n"))
-				return -1;
+		if(!is_absolute(s->path))
+		{
+			logp("ERROR: Please use absolute include/exclude paths.\n");
+			return -1;
+		}
 
 		// Ensure that we do not backup the same directory twice.
 		if(last_ie && !strcmp(s->path, last_ie->path))
@@ -827,6 +900,18 @@ static int finalise_start_dirs(struct conf **c)
 		}
 		last_ie=s;
 	}
+
+	if(check_start_dirs_and_seed(c))
+		return -1;
+
+	return 0;
+}
+
+static int finalise_fschg_dirs(struct conf **c)
+{
+	struct strlist *s;
+	for(s=get_strlist(c[OPT_FSCHGDIR]); s; s=s->next)
+		strip_trailing_slashes(&s->path);
 	return 0;
 }
 
@@ -849,7 +934,7 @@ static int finalise_glob(struct conf **c)
 	}
 
 	for(i=0; (unsigned int)i<globbuf.gl_pathc; i++)
-		if(add_to_strlist_include(c[OPT_INCLUDE], globbuf.gl_pathv[i]))
+		if(add_to_strlist_include_uniq(c[OPT_INCLUDE], globbuf.gl_pathv[i]))
 			goto end;
 
 	globfree(&globbuf);
@@ -859,6 +944,20 @@ end:
 	return ret;
 }
 
+// Reeval the glob after script pre
+int reeval_glob(struct conf **c)
+{
+	if(finalise_glob(c))
+		return -1;
+
+	if(finalise_incexc_dirs(c)
+	  || finalise_start_dirs(c)
+	  || finalise_fschg_dirs(c))
+		return -1;
+
+	return 0;
+}
+
 // Set the flag of the first item in a list that looks at extensions to the
 // maximum number of characters that need to be checked, plus one. This is for
 // a bit of added efficiency.
@@ -866,27 +965,25 @@ static void set_max_ext(struct strlist *list)
 {
 	int max=0;
 	struct strlist *l=NULL;
-	struct strlist *last=NULL;
 	for(l=list; l; l=l->next)
 	{
 		int s=strlen(l->path);
 		if(s>max) max=s;
-		last=l;
 	}
-	if(last) last->flag=max+1;
+	if(list) list->flag=max+1;
 }
 
-static int finalise_fstypes(struct conf **c)
+static int finalise_fstypes(struct conf **c, int opt)
 {
 	struct strlist *l;
 	// Set the strlist flag for the excluded fstypes
-	for(l=get_strlist(c[OPT_EXCFS]); l; l=l->next)
+	for(l=get_strlist(c[opt]); l; l=l->next)
 	{
 		l->flag=0;
 		if(!strncasecmp(l->path, "0x", 2))
 		{
 			l->flag=strtol((l->path)+2, NULL, 16);
-			logp("Excluding file system type 0x%08X\n", l->flag);
+			logp("Excluding file system type 0x%08lX\n", l->flag);
 		}
 		else
 		{
@@ -918,10 +1015,144 @@ static int setup_script_arg_overrides(struct conf *c,
 	  || setup_script_arg_override(c, post_args);
 }
 
-int conf_finalise(struct conf **c)
+static int listen_config_ok(const char *l)
 {
+	int port;
+	const char *c=NULL;
+	const char *cp=NULL;
+
+	for(c=l; *c; c++)
+		if(!isalnum(*c) && *c!=':' && *c!='.')
+			return 0;
+
+	if(!(cp=strrchr(l, ':')))
+		return 0;
+	if(l==cp)
+		return 0;
+	cp++;
+	if(!strlen(cp) || strlen(cp)>5)
+		return 0;
+	port=atoi(cp);
+	if(port<=0 || port>65535)
+		return 0;
+
+	return 1;
+}
+
+static int finalise_server_max_children(struct conf **c,
+	enum conf_opt listen_opt, enum conf_opt max_children_opt)
+{
+	struct strlist *l;
+	struct strlist *mc;
+	long max_children=5;
+
+	for(l=get_strlist(c[listen_opt]),
+	   mc=get_strlist(c[max_children_opt]); l; l=l->next)
+	{
+		if(!listen_config_ok(l->path))
+		{
+			logp("Could not parse %s config '%s'\n",
+				c[listen_opt]->field, l->path);
+			return -1;
+		}
+		if(mc)
+		{
+			if((max_children=atol(mc->path))<=0)
+			{
+				logp("%s too low for %s %s\n",
+					c[max_children_opt]->field,
+					c[listen_opt]->field,
+					l->path);
+				return -1;
+			}
+			l->flag=max_children;
+
+			mc=mc->next;
+		}
+		else
+		{
+			logp("%s %s defaulting to %s %lu\n",
+				c[listen_opt]->field,
+				l->path,
+				c[max_children_opt]->field,
+				max_children);
+			l->flag=max_children;
+		}
+	}
+
+	if(mc)
+	{
+		logp("too many %s options\n", c[max_children_opt]->field);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int finalise_client_ports(struct conf **c)
+{
+	int port=0;
+	struct strlist *p;
+
+	for(p=get_strlist(c[OPT_PORT]); p; p=p->next)
+		port=atoi(p->path);
+
+	if(!port)
+		return 0;
+
+	if(!get_int(c[OPT_PORT_BACKUP]))
+		set_int(c[OPT_PORT_BACKUP], port);
+	if(!get_int(c[OPT_PORT_RESTORE]))
+		set_int(c[OPT_PORT_RESTORE], port);
+	if(!get_int(c[OPT_PORT_VERIFY]))
+		set_int(c[OPT_PORT_VERIFY], get_int(c[OPT_PORT_RESTORE]));
+	if(!get_int(c[OPT_PORT_LIST]))
+		set_int(c[OPT_PORT_LIST], port);
+	if(!get_int(c[OPT_PORT_DELETE]))
+		set_int(c[OPT_PORT_DELETE], port);
+
+	return 0;
+}
+
+static int apply_cli_overrides(struct conf **confs)
+{
+	int ret=-1;
+	int line=0;
+	char *opt=NULL;
+	struct strlist *oo=NULL;
+
+	for(oo=cli_overrides; oo; oo=oo->next)
+	{
+		line++;
+		free_w(&opt);
+		if(!(opt=strdup_w(oo->path, __func__)))
+			goto end;
+		if((ret=conf_parse_line(confs, "", opt, line)))
+		{
+			logp("Unable to parse cli option %d '%s'\n",
+				line, oo->path);
+			goto end;
+		}
+	}
+	ret=0;
+end:
+	free_w(&opt);
+	return ret;
+}
+
+static int conf_finalise(struct conf **c)
+{
+	enum burp_mode burp_mode;
 	int s_script_notify=0;
-	if(finalise_fstypes(c)) return -1;
+
+	if(apply_cli_overrides(c))
+		return -1;
+
+	burp_mode=get_e_burp_mode(c[OPT_BURP_MODE]);
+
+	if(finalise_fstypes(c, OPT_EXCFS)
+	  || finalise_fstypes(c, OPT_INCFS))
+		return -1;
 
 	strlist_compile_regexes(get_strlist(c[OPT_INCREG]));
 	strlist_compile_regexes(get_strlist(c[OPT_EXCREG]));
@@ -930,13 +1161,36 @@ int conf_finalise(struct conf **c)
 	set_max_ext(get_strlist(c[OPT_EXCEXT]));
 	set_max_ext(get_strlist(c[OPT_EXCOM]));
 
-	if(get_e_burp_mode(c[OPT_BURP_MODE])==BURP_MODE_CLIENT
-	  && finalise_glob(c)) return -1;
+	if(burp_mode==BURP_MODE_CLIENT
+	  && finalise_glob(c))
+		return -1;
 
 	if(finalise_incexc_dirs(c)
-	  || finalise_start_dirs(c)) return -1;
+	  || finalise_start_dirs(c)
+	  || finalise_fschg_dirs(c))
+		return -1;
 
-	if(finalise_keep_args(c)) return -1;
+	if(finalise_keep_args(c))
+		return -1;
+
+	if(burp_mode==BURP_MODE_SERVER)
+	{
+		if(!get_strlist(c[OPT_LISTEN]))
+		{
+			logp("Need at least one 'listen' config.\n");
+			return -1;
+		}
+		if(finalise_server_max_children(c,
+			OPT_LISTEN, OPT_MAX_CHILDREN)
+		  || finalise_server_max_children(c,
+			OPT_LISTEN_STATUS, OPT_MAX_STATUS_CHILDREN))
+				return -1;
+	}
+	if(burp_mode==BURP_MODE_CLIENT)
+	{
+		if(finalise_client_ports(c))
+			return -1;
+	}
 
 	if((s_script_notify=get_int(c[OPT_S_SCRIPT_NOTIFY])))
 	{
@@ -971,9 +1225,6 @@ int conf_finalise(struct conf **c)
 static int conf_finalise_global_only(const char *conf_path, struct conf **confs)
 {
 	int r=0;
-
-	if(!get_string(confs[OPT_PORT]))
-		conf_problem(conf_path, "port unset", &r);
 
 	// Let the caller check the 'keep' value.
 
@@ -1027,6 +1278,9 @@ static int conf_load_lines_from_file(const char *conf_path, struct conf **confs)
 	return ret;
 }
 
+#ifndef UTEST
+static
+#endif
 int conf_load_lines_from_buf(const char *buf, struct conf **c)
 {
 	int ret=0;
@@ -1035,7 +1289,7 @@ int conf_load_lines_from_buf(const char *buf, struct conf **c)
 	char *copy=NULL;
 
 	if(!buf) return 0;
-	
+
 	if(!(copy=strdup_w(buf, __func__))) return -1;
 	if(!(tok=strtok(copy, "\n")))
 	{
@@ -1057,7 +1311,8 @@ int conf_load_lines_from_buf(const char *buf, struct conf **c)
 	return ret;
 }
 
-/* The server runs this when parsing a restore file on the server. */
+/* The server runs this when parsing a restore file on the server. Called
+   elsewhere too. */
 int conf_parse_incexcs_path(struct conf **c, const char *path)
 {
 	free_incexcs(c);
@@ -1075,6 +1330,66 @@ int conf_parse_incexcs_buf(struct conf **c, const char *incexc)
 	  || conf_finalise(c))
 		return -1;
 	return 0;
+}
+
+/* The client runs this when the server overrides the incexcs for restore. */
+int conf_parse_incexcs_srestore(struct conf **c, const char *incexc)
+{
+	int ret=-1;
+	char *rp=NULL;
+	char *oldprefix=NULL;
+	char *srvprefix=NULL;
+	char *newprefix=NULL;
+	const char *rpfield=c[OPT_RESTOREPREFIX]->field;
+
+	if(!(rp=get_string(c[OPT_RESTOREPREFIX])))
+	{
+		logp("The client side must specify a %s!\n", rpfield);
+		goto end;
+	}
+	if(!(oldprefix=strdup_w(rp, __func__)))
+		goto end;
+
+	free_incexcs(c);
+	set_string(c[OPT_RESTOREPREFIX], NULL);
+	if(conf_load_lines_from_buf(incexc, c)
+	  || conf_finalise(c))
+		goto end;
+
+	if((srvprefix=get_string(c[OPT_RESTOREPREFIX])))
+	{
+		if(has_dot_component(srvprefix))
+		{
+			logp("The server gave %s '%s', which is not allowed!",
+				rpfield, srvprefix);
+			goto end;
+		}
+		if(!strcmp(oldprefix, "/"))
+		{
+			// Avoid double slash.
+			if(!(newprefix=prepend_s("", srvprefix)))
+				goto end;
+		}
+		else
+		{
+			if(!(newprefix=prepend_s(oldprefix, srvprefix)))
+				goto end;
+		}
+		if(set_string(c[OPT_RESTOREPREFIX], newprefix))
+			goto end;
+		if(build_path_w(newprefix))
+			goto end;
+	}
+	else
+	{
+		if(set_string(c[OPT_RESTOREPREFIX], oldprefix))
+			goto end;
+	}
+	ret=0;
+end:
+	free_w(&oldprefix);
+	free_w(&newprefix);
+	return ret;
 }
 
 static int conf_set_from_global(struct conf **globalc, struct conf **cc)
@@ -1099,7 +1414,7 @@ static int conf_set_from_global(struct conf **globalc, struct conf **cc)
 				set_mode_t(cc[i], get_mode_t(globalc[i]));
 				break;
 			case CT_SSIZE_T:
-				set_ssize_t(cc[i], get_ssize_t(globalc[i]));
+				set_uint64_t(cc[i], get_uint64_t(globalc[i]));
 				break;
 			case CT_E_BURP_MODE:
 				set_e_burp_mode(cc[i], get_e_burp_mode(globalc[i]));
@@ -1211,19 +1526,26 @@ static int do_conf_load_overrides(struct conf **globalcs, struct conf **cconfs,
 	return 0;
 }
 
-static int conf_load_overrides(struct conf **globalcs, struct conf **cconfs,
+#ifndef UTEST
+static
+#endif
+int conf_load_overrides(struct conf **globalcs, struct conf **cconfs,
 	const char *path)
 {
 	return do_conf_load_overrides(globalcs, cconfs, path, NULL);
 }
 
-#ifdef UTEST
-int conf_load_overrides_buf(struct conf **globalcs, struct conf **cconfs,
-	const char *buf)
+int cname_valid(const char *cname)
 {
-	return do_conf_load_overrides(globalcs, cconfs, "test buf", buf);
+	if(!cname) return 0;
+	if(cname[0]=='.'
+	  || strchr(cname, '/') // Avoid path attacks.
+	  || strchr(cname, '\\') // Be cautious of backslashes too.
+	  // I am told that emacs tmp files end with '~'.
+	  || cname[strlen(cname)-1]=='~')
+		return 0;
+	return 1;
 }
-#endif
 
 int conf_load_clientconfdir(struct conf **globalcs, struct conf **cconfs)
 {
@@ -1233,9 +1555,9 @@ int conf_load_clientconfdir(struct conf **globalcs, struct conf **cconfs)
 
 	if(conf_init_save_cname_and_version(cconfs)) goto end;
 	cname=get_string(cconfs[OPT_CNAME]);
-	if(looks_like_tmp_or_hidden_file(cname))
+	if(!cname_valid(cname))
 	{
-		logp("client name '%s' is invalid\n", cname);
+		logp("client name '%s' is not valid\n", cname);
 		goto end;
 	}
 
@@ -1265,31 +1587,31 @@ int conf_load_global_only(const char *path, struct conf **globalcs)
 	return do_load_global_only(globalcs, path, NULL);
 }
 
-#ifdef UTEST
-int conf_load_global_only_buf(const char *buf, struct conf **globalcs)
-{
-	return do_load_global_only(globalcs, "test buf", buf);
-}
-#endif
-
 static int restore_client_allowed(struct conf **cconfs, struct conf **sconfs)
 {
 	struct strlist *r;
+	for(r=get_strlist(sconfs[OPT_SUPER_CLIENTS]); r; r=r->next)
+		if(!strcmp(r->path, get_string(cconfs[OPT_CNAME])))
+			return 2;
 	for(r=get_strlist(sconfs[OPT_RESTORE_CLIENTS]); r; r=r->next)
 		if(!strcmp(r->path, get_string(cconfs[OPT_CNAME])))
 			return 1;
-	logp("Access to client is not allowed: %s",
+	logp("Access to client is not allowed: %s\n",
 		get_string(sconfs[OPT_CNAME]));
 	return 0;
 }
 
-// FIX THIS: need to unit test this.
-static int do_conf_switch_to_orig_client(struct conf **globalcs,
-	struct conf **cconfs, const char *orig_client, const char *buf)
+int conf_switch_to_orig_client(struct conf **globalcs,
+	struct conf **cconfs, const char *orig_client)
 {
 	int ret=-1;
-	int loadrc;
+	int is_super=0;
 	struct conf **sconfs=NULL;
+
+	// If we are already the wanted client, no need to switch.
+	if(!strcmp(get_string(cconfs[OPT_CNAME]), orig_client))
+		return 0;
+
 	if(!(sconfs=confs_alloc())
 	  || confs_init(sconfs)) goto end;
 	if(set_string(sconfs[OPT_CNAME], orig_client))
@@ -1297,13 +1619,7 @@ static int do_conf_switch_to_orig_client(struct conf **globalcs,
 	logp("Client wants to switch to client: %s\n",
 		get_string(sconfs[OPT_CNAME]));
 
-	// Allow unit testing using a buffer.
-#ifdef UTEST
-	if(buf) loadrc=conf_load_overrides_buf(globalcs, sconfs, buf);
-	else
-#endif
-		loadrc=conf_load_clientconfdir(globalcs, sconfs);
-	if(loadrc)
+	if(conf_load_clientconfdir(globalcs, sconfs))
 	{
 		logp("Could not load alternate config: %s",
 			get_string(sconfs[OPT_CNAME]));
@@ -1312,21 +1628,68 @@ static int do_conf_switch_to_orig_client(struct conf **globalcs,
 	set_int(sconfs[OPT_SEND_CLIENT_CNTR],
 		get_int(cconfs[OPT_SEND_CLIENT_CNTR]));
 
-	if(!restore_client_allowed(cconfs, sconfs))
-		goto end;
+	switch(restore_client_allowed(cconfs, sconfs))
+	{
+		case 1:
+			break;
+		case 2:
+			is_super=1;
+			break;
+		default:
+			goto end;
+	}
 
+	// Restore client can never force backup.
+	set_int(sconfs[OPT_CLIENT_CAN_FORCE_BACKUP], 0);
+
+	if(is_super)
+	{
+		set_int(sconfs[OPT_CLIENT_CAN_DELETE],
+			get_int(cconfs[OPT_CLIENT_CAN_DELETE]));
+		set_int(sconfs[OPT_CLIENT_CAN_DIFF],
+			get_int(cconfs[OPT_CLIENT_CAN_DIFF]));
+		set_int(sconfs[OPT_CLIENT_CAN_LIST],
+			get_int(cconfs[OPT_CLIENT_CAN_LIST]));
+		set_int(sconfs[OPT_CLIENT_CAN_MONITOR],
+			get_int(cconfs[OPT_CLIENT_CAN_MONITOR]));
+		set_int(sconfs[OPT_CLIENT_CAN_RESTORE],
+			get_int(cconfs[OPT_CLIENT_CAN_RESTORE]));
+		set_int(sconfs[OPT_CLIENT_CAN_VERIFY],
+			get_int(cconfs[OPT_CLIENT_CAN_VERIFY]));
+	}
+	else
+	{
+		// For the rest of the client_can things, do not allow them on
+		// orig_client if we do not have them ourselves.
+		if(!get_int(cconfs[OPT_CLIENT_CAN_DELETE]))
+			set_int(sconfs[OPT_CLIENT_CAN_DELETE], 0);
+		if(!get_int(cconfs[OPT_CLIENT_CAN_DIFF]))
+			set_int(sconfs[OPT_CLIENT_CAN_DIFF], 0);
+		if(!get_int(cconfs[OPT_CLIENT_CAN_LIST]))
+			set_int(sconfs[OPT_CLIENT_CAN_LIST], 0);
+		if(!get_int(cconfs[OPT_CLIENT_CAN_MONITOR]))
+			set_int(sconfs[OPT_CLIENT_CAN_MONITOR], 0);
+		if(!get_int(cconfs[OPT_CLIENT_CAN_RESTORE]))
+			set_int(sconfs[OPT_CLIENT_CAN_RESTORE], 0);
+		if(!get_int(cconfs[OPT_CLIENT_CAN_VERIFY]))
+			set_int(sconfs[OPT_CLIENT_CAN_VERIFY], 0);
+	}
+
+	if(set_string(sconfs[OPT_CONNECT_CLIENT],
+		get_string(cconfs[OPT_CONNECT_CLIENT])))
+			goto end;
 	if(set_string(sconfs[OPT_RESTORE_PATH],
 		get_string(cconfs[OPT_RESTORE_PATH])))
 			goto end;
 	if(set_string(cconfs[OPT_RESTORE_PATH], NULL))
 		goto end;
-	set_cntr(sconfs[OPT_CNTR], get_cntr(cconfs[OPT_CNTR]));
+	set_cntr(sconfs[OPT_CNTR], get_cntr(cconfs));
 	set_cntr(cconfs[OPT_CNTR], NULL);
 	confs_free_content(cconfs);
 	confs_init(cconfs);
 	confs_memcpy(cconfs, sconfs);
 	confs_null(sconfs);
-	if(set_string(cconfs[OPT_RESTORE_CLIENT],
+	if(set_string(cconfs[OPT_SUPER_CLIENT],
 		get_string(cconfs[OPT_CNAME]))) goto end;
 	if(set_string(cconfs[OPT_ORIG_CLIENT],
 		get_string(cconfs[OPT_CNAME]))) goto end;
@@ -1338,18 +1701,29 @@ end:
 	return ret;
 }
 
-int conf_switch_to_orig_client(struct conf **globalcs, struct conf **cconfs,
-	const char *orig_client)
+char *config_default_path(void)
 {
-	return do_conf_switch_to_orig_client(globalcs,
-		cconfs, orig_client, NULL);
-}
+	static char path[256]="";
+#ifdef HAVE_WIN32
+	char *pfenv=NULL;
 
-#ifdef UTEST
-int conf_switch_to_orig_client_buf(struct conf **globalcs,
-	struct conf **cconfs, const char *orig_client, const char *buf)
-{
-	return do_conf_switch_to_orig_client(globalcs,
-		cconfs, orig_client, buf);
-}
+	// Burp used to always install to 'C:/Program Files/Burp/', but as
+	// of 1.3.11, it changed to %PROGRAMFILES%. Still want the old way
+	// to work though. So check %PROGRAMFILES% first, then fall back.
+	if((pfenv=getenv("PROGRAMFILES")))
+	{
+		struct stat statp;
+		snprintf(path, sizeof(path), "%s/%s/%s.conf",
+			pfenv, PACKAGE_NAME, PACKAGE_TARNAME);
+		if(!lstat(path, &statp)
+		  && !S_ISDIR(statp.st_mode))
+			return path;
+	}
+	snprintf(path, sizeof(path), "C:/Program Files/%s/%s.conf",
+		PACKAGE_NAME, PACKAGE_TARNAME);
+#else
+	snprintf(path, sizeof(path), "%s/%s.conf",
+		SYSCONFDIR, PACKAGE_TARNAME);
 #endif
+	return path;
+}

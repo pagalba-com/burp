@@ -1,8 +1,17 @@
-#include "include.h"
+#include "../../burp.h"
+#include "../../alloc.h"
+#include "../../conf.h"
+#include "../../conffile.h"
+#include "../../handy.h"
+#include "../../fsops.h"
+#include "../../fzp.h"
 #include "../../lock.h"
+#include "../../log.h"
+#include "../../prepend.h"
+#include "../../strlist.h"
+#include "bedup.h"
 
 #include <uthash.h>
-#include <dirent.h>
 
 #define LOCKFILE_NAME		"lockfile"
 #define BEDUP_LOCKFILE_NAME	"lockfile.bedup"
@@ -12,13 +21,16 @@
 static int makelinks=0;
 static int deletedups=0;
 
-static unsigned long long savedbytes=0;
-static unsigned long long count=0;
+static uint64_t savedbytes=0;
+static uint64_t count=0;
 static int ccount=0;
 
 static struct lock *locklist=NULL;
 
 static int verbose=0;
+
+static unsigned int maxlinks=DEF_MAX_LINKS;
+static char ext[16]="";
 
 typedef struct file file_t;
 
@@ -28,8 +40,8 @@ struct file
 	dev_t dev;
 	ino_t ino;
 	nlink_t nlink;
-	unsigned long full_cksum;
-	unsigned long part_cksum;
+	uint64_t full_cksum;
+	uint64_t part_cksum;
 	file_t *next;
 };
 
@@ -42,7 +54,7 @@ struct mystruct
 
 struct mystruct *myfiles=NULL;
 
-struct mystruct *find_key(off_t st_size)
+static struct mystruct *find_key(off_t st_size)
 {
 	struct mystruct *s;
 
@@ -76,17 +88,63 @@ static int add_key(off_t st_size, struct file *f)
 	return 0;
 }
 
-static FILE *open_file(struct file *f)
+static void file_free_content(struct file *file)
 {
-	FILE *fp=NULL;
-	if(!(fp=fopen(f->path, "rb")))
-		logp("Could not open %s\n", f->path);
-	return fp;
+	if(!file) return;
+	free_w(&file->path);
+}
+
+static void file_free(struct file **file)
+{
+	if(!file || !*file) return;
+	file_free_content(*file);
+	free_v((void **)file);
+}
+
+static void files_free(struct file **files)
+{
+	struct file *f;
+	struct file *fhead;
+	if(!files || !*files) return;
+	fhead=*files;
+	while(fhead)
+	{
+		f=fhead;
+		fhead=fhead->next;
+		file_free(&f);
+	}
+}
+
+static void mystruct_free_content(struct mystruct *mystruct)
+{
+	if(!mystruct) return;
+	files_free(&mystruct->files);
+}
+
+static void mystruct_free(struct mystruct **mystruct)
+{
+	if(!mystruct || !*mystruct) return;
+	mystruct_free_content(*mystruct);
+	free_v((void **)mystruct);
+}
+
+static void mystruct_delete_all(void)
+{
+	struct mystruct *tmp;
+	struct mystruct *mystruct;
+
+	HASH_ITER(hh, myfiles, mystruct, tmp)
+	{
+		HASH_DEL(myfiles, mystruct);
+		mystruct_free(&mystruct);
+	}
+	myfiles=NULL;
 }
 
 #define FULL_CHUNK	4096
 
-static int full_match(struct file *o, struct file *n, FILE **ofp, FILE **nfp)
+static int full_match(struct file *o, struct file *n,
+	struct fzp **ofp, struct fzp **nfp)
 {
 	size_t ogot;
 	size_t ngot;
@@ -94,8 +152,8 @@ static int full_match(struct file *o, struct file *n, FILE **ofp, FILE **nfp)
 	static char obuf[FULL_CHUNK];
 	static char nbuf[FULL_CHUNK];
 
-	if(*ofp) fseek(*ofp, 0, SEEK_SET);
-	else if(!(*ofp=open_file(o)))
+	if(*ofp) fzp_seek(*ofp, 0, SEEK_SET);
+	else if(!(*ofp=fzp_open(o->path, "rb")))
 	{
 		// Blank this entry so that it can be ignored from
 		// now on.
@@ -103,13 +161,13 @@ static int full_match(struct file *o, struct file *n, FILE **ofp, FILE **nfp)
 		return 0;
 	}
 
-	if(*nfp) fseek(*nfp, 0, SEEK_SET);
-	else if(!(*nfp=open_file(n))) return 0;
+	if(*nfp) fzp_seek(*nfp, 0, SEEK_SET);
+	else if(!(*nfp=fzp_open(n->path, "rb"))) return 0;
 
 	while(1)
 	{
-		ogot=fread(obuf, 1, FULL_CHUNK, *ofp);
-		ngot=fread(nbuf, 1, FULL_CHUNK, *nfp);
+		ogot=fzp_read(*ofp, obuf, FULL_CHUNK);
+		ngot=fzp_read(*nfp, nbuf, FULL_CHUNK);
 		if(ogot!=ngot) return 0;
 		for(i=0; i<ogot; i++)
 			if(obuf[i]!=nbuf[i]) return 0;
@@ -121,15 +179,15 @@ static int full_match(struct file *o, struct file *n, FILE **ofp, FILE **nfp)
 
 #define PART_CHUNK	1024
 
-static int get_part_cksum(struct file *f, FILE **fp)
+static int get_part_cksum(struct file *f, struct fzp **fzp)
 {
 	MD5_CTX md5;
 	int got=0;
 	static char buf[PART_CHUNK];
 	unsigned char checksum[MD5_DIGEST_LENGTH+1];
 
-	if(*fp) fseek(*fp, 0, SEEK_SET);
-	else if(!(*fp=open_file(f)))
+	if(*fzp) fzp_seek(*fzp, 0, SEEK_SET);
+	else if(!(*fzp=fzp_open(f->path, "rb")))
 	{
 		f->part_cksum=0;
 		return 0;
@@ -141,7 +199,7 @@ static int get_part_cksum(struct file *f, FILE **fp)
 		return -1;
 	}
 
-	got=fread(buf, 1, PART_CHUNK, *fp);
+	got=fzp_read(*fzp, buf, PART_CHUNK);
 
 	if(!MD5_Update(&md5, buf, got))
 	{
@@ -164,15 +222,15 @@ static int get_part_cksum(struct file *f, FILE **fp)
 	return 0;
 }
 
-static int get_full_cksum(struct file *f, FILE **fp)
+static int get_full_cksum(struct file *f, struct fzp **fzp)
 {
 	size_t s=0;
 	MD5_CTX md5;
 	static char buf[FULL_CHUNK];
 	unsigned char checksum[MD5_DIGEST_LENGTH+1];
 
-	if(*fp) fseek(*fp, 0, SEEK_SET);
-	else if(!(*fp=open_file(f)))
+	if(*fzp) fzp_seek(*fzp, 0, SEEK_SET);
+	else if(!(*fzp=fzp_open(f->path, "rb")))
 	{
 		f->full_cksum=0;
 		return 0;
@@ -184,7 +242,7 @@ static int get_full_cksum(struct file *f, FILE **fp)
 		return -1;
 	}
 
-	while((s=fread(buf, 1, FULL_CHUNK, *fp))>0)
+	while((s=fzp_read(*fzp, buf, FULL_CHUNK))>0)
 	{
 		if(!MD5_Update(&md5, buf, s))
 		{
@@ -206,7 +264,7 @@ static int get_full_cksum(struct file *f, FILE **fp)
 }
 
 /* Make it atomic by linking to a temporary file, then moving it into place. */
-static int do_hardlink(struct file *o, struct file *n, const char *ext)
+static int do_hardlink(struct file *o, struct file *n)
 {
 	int ret=-1;
 	char *tmppath=NULL;
@@ -222,7 +280,15 @@ static int do_hardlink(struct file *o, struct file *n, const char *ext)
 		goto end;
 	}
 	if((ret=do_rename(tmppath, o->path)))
+	{
+		// 'man 2 rename', says it should be safe to unlink tmppath:
+		// "If newpath exists but the operation fails for some reason,
+		// rename() guarantees to leave an instance of newpath in
+		// place."
+		if(unlink(tmppath))
+			logp("Could not unlink %s\n", tmppath);
 		goto end;
+	}
 	ret=0;
 end:
 	free_w(&tmppath);
@@ -234,18 +300,21 @@ static void reset_old_file(struct file *oldfile, struct file *newfile,
 {
 	//printf("reset %s with %s %d\n", oldfile->path, newfile->path,
 	//	info->st_nlink);
-	oldfile->nlink=info->st_nlink;
+	struct file *next;
+
+	next=oldfile->next;
 	free_w(&oldfile->path);
-	oldfile->path=newfile->path;
+	memcpy(oldfile, newfile, sizeof(struct file));
+	oldfile->next=next;
 	newfile->path=NULL;
 }
 
 static int check_files(struct mystruct *find, struct file *newfile,
-	struct stat *info, const char *ext, unsigned int maxlinks)
+	struct stat *info)
 {
 	int found=0;
-	FILE *nfp=NULL;
-	FILE *ofp=NULL;
+	struct fzp *nfp=NULL;
+	struct fzp *ofp=NULL;
 	struct file *f=NULL;
 
 	for(f=find->files; f; f=f->next)
@@ -271,6 +340,12 @@ static int check_files(struct mystruct *find, struct file *newfile,
 			found++;
 			break;
 		}
+		if(newfile->nlink>=maxlinks) {
+			// This new file file has enough links. Just leave it
+			// as it is to avoid undoing all these hardlinks.
+			found++;
+			break;
+		}
 		if((!newfile->part_cksum && get_part_cksum(newfile, &nfp))
 		  || (!f->part_cksum && get_part_cksum(f, &ofp)))
 		{
@@ -279,7 +354,7 @@ static int check_files(struct mystruct *find, struct file *newfile,
 		}
 		if(newfile->part_cksum!=f->part_cksum)
 		{
-			close_fp(&ofp);
+			fzp_close(&ofp);
 			continue;
 		}
 		//printf("  %s, %s\n", find->files->path, newfile->path);
@@ -293,14 +368,14 @@ static int check_files(struct mystruct *find, struct file *newfile,
 		}
 		if(newfile->full_cksum!=f->full_cksum)
 		{
-			close_fp(&ofp);
+			fzp_close(&ofp);
 			continue;
 		}
 
 		//printf("  full cksum matched\n");
 		if(!full_match(newfile, f, &nfp, &ofp))
 		{
-			close_fp(&ofp);
+			fzp_close(&ofp);
 			continue;
 		}
 		//printf("  full match\n");
@@ -327,33 +402,16 @@ static int check_files(struct mystruct *find, struct file *newfile,
 		// Now hardlink it.
 		if(makelinks)
 		{
-			switch(do_hardlink(newfile, f, ext))
+			if(do_hardlink(newfile, f))
 			{
-				case 0:
-					f->nlink++;
-					// Only count bytes as saved if we
-					// removed the last link.
-					if(newfile->nlink==1)
-						savedbytes+=info->st_size;
-					break;
-				case -1:
-					// On error, replace the memory of the
-					// old file with the one that we just
-					// found. It might work better when
-					// someone later tries to link to the
-					// new one instead of the old one.
-					reset_old_file(f, newfile, info);
-					count--;
-					break;
-				default:
-					// Abandon all hope.
-					// This could happen if renaming the
-					// hardlink failed in such a way that
-					// the target file was unlinked without
-					// being replaced - ie, if the max
-					// number of hardlinks is being hit.
-					return -1;
+				count--;
+				return -1;
 			}
+			f->nlink++;
+			// Only count bytes as saved if we
+			// removed the last link.
+			if(newfile->nlink==1)
+				savedbytes+=info->st_size;
 		}
 		else if(deletedups)
 		{
@@ -379,8 +437,8 @@ static int check_files(struct mystruct *find, struct file *newfile,
 
 		break;
 	}
-	close_fp(&nfp);
-	close_fp(&ofp);
+	fzp_close(&nfp);
+	fzp_close(&ofp);
 
 	if(found)
 	{
@@ -397,7 +455,6 @@ static int looks_like_protocol1(const char *basedir)
 {
 	int ret=-1;
 	char *tmp=NULL;
-	struct stat statp;
 	if(!(tmp=prepend_s(basedir, "current")))
 	{
 		log_out_of_memory(__func__);
@@ -405,7 +462,7 @@ static int looks_like_protocol1(const char *basedir)
 	}
 	// If there is a 'current' symlink here, we think it looks like a
 	// protocol 1 backup.
-	if(!lstat(tmp, &statp) && S_ISLNK(statp.st_mode))
+	if(is_lnk_lstat(tmp)>0)
 	{
 		ret=1;
 		goto end;
@@ -418,18 +475,10 @@ end:
 
 static int get_link(const char *basedir, const char *lnk, char real[], size_t r)
 {
-	int len=0;
-	char *tmp=NULL;
-	if(!(tmp=prepend_s(basedir, lnk)))
-	{
-		log_out_of_memory(__func__);
-		return -1;
-	}
-	if((len=readlink(tmp, real, r-1))<0) len=0;
-	real[len]='\0';
-	free_w(&tmp);
+	readlink_w_in_dir(basedir, lnk, real, r);
 	// Strip any trailing slash.
-	if(real[strlen(real)-1]=='/') real[strlen(real)-1]='\0';
+	if(real[strlen(real)-1]=='/')
+		real[strlen(real)-1]='\0';
 	return 0;
 }
 
@@ -468,7 +517,7 @@ static int level_exclusion(int level, const char *fname,
 
 // Return 0 for directory processed, -1 for error, 1 for not processed.
 static int process_dir(const char *oldpath, const char *newpath,
-	const char *ext, unsigned int maxlinks, int burp_mode, int level)
+	int burp_mode, int level)
 {
 	int ret=-1;
 	DIR *dirp=NULL;
@@ -525,7 +574,8 @@ static int process_dir(const char *oldpath, const char *newpath,
 
 		if(S_ISDIR(info.st_mode))
 		{
-			if(process_dir(path, dirinfo->d_name, ext, maxlinks,					burp_mode, level+1))
+			if(process_dir(path, dirinfo->d_name,
+				burp_mode, level+1))
 					goto end;
 			continue;
 		}
@@ -543,7 +593,7 @@ static int process_dir(const char *oldpath, const char *newpath,
 		if((find=find_key(info.st_size)))
 		{
 			//printf("check %d: %s\n", info.st_size, newfile.path);
-			if(check_files(find, &newfile, &info, ext, maxlinks))
+			if(check_files(find, &newfile, &info))
 				goto end;
 		}
 		else
@@ -555,13 +605,13 @@ static int process_dir(const char *oldpath, const char *newpath,
 	}
 	ret=0;
 end:
-	closedir(dirp);
+	if(dirp) closedir(dirp);
 	free_w(&newfile.path);
 	free_w(&path);
 	return ret;
 }
 
-static void sighandler(int signum)
+static void sighandler(__attribute__ ((unused)) int signum)
 {
 	locks_release_and_free(&locklist);
 	exit(1);
@@ -593,17 +643,13 @@ static int in_group(struct strlist *grouplist, const char *dedup_group)
 }
 
 static int iterate_over_clients(struct conf **globalcs,
-	struct strlist *grouplist, const char *ext, unsigned int maxlinks)
+	struct strlist *grouplist)
 {
 	int ret=0;
 	DIR *dirp=NULL;
 	struct conf **cconfs=NULL;
 	struct dirent *dirinfo=NULL;
 	const char *globalclientconfdir=get_string(globalcs[OPT_CLIENTCONFDIR]);
-
-	signal(SIGABRT, &sighandler);
-	signal(SIGTERM, &sighandler);
-	signal(SIGINT, &sighandler);
 
 	if(!(cconfs=confs_alloc())) return -1;
 	if(confs_init(cconfs)) return -1;
@@ -622,8 +668,7 @@ static int iterate_over_clients(struct conf **globalcs,
 		struct lock *lock=NULL;
 
 		if(dirinfo->d_ino==0
-		// looks_like...() also avoids '.' and '..'.
-		  || looks_like_tmp_or_hidden_file(dirinfo->d_name)
+		  || !cname_valid(dirinfo->d_name)
 		  || !is_regular_file(globalclientconfdir, dirinfo->d_name))
 			continue;
 
@@ -682,7 +727,7 @@ static int iterate_over_clients(struct conf **globalcs,
 
 		switch(process_dir(get_string(cconfs[OPT_DIRECTORY]),
 			dirinfo->d_name,
-			ext, maxlinks, 1 /* burp mode */, 0 /* level */))
+			1 /* burp mode */, 0 /* level */))
 		{
 			case 0: ccount++;
 			case 1: continue;
@@ -699,60 +744,148 @@ static int iterate_over_clients(struct conf **globalcs,
 	return ret;
 }
 
-static char *get_config_path(void)
+static int process_from_conf(const char *configfile, char **groups)
 {
-        static char path[256]="";
-        snprintf(path, sizeof(path), "%s", SYSCONFDIR "/burp.conf");
-        return path;
+	int ret=-1;
+	struct conf **globalcs=NULL;
+	struct strlist *grouplist=NULL;
+	struct lock *globallock=NULL;
+
+	signal(SIGABRT, &sighandler);
+	signal(SIGTERM, &sighandler);
+	signal(SIGINT, &sighandler);
+
+	if(*groups)
+	{
+		char *tok=NULL;
+		if((tok=strtok(*groups, ",\n")))
+		{
+			do
+			{
+				if(strlist_add(&grouplist, tok, 1))
+				{
+					log_out_of_memory(__func__);
+					goto end;
+				}
+			} while((tok=strtok(NULL, ",\n")));
+		}
+		if(!grouplist)
+		{
+			logp("unable to read list of groups\n");
+			goto end;
+		}
+	}
+
+	// Read directories from config files, and get locks.
+	if(!(globalcs=confs_alloc())
+	  || confs_init(globalcs)
+	  || conf_load_global_only(configfile, globalcs))
+		goto end;
+
+	if(get_e_burp_mode(globalcs[OPT_BURP_MODE])!=BURP_MODE_SERVER)
+	{
+		logp("%s is not a server config file\n", configfile);
+		goto end;
+	}
+	logp("Dedup clients from %s\n",
+		get_string(globalcs[OPT_CLIENTCONFDIR]));
+	maxlinks=get_int(globalcs[OPT_MAX_HARDLINKS]);
+	if(grouplist)
+	{
+		struct strlist *g=NULL;
+		logp("in dedup groups:\n");
+		for(g=grouplist; g; g=g->next)
+			logp("%s\n", g->path);
+	}
+	else
+	{
+		char *lockpath=NULL;
+		const char *opt_lockfile=confs_get_lockfile(globalcs);
+		// Only get the global lock when doing a global run.
+		// If you are doing individual groups, you are likely
+		// to want to do many different dedup jobs and a
+		// global lock would get in the way.
+		if(!(lockpath=prepend(opt_lockfile, ".bedup"))
+		  || !(globallock=lock_alloc_and_init(lockpath)))
+			goto end;
+		lock_get(globallock);
+		if(globallock->status!=GET_LOCK_GOT)
+		{
+			logp("Could not get lock %s (%d)\n", lockpath,
+				globallock->status);
+			free_w(&lockpath);
+			goto end;
+		}
+		logp("Got %s\n", lockpath);
+	}
+	ret=iterate_over_clients(globalcs, grouplist);
+end:
+	confs_free(&globalcs);
+	lock_release(globallock);
+	lock_free(&globallock);
+	strlists_free(&grouplist);
+	return ret;
+}
+
+static int process_from_command_line(int argc, char *argv[])
+{
+	int i;
+	for(i=optind; i<argc; i++)
+	{
+		// Strip trailing slashes, for tidiness.
+		if(argv[i][strlen(argv[i])-1]=='/')
+			argv[i][strlen(argv[i])-1]='\0';
+		if(process_dir("", argv[i],
+			0 /* not burp mode */, 0 /* level */))
+				return 1;
+	}
+	return  0;
 }
 
 static int usage(void)
 {
-	printf("\n%s: [options]\n", prog);
-	printf("\n");
-	printf(" Options:\n");
-	printf("  -c <path>                Path to config file (default: %s).\n", get_config_path());
-	printf("  -g <list of group names> Only run on the directories of clients that\n");
-	printf("                           are in one of the groups specified.\n");
-	printf("                           The list is comma-separated. To put a client in a\n");
-	printf("                           group, use the 'dedup_group' option in the client\n");
-	printf("                           configuration file on the server.\n");
-	printf("  -h|-?                    Print this text and exit.\n");
-	printf("  -d                       Delete any duplicate files found.\n");
-	printf("                           (non-burp mode only)\n");
-	printf("  -l                       Hard link any duplicate files found.\n");
-	printf("  -m <number>              Maximum number of hard links to a single file.\n");
-	printf("                           (non-burp mode only - in burp mode, use the\n");
-	printf("                           max_hardlinks option in the configuration file)\n");
-	printf("                           The default is %d. On ext3, the maximum number\n", DEF_MAX_LINKS);
-	printf("                           of links possible is 32000, but space is needed\n");
-	printf("                           for the normal operation of burp.\n");
-	printf("  -n <list of directories> Non-burp mode. Deduplicate any (set of) directories.\n");
-	printf("  -v                       Print duplicate paths.\n");
-	printf("  -V                       Print version and exit.\n");
-	printf("\n");
-	printf("By default, %s will read %s and deduplicate client storage\n", prog, get_config_path());
-	printf("directories using special knowledge of the structure.\n");
-	printf("\n");
-	printf("With '-n', this knowledge is turned off and you have to specify the directories\n");
-	printf("to deduplicate on the command line. Running with '-n' is therefore dangerous\n");
-	printf("if you are deduplicating burp storage directories.\n\n");
+	logfmt("\nUsage: %s [options]\n", prog);
+	logfmt("\n");
+	logfmt(" Options:\n");
+	logfmt("  -c <path>                Path to config file (default: %s).\n", config_default_path());
+	logfmt("  -g <list of group names> Only run on the directories of clients that\n");
+	logfmt("                           are in one of the groups specified.\n");
+	logfmt("                           The list is comma-separated. To put a client in a\n");
+	logfmt("                           group, use the 'dedup_group' option in the client\n");
+	logfmt("                           configuration file on the server.\n");
+	logfmt("  -h|-?                    Print this text and exit.\n");
+	logfmt("  -d                       Delete any duplicate files found.\n");
+	logfmt("                           (non-%s mode only)\n", PACKAGE_TARNAME);
+	logfmt("  -l                       Hard link any duplicate files found.\n");
+	logfmt("  -m <number>              Maximum number of hard links to a single file.\n");
+	logfmt("                           (non-%s mode only - in burp mode, use the\n", PACKAGE_TARNAME);
+	logfmt("                           max_hardlinks option in the configuration file)\n");
+	logfmt("                           The default is %d. On ext3, the maximum number\n", DEF_MAX_LINKS);
+	logfmt("                           of links possible is 32000, but space is needed\n");
+	logfmt("                           for the normal operation of %s.\n", PACKAGE_TARNAME);
+	logfmt("  -n <list of directories> Non-%s mode. Deduplicate any (set of) directories.\n", PACKAGE_TARNAME);
+	logfmt("  -v                       Print duplicate paths.\n");
+	logfmt("  -V                       Print version and exit.\n");
+	logfmt("\n");
+	logfmt("By default, %s will read %s and deduplicate client storage\n", prog, config_default_path());
+	logfmt("directories using special knowledge of the structure.\n");
+	logfmt("\n");
+	logfmt("With '-n', this knowledge is turned off and you have to specify the directories\n");
+	logfmt("to deduplicate on the command line. Running with '-n' is therefore dangerous\n");
+	logfmt("if you are deduplicating %s storage directories.\n\n", PACKAGE_TARNAME);
 	return 1;
 }
 
 int run_bedup(int argc, char *argv[])
 {
-	int i=1;
 	int ret=0;
 	int option=0;
 	int nonburp=0;
-	unsigned int maxlinks=DEF_MAX_LINKS;
 	char *groups=NULL;
-	char ext[16]="";
 	int givenconfigfile=0;
 	const char *configfile=NULL;
 
-	configfile=get_config_path();
+	configfile=config_default_path();
 	snprintf(ext, sizeof(ext), ".bedup.%d", getpid());
 
 	while((option=getopt(argc, argv, "c:dg:hlm:nvV?"))!=-1)
@@ -779,7 +912,7 @@ int run_bedup(int argc, char *argv[])
 				nonburp=1;
 				break;
 			case 'V':
-				printf("%s-%s\n", prog, VERSION);
+				logfmt("%s-%s\n", prog, PACKAGE_VERSION);
 				return 0;
 			case 'v':
 				verbose=1;
@@ -802,7 +935,7 @@ int run_bedup(int argc, char *argv[])
 	}
 	if(!nonburp && maxlinks!=DEF_MAX_LINKS)
 	{
-		logp("-m option is specified via the configuration file in burp mode (max_hardlinks=)\n");
+		logp("-m option is specified via the configuration file in %s mode (max_hardlinks=)\n", PACKAGE_TARNAME);
 		return 1;
 	}
 	if(deletedups && makelinks)
@@ -842,103 +975,24 @@ int run_bedup(int argc, char *argv[])
 	if(nonburp)
 	{
 		// Read directories from command line.
-		for(i=optind; i<argc; i++)
-		{
-			// Strip trailing slashes, for tidiness.
-			if(argv[i][strlen(argv[i])-1]=='/')
-				argv[i][strlen(argv[i])-1]='\0';
-			if(process_dir("", argv[i], ext, maxlinks,
-				0 /* not burp mode */, 0 /* level */))
-			{
-				ret=1;
-				break;
-			}
-		}
+		if(process_from_command_line(argc, argv))
+			ret=1;
 	}
 	else
 	{
-		struct conf **globalcs=NULL;
-		struct strlist *grouplist=NULL;
-		struct lock *globallock=NULL;
-
-		if(groups)
-		{
-			char *tok=NULL;
-			if((tok=strtok(groups, ",\n")))
-			{
-				do
-				{
-					if(strlist_add(&grouplist, tok, 1))
-					{
-						log_out_of_memory(__func__);
-						return -1;
-					}
-				} while((tok=strtok(NULL, ",\n")));
-			}
-			if(!grouplist)
-			{
-				logp("unable to read list of groups\n");
-				return -1;
-			}
-		}
-
-		// Read directories from config files, and get locks.
-		if(!(globalcs=confs_alloc())) return -1;
-		if(confs_init(globalcs)) return -1;
-		if(conf_load_global_only(configfile, globalcs)) return 1;
-		if(get_e_burp_mode(globalcs[OPT_BURP_MODE])!=BURP_MODE_SERVER)
-		{
-			logp("%s is not a server config file\n", configfile);
-			confs_free(&globalcs);
-			return 1;
-		}
-		logp("Dedup clients from %s\n",
-			get_string(globalcs[OPT_CLIENTCONFDIR]));
-		maxlinks=get_int(globalcs[OPT_MAX_HARDLINKS]);
-		if(grouplist)
-		{
-			struct strlist *g=NULL;
-			logp("in dedup groups:\n");
-			for(g=grouplist; g; g=g->next)
-				logp("%s\n", g->path);
-		}
-		else
-		{
-			char *lockpath=NULL;
-			const char *opt_lockfile=confs_get_lockfile(globalcs);
-			// Only get the global lock when doing a global run.
-			// If you are doing individual groups, you are likely
-			// to want to do many different dedup jobs and a
-			// global lock would get in the way.
-			if(!(lockpath=prepend(opt_lockfile, ".bedup"))
-			  || !(globallock=lock_alloc_and_init(lockpath)))
-				return 1;
-			lock_get(globallock);
-			if(globallock->status!=GET_LOCK_GOT)
-			{
-				logp("Could not get lock %s (%d)\n", lockpath,
-					globallock->status);
-				free_w(&lockpath);
-				return 1;
-			}
-			logp("Got %s\n", lockpath);
-		}
-		ret=iterate_over_clients(globalcs, grouplist, ext, maxlinks);
-		confs_free(&globalcs);
-
-		lock_release(globallock);
-		lock_free(&globallock);
-		strlists_free(&grouplist);
+		if(process_from_conf(configfile, &groups))
+			ret=1;
 	}
 
 	if(!nonburp)
 	{
 		logp("%d client storages scanned\n", ccount);
 	}
-	logp("%llu duplicate %s found\n",
+	logp("%" PRIu64 " duplicate %s found\n",
 		count, count==1?"file":"files");
-	logp("%llu bytes %s%s\n",
+	logp("%" PRIu64 " bytes %s%s\n",
 		savedbytes, (makelinks || deletedups)?"saved":"saveable",
 			bytes_to_human(savedbytes));
+	mystruct_delete_all();
 	return ret;
 }

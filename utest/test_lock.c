@@ -1,7 +1,3 @@
-#include <check.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdio.h>
 #include "test.h"
 #include "../src/alloc.h"
 #include "../src/lock.h"
@@ -22,7 +18,7 @@ static void tear_down(struct lock **lock, struct lock **locklist)
 {
 	lock_free(lock);
 	locks_release_and_free(locklist);
-	fail_unless(free_count==alloc_count);
+	alloc_check();
 }
 
 static void assert_can_get_lock(struct lock *lock)
@@ -71,8 +67,8 @@ static void run_with_fork(int child_exit_early)
 		fail_unless(lock_test(lockfile)==-1);
 		lock_get_quick(lock);
 		fail_unless(lock->status==GET_LOCK_NOT_GOT);
-		wait(&stat);
 	}
+	wait(&stat);
 
 	// The child has exited, should now be able to get it.
 	assert_can_get_lock(lock);

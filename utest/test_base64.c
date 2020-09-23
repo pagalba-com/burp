@@ -51,10 +51,11 @@ END_TEST
 static struct data extra_from[] = {
 	// Test some strange input.
 	{ 0,		"", 0 },
-	{ 0,		" sdff", 0 },
+	{ 10000,	" C$cQ", 5 },
 	{ 10000,	"C$cQ", 4 },
 	{ 10000,	"C$cQ 82394", 4 },
 	{ 10000,	"Cc€Q 82394", 6 },
+	{ 9184233123957407608,	"812908312903012923901239081232394", 33 }
 };
 
 static void do_from_base64(struct data *d, size_t s)

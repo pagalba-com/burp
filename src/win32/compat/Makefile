@@ -1,21 +1,9 @@
-#
-# Makefile for win32 burp executables
-# Using MinGW cross-compiler on GNU/Linux
-
 include ../Makefile.inc
-
-INCLUDES = \
-	$(INCLUDE_GCC) \
-	$(INCLUDE_MINGW) \
-	$(INCLUDE_BURP) \
-	$(INCLUDE_ZLIB) \
-	$(INCLUDE_VSS) \
-	$(INCLUDE_ICONS) \
-	$(INCLUDE_OPENSSL)
 
 DEFINES = \
 	-DWIN32 \
-	$(HAVES)
+	$(HAVES) \
+	$(PACKAGE_DEFINES)
 
 ######################################################################
 

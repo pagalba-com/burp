@@ -30,12 +30,44 @@ static struct data p[] = {
 	{ APRIOR,	"/some/path",	"/some/path/" },
 	{ APRIOR,	"/some/path",	"/some/pathy" },
 	{ ALATER,	"/some/path",	"/som/path" },
-	{ ALATER,	"/long/p/a/t/h","/long/p/a/s/t" }
+	{ ALATER,	"/long/p/a/t/h","/long/p/a/s/t" },
+	{ APRIOR,	"/some/path",	"/someppath" },
+	{ APRIOR,	"/some/path",	"/some path" },
 };
 
 START_TEST(test_pathcmp)
 {
 	FOREACH(p) fail_unless(pathcmp(p[i].a, p[i].b)==p[i].expected);
+}
+END_TEST
+
+struct data_s
+{
+	int expected;
+	int a;
+	int b;
+};
+
+// pathcmp has a bug that we have to live with, where it compares signed chars
+// instead of unsigned chars. It means that it orders chars above 127 (0x7F)
+// first.
+static struct data_s p_s[] = {
+	{ APRIOR,	0x00,		0xFF },
+	{ APRIOR,	0x7E,		0x7F },
+	{ APRIOR,	0x80,		0x7F },
+	{ APRIOR,	0x80,		0x81 },
+};
+
+START_TEST(test_pathcmp_s)
+{
+	char a[2]="";
+	char b[2]="";
+	FOREACH(p_s)
+	{
+		snprintf(a, sizeof(a), "%c", p_s[i].a);
+		snprintf(b, sizeof(b), "%c", p_s[i].b);
+		fail_unless(pathcmp(a, b)==p_s[i].expected);
+	}
 }
 END_TEST
 
@@ -66,6 +98,52 @@ START_TEST(test_is_subdir)
 }
 END_TEST
 
+struct abs
+{
+	int expected_dot;
+	int expected_abs;
+	const char *a;
+};
+
+static struct abs a[] = {
+	{ 0, 0, "foo/bar" },
+#ifndef HAVE_WIN32
+	{ 0, 1, "/foo/bar" },
+	{ 0, 1, "/foo..bar" },
+	{ 0, 1, "/foo/bar.." },
+	{ 0, 1, "/foo../bar" },
+#endif
+	{ 0, 0, ":/foo/bar" },
+	{ 1, 0, ".." },
+	{ 1, 0, "../" },
+	{ 1, 0, "/foo/.." },
+	{ 1, 0, "/foo/../" },
+	{ 1, 0, "/foo/../bar" },
+	{ 1, 0, "." },
+	{ 1, 0, "./" },
+	{ 1, 0, "/foo/." },
+	{ 1, 0, "/foo/./" },
+	{ 1, 0, "/foo/./bar" },
+	{ 0, 1, "C:/foo/bar" },
+	{ 0, 1, "D:/foo/bar" },
+	{ 0, 1, "C:/foo..bar" },
+	{ 0, 1, "C:/foo/bar.." },
+	{ 0, 1, "C:/foo../bar" },
+	{ 0, 0, "CD:/foo/bar" },
+};
+
+START_TEST(test_has_dot_component)
+{
+	FOREACH(a) fail_unless(has_dot_component(a[i].a)==a[i].expected_dot);
+}
+END_TEST
+
+START_TEST(test_is_absolute)
+{
+	FOREACH(a) fail_unless(is_absolute(a[i].a)==a[i].expected_abs);
+}
+END_TEST
+
 Suite *suite_pathcmp(void)
 {
 	Suite *s;
@@ -76,7 +154,10 @@ Suite *suite_pathcmp(void)
 	tc_core=tcase_create("Core");
 
 	tcase_add_test(tc_core, test_pathcmp);
+	tcase_add_test(tc_core, test_pathcmp_s);
 	tcase_add_test(tc_core, test_is_subdir);
+	tcase_add_test(tc_core, test_has_dot_component);
+	tcase_add_test(tc_core, test_is_absolute);
 	suite_add_tcase(s, tc_core);
 
 	return s;

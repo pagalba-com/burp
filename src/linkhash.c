@@ -45,8 +45,8 @@ struct f_link **linkhash=NULL;
 
 int linkhash_init(void)
 {
-	if(!(linkhash=(f_link **)
-		calloc_w(1, LINK_HASHTABLE_SIZE*sizeof(f_link *), __func__)))
+	if(!(linkhash=(struct f_link **)calloc_w(1,
+		LINK_HASHTABLE_SIZE*sizeof(*linkhash), __func__)))
 			return -1;
 	return 0;
 }
@@ -81,7 +81,7 @@ void linkhash_free(void)
 static inline int get_hash(struct stat *statp)
 {
 	int hash=statp->st_dev;
-	unsigned long long i=statp->st_ino;
+	uint64_t i=statp->st_ino;
 	hash ^= i;
 	i >>= 16;
 	hash ^= i;

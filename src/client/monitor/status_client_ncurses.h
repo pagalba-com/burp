@@ -1,27 +1,18 @@
 #ifndef STATUS_CLIENT_NCURSES_H
 #define STATUS_CLIENT_NCURSES_H
 
-enum page
-{
-	PAGE_CLIENT_LIST=0,
-	PAGE_BACKUP_LIST,
-	PAGE_BACKUP_LOGS,
-	PAGE_VIEW_LOG
-};
+#include "../../action.h"
 
-struct sel
-{
-	struct cstat *clist;
-	struct cstat *client;
-	struct bu *backup;
-	uint16_t logop;
-	struct lline *llines;
-	struct lline *lline;
-	enum page page;
-	int offset;
-	uint8_t gotfirstresponse;
-};
+struct async;
+struct sel;
 
-extern int status_client_ncurses(enum action act, struct conf **confs);
+extern int status_client_ncurses_init(enum action act);
+extern int status_client_ncurses(struct conf **confs);
+
+#ifdef UTEST
+extern int status_client_ncurses_main_loop(struct async *as,
+	struct asfd *so_asfd, struct sel *sel,
+	const char *orig_client);
+#endif
 
 #endif

@@ -1,0 +1,40 @@
+{
+    "clients": [
+        {
+            "name": "cli1",
+            "labels": [
+                "abc",
+                "xyz"
+            ],
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+
+            ]
+        },
+        {
+            "name": "cli2",
+            "labels": [
+                "abc",
+                "xyz"
+            ],
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+
+            ]
+        },
+        {
+            "name": "cli3",
+            "labels": [
+                "abc",
+                "xyz"
+            ],
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+
+            ]
+        }
+    ]
+}

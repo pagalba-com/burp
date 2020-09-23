@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# Run builds and tests on Amazon virtual machines.
+set -eux
+
+prog=$(basename $0)
+DIR=$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)
+
+usage()
+{
+	echo "usage: $prog tarfile" 1>&2
+	exit 1
+}
+
+tarfile="$1"
+[ -n "$tarfile" ] || usage
+[ -f "$tarfile" ]
+
+. "$DIR"/vms_shared
+. "$DIR"/vms_ids
+instanceids="$debianid
+$windowsid"
+[ -n "$instanceids" ]
+restart_instanceids "$instanceids"
+get_summary "$instanceids"
+
+host="admin@$debian"
+ssh_opts="-i /var/lib/jenkins/aws/ubfree.pem -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+
+# It is possible for the machine to be up, but for sshd to not yet be running.
+# Try multiple times for the initial connect.
+attempts=0
+attempts_max=50
+while true ; do
+	ssh $ssh_opts "$host" true && break
+	attempts=$((attempts+1))
+	[ "$attempts" = "$attempts_max" ]
+done
+
+ssh $ssh_opts "$host" "sudo rm -rf $tarfile burp"
+scp $ssh_opts "$tarfile" "$host:"
+ssh $ssh_opts "$host" "mkdir burp"
+ssh $ssh_opts "$host" "tar -xvf $tarfile -C burp --strip-components=1"
+
+function docker_run()
+{
+	ssh $ssh_opts "$host" "docker run --name burp --rm -v ~/burp:/burp -v ~/.ssh:/root/.ssh --expose 4998-4999 -p 4998:4998 -p 4999:4999 -w /burp burp-cross-tools $@"
+}
+
+docker_run "./configure --prefix=/usr --sysconfdir=/etc/burp --localstatedir=/var --with-coverage"
+docker_run "make coverage"
+echo "Running utests with valgrind"
+docker_run "valgrind --error-exitcode=1 --suppressions=valgrind.supp -q ./runner"
+
+scp -r $ssh_opts "$host:burp/burp-coverage" .
+
+docker_run "make -C test clean"
+docker_run "make -C test test"
+docker_run "./configure --prefix=/usr --sysconfdir=/etc/burp --localstatedir=/var"
+ssh $ssh_opts "$host" "ln -sfT /burp-cross-tools/cross-tools burp/burp-cross-tools"
+ssh $ssh_opts "$host" "ln -sfT /burp-cross-tools/depkgs burp/burp-depkgs"
+docker_run "make -C src/win32"
+docker_run "make -C src/win32 WIN64=yes"
+docker_run "./test/test_windows64 $debian $windows Administrator"
+scp -r $ssh_opts "$host:burp/src/win*/release*/burp-win*installer*.exe" .
+
+# For the files-only release.
+ssh $ssh_opts "$host" "sudo rm -rf Burp"
+ssh $ssh_opts "$host" "sudo mv burp/src/win32/installer64/release64 Burp"
+ssh $ssh_opts "$host" "zip -r Burp.zip Burp"
+scp -r $ssh_opts "$host:Burp.zip" .
+
+ssh $ssh_opts "$host" "sudo rm -rf '$tarfile' burp"
+ssh $ssh_opts "$host" "sudo rm -rf Burp Burp.zip"
+
+stop_instanceids "$instanceids"
+
+echo "Everything succeeded."
+
+exit 0

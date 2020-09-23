@@ -1,7 +1,39 @@
-#include "include.h"
-#include "openssl/ssl.h"
+#include "burp.h"
+#include "alloc.h"
+#include "conf.h"
+#include "log.h"
+#include "server/ca.h"
+#include "ssl.h"
 
 static const char *pass=NULL;
+
+int ssl_do_accept(SSL *ssl)
+{
+	while(1)
+	{
+		int r;
+		ERR_clear_error();
+		switch((r=SSL_accept(ssl)))
+		{
+			case 1:
+				return 0;
+			case 0:
+				goto error;
+			default:
+				switch(SSL_get_error(ssl, r))
+				{
+					case SSL_ERROR_WANT_READ:
+						continue;
+					default:
+						goto error;
+				}
+				break;
+		}
+	}
+error:
+	logp_ssl_err("SSL_accept error\n");
+	return -1;
+}
 
 int ssl_load_dh_params(SSL_CTX *ctx, struct conf **confs)
 {
@@ -25,7 +57,9 @@ int ssl_load_dh_params(SSL_CTX *ctx, struct conf **confs)
 	return 0;
 }
 
-static int password_cb(char *buf, int num, int rwflag, void *userdata)
+static int password_cb(char *buf, int num,
+	__attribute__ ((unused)) int rwflag,
+	__attribute__ ((unused)) void *userdata)
 {
 	if(num<(int)strlen(pass)+1) return 0;
 	strcpy(buf, pass);
@@ -39,15 +73,27 @@ void ssl_load_globals(void)
 	SSL_load_error_strings();
 }
 
+static int check_path(const char *path, const char *what)
+{
+	struct stat statp;
+	if(!path) return -1;
+	if(stat(path, &statp))
+	{
+		logp("Could not find %s %s: %s\n",
+			what, path, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 static int ssl_load_keys_and_certs(SSL_CTX *ctx, struct conf **confs)
 {
 	char *ssl_key=NULL;
-	struct stat statp;
 	const char *ssl_cert=get_string(confs[OPT_SSL_CERT]);
 	const char *ssl_cert_ca=get_string(confs[OPT_SSL_CERT_CA]);
 
 	// Load our keys and certificates if the path exists.
-	if(ssl_cert && !lstat(ssl_cert, &statp)
+	if(!check_path(ssl_cert, "ssl_cert")
 	  && !SSL_CTX_use_certificate_chain_file(ctx, ssl_cert))
 	{
 		logp_ssl_err("Can't read ssl_cert: %s\n", ssl_cert);
@@ -61,15 +107,15 @@ static int ssl_load_keys_and_certs(SSL_CTX *ctx, struct conf **confs)
 	if(!ssl_key) ssl_key=get_string(confs[OPT_SSL_CERT]);
 
 	// Load the key file, if the path exists.
-	if(ssl_key && !lstat(ssl_key, &statp)
-	  && !SSL_CTX_use_PrivateKey_file(ctx,ssl_key,SSL_FILETYPE_PEM))
+	if(!check_path(ssl_key, "ssl_key")
+	  && !SSL_CTX_use_PrivateKey_file(ctx, ssl_key, SSL_FILETYPE_PEM))
 	{
 		logp_ssl_err("Can't read ssl_key file: %s\n", ssl_key);
 		return -1;
 	}
 
 	// Load the CAs we trust, if the path exists.
-	if(ssl_cert_ca && !lstat(ssl_cert_ca, &statp)
+	if(!check_path(ssl_cert_ca, "ssl_cert_ca")
 	  && !SSL_CTX_load_verify_locations(ctx, ssl_cert_ca, 0))
 	{
 		logp_ssl_err("Can't read ssl_cert_ca file: %s\n", ssl_cert_ca);
@@ -164,8 +210,8 @@ static int setenv_x509(X509_NAME *x509, const char *type)
 		sanitise(name_expand);
 		sanitise((char*)buf);
 		setenv(name_expand, (char*)buf, 1);
-		free (name_expand);
-		OPENSSL_free (buf);
+		free_w(&name_expand);
+		OPENSSL_free(buf);
 	}
 	return 0;
 }
@@ -209,11 +255,12 @@ static int setenv_x509_serialnumber(ASN1_INTEGER *i, const char *env)
 }
 #endif
 
-int ssl_check_cert(SSL *ssl, struct conf **confs)
+int ssl_check_cert(SSL *ssl, struct conf **confs, struct conf **cconfs)
 {
 	X509 *peer;
+	int result;
 	char tmpbuf[256]="";
-	const char *ssl_peer_cn=get_string(confs[OPT_SSL_PEER_CN]);
+	const char *ssl_peer_cn=get_string(cconfs[OPT_SSL_PEER_CN]);
 
 	if(!ssl_peer_cn)
 	{
@@ -229,9 +276,10 @@ int ssl_check_cert(SSL *ssl, struct conf **confs)
 		logp("Could not get peer certificate.\n");
 		return -1;
 	}
-	if(SSL_get_verify_result(ssl)!=X509_V_OK)
+	result=SSL_get_verify_result(ssl);
+	if(result!=X509_V_OK)
 	{
-		logp_ssl_err("Certificate doesn't verify.\n");
+		logp_ssl_err("Certificate doesn't verify (%d).\n", result);
 		return -1;
 	}
 
@@ -243,7 +291,14 @@ int ssl_check_cert(SSL *ssl, struct conf **confs)
 		logp("'%s'!='%s'\n", tmpbuf, ssl_peer_cn);
 		return -1;
 	}
+
 #ifndef HAVE_WIN32
+	// Check the peer certificate against the CRL list only if set
+        // in the configuration file. Thus if not set it is not
+        // breaking the 'ssl_extra_checks_script' configuration.
+	if(confs && ca_x509_verify_crl(confs, peer, ssl_peer_cn))
+		return -1;
+
 	if(setenv_x509(X509_get_subject_name(peer), "PEER")
 	  || setenv_x509(X509_get_issuer_name(peer), "ISSUER"))
 		return -1;

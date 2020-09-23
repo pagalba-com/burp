@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "../burp.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,7 +26,7 @@
 
 #include "yajl_parser.h"
 
-#if defined(_WIN32) || defined(WIN32)
+#if ( (defined(_WIN32) || defined(WIN32) || defined(HAVE_WIN32) ) && ( defined(_MSC_VER) ) )
 #define snprintf sprintf_s
 #endif
 

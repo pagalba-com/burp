@@ -40,30 +40,13 @@
 #ifndef _FIND_H
 #define _FIND_H
 
-#ifdef HAVE_DIRENT_H
-#include <dirent.h>
-#endif
-
 #include <sys/file.h>
 #include <sys/param.h>
-#if HAVE_UTIME_H
-#include <utime.h>
-#else
-struct utimbuf
-{
-	long actime;
-	long modtime;
-};
-#endif
 
 #define MODE_RALL (S_IRUSR|S_IRGRP|S_IROTH)
 
 #ifdef HAVE_REGEX_H
 #include <regex.h>
-#endif
-
-#ifndef HAVE_READDIR_R
-int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result);
 #endif
 
 #define FT_LNK_H	1  // hard link to file already saved.
@@ -94,12 +77,20 @@ struct FF_PKT
 	int type;		/* FT_ type from above */
 };
 
-extern FF_PKT *find_files_init(void);
-extern void find_files_free(FF_PKT *ff);
+struct asfd;
+
+extern struct FF_PKT *find_files_init(
+	int callback(struct asfd *asfd, struct FF_PKT *ff, struct conf **confs));
+extern void find_files_free(struct FF_PKT **ff);
 extern int find_files_begin(struct asfd *asfd,
-	FF_PKT *ff_pkt, struct conf **confs, char *fname);
+	struct FF_PKT *ff_pkt, struct conf **confs, char *fname);
 // Returns the level of compression.
 extern int in_exclude_comp(struct strlist *excom, const char *fname,
 	int compression);
+
+#ifdef UTEST
+extern int file_is_included_no_incext(struct conf **confs, const char *fname);
+#endif
+
 
 #endif

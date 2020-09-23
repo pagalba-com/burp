@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
 
+DIR=$(dirname "$0")
+cd "$DIR" || exit 1
+
 myscript=$(basename $0)
-if [ ! -f "$myscript" ] ; then
-	echo "Please run $myscript whilst standing in the same directory" 1>&2
-	exit 1
-fi
 
 server="$1"
 client="$2"
 user="$3"
-pass="$4"
 
 if [ -z "$server" ] \
   || [ -z "$client" ] \
-  || [ -z "$user" ] \
-  || [ -z "$pass" ] ; then
-	echo "Usage: $myscript [server address] [client address] [client user] [client pass]"
+  || [ -z "$user" ] ; then
+	echo "Usage: $myscript [server address] [client address] [client user]"
 	exit 1
 fi
 
 path="$PWD"
 build="$path/build"
 target="$path/target"
+ssh_opts="-o StrictHostKeyChecking=no"
 
 fail()
 {
@@ -52,18 +50,20 @@ build_and_install()
 		[ "$f" = ".git" ] && continue
 		cp -ar ../"$f" "$build" || fail "could not copy ../$f to $build"
 	done || exit 1
+	# Add some extra directories/files.
+	cp -ar fs-data "$build"
 
 	# Create a target directory, compile burp and install it into the
 	# target.
 	makedir "$target"
 	cdir "$build"
 	make clean
-	./configure || fail "configure failed"
+	./configure --prefix=/usr --sysconfdir=/etc/burp --localstatedir=/var || fail "configure failed"
 	make || fail "make failed"
 	# For some reason, make is not returning an error code.
 	# Look for important binaries before carrying on.
-	[ -f src/burp ] || fail "make failed"
-	make install DESTDIR="$target" || fail "make install failed"
+	[ -x burp ] || fail "make failed to build binaries"
+	make install-all DESTDIR="$target" || fail "make install failed"
 	cdir -
 
 	# Now build the Windows installer.
@@ -73,7 +73,7 @@ build_and_install()
 	# Now copy the Windows installer to the client
 	installer=$(find -name burp-win64-installer*.exe)
 	[ -z "$client" ] && fail
-	"$path/scp_expect" "$pass" "$installer" "$user@$client:" || fail
+	scp $ssh_opts "$installer" "$user@$client:" || fail
 
 	cdir -
 }
@@ -82,12 +82,12 @@ build_and_install
 
 # Copy the build directory to the client, to give it something to backup.
 cdir "$path" || fail
-# The Windows build symlinks cock things for 'diff -ur' on the restore later,
-# so delete them first.
+# The Windows build symlinks cock things up for 'diff -ur' on the restore
+# later, so delete them first.
 rm -f build/burp-depkgs
 rm -f build/burp-cross-tools
 tar -cjf build.tar.bz2 build || fail
-"$path/scp_expect" "$pass" build.tar.bz2 "$user@$client:" || fail
+scp $ssh_opts build.tar.bz2 "$user@$client:" || fail
 
 
 installer=$(basename $installer)
@@ -96,15 +96,44 @@ clientburpdir="/cygdrive/c/Program Files/Burp"
 rm -f windowsscript
 cat >> windowsscript << EOF
 #!/usr/bin/env bash
-rm -rf "/cygdrive/c/Program Files/Burp" || exit 1
-./$installer /S || exit 1
-tar -xjf build.tar.bz2 -C "$clientburpdir" || exit 1
+set -ex
+
+clientburpdir="$clientburpdir"
+
+function check_conf()
+{
+	local conf="\$clientburpdir/burp.conf"
+	grep "\$1" "\$conf"
+}
+
+echo "Test command line switches"
+rm -rf "\$clientburpdir"
+./$installer /S /cname=customcname /server=1.2.3.4 /password=custompass
+check_conf '^cname = customcname$'
+check_conf '^server = 1.2.3.4:4971$'
+check_conf '^password = custompass$'
+
+echo "Test command line without switches"
+rm -rf "\$clientburpdir"
+./$installer /S
+check_conf "^cname = \$(hostname)$"
+check_conf '^server = 10.0.0.1:4971$'
+check_conf '^password = abcdefgh$'
+
+# Remove the cron job, or unexpected results can occur.
+schtasks /DELETE /TN "burp cron" /F
+tar -xjf build.tar.bz2 -C "$clientburpdir"
+# Encrypt some directories and files to test EFS.
+cipher.exe /E /S:"C:/Program Files/Burp/build/utest/builders"
+# Run utest.exe.
+cd "/cygdrive/c/Program Files/Burp/bin"
+./utest.exe
 EOF
 
-"$path/scp_expect" "$pass" windowsscript "$user@$client:" || fail
-"$path/ssh_expect" "$pass" "$user@$client" chmod 755 windowsscript || fail
-"$path/ssh_expect" "$pass" "$user@$client" chmod 755 "$installer" || fail
-"$path/ssh_expect" "$pass" "$user@$client" ./windowsscript || fail
+scp $ssh_opts windowsscript "$user@$client:" || fail
+ssh $ssh_opts "$user@$client" chmod 755 windowsscript || fail
+ssh $ssh_opts "$user@$client" chmod 755 "$installer" || fail
+ssh $ssh_opts "$user@$client" ./windowsscript || fail
 
 # args:
 # 1 - directory where build was installed
@@ -117,47 +146,47 @@ EOF
 # 8 - ssh command (leave unset for self test)
 # 9 - scp command (leave unset for self test)
 # 10 - address of the client (leave unset for self test)
-echo "Running with split_vss=0 and strip_vss=0"
-./test_main \
-	"$target" \
-	"$clientburpdir/bin/burp.exe" \
-	"$clientburpdir/burp.conf" \
-	"C:\Program Files\Burp\burp.conf" \
-	"C:/Program Files/Burp/build" \
-	"C:/Program Files/Burp/restore" \
-	"$server" \
-	"$path/ssh_expect $pass" \
-	"$path/scp_expect $pass" \
-	"$user@$client" || exit 1
 
-# Go again with SPLIT_VSS=1
-echo "Running with split_vss=1 and strip_vss=0"
-rm -rf "$target/var/spool/burp/testclient"
-NO_CA_GEN=1 SPLIT_VSS=1 ./test_main \
-	"$target" \
-	"$clientburpdir/bin/burp.exe" \
-	"$clientburpdir/burp.conf" \
-	"C:\Program Files\Burp\burp.conf" \
-	"C:/Program Files/Burp/build" \
-	"C:/Program Files/Burp/restore" \
-	"$server" \
-	"$path/ssh_expect $pass" \
-	"$path/scp_expect $pass" \
-	"$user@$client" || exit 1
+do_run()
+{
+	rm -rf "$target/var/spool/burp/global"
+	rm -rf "$target/var/spool/burp/testclient"
+	./test_main \
+		"$target" \
+		"$clientburpdir/bin/burp.exe" \
+		"$clientburpdir/burp.conf" \
+		"C:\Program Files\Burp\burp.conf" \
+		"C:/Program Files/Burp/build" \
+		"C:/Program Files/Burp/restore" \
+		"$server" \
+		"ssh $ssh_opts" \
+		"scp $ssh_opts" \
+		"$user@$client" || exit 1
+}
 
-# Go again with STRIP_VSS=1
-echo "Running with split_vss=0 and strip_vss=1"
-rm -rf "$target/var/spool/burp/testclient"
-NO_CA_GEN=1 STRIP_VSS=1 ./test_main \
-	"$target" \
-	"$clientburpdir/bin/burp.exe" \
-	"$clientburpdir/burp.conf" \
-	"C:\Program Files\Burp\burp.conf" \
-	"C:/Program Files/Burp/build" \
-	"C:/Program Files/Burp/restore" \
-	"$server" \
-	"$path/ssh_expect $pass" \
-	"$path/scp_expect $pass" \
-	"$user@$client" || exit 1
+echo "Running with protocol=1, split_vss=0, strip_vss=0"
+PROTOCOL=1 do_run
+
+echo "Running with protocol=1, split_vss=1, strip_vss=0"
+PROTOCOL=1 NO_CA_GEN=1 SPLIT_VSS=1 do_run
+
+echo "Running with protocol=1, split_vss=0, strip_vss=1"
+PROTOCOL=1 NO_CA_GEN=1 STRIP_VSS=1 do_run
+
+# Protocol 2 does not yet support EFS, so redo the test files without EFS.
+# Can delete this once protocol 2 does support EFS.
+rm -f windowsscript
+cat >> windowsscript << EOF
+#!/usr/bin/env bash
+rm -rf "$clientburpdir/build" || exit 1
+tar -xjf build.tar.bz2 -C "$clientburpdir" || exit 1
+EOF
+
+scp $ssh_opts windowsscript "$user@$client:" || fail
+ssh $ssh_opts "$user@$client" chmod 755 windowsscript || fail
+ssh $ssh_opts "$user@$client" ./windowsscript || fail
+
+echo "Running with protocol=2, split_vss=0, strip_vss=0"
+PROTOCOL=2 NO_CA_GEN=1 do_run
 
 exit 0

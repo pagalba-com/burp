@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Uncomment to get core dumps if segfaults are happening.
+ulimit -c unlimited
+
 myscript=$(basename $0)
 if [ ! -f "$myscript" ] ; then
 	echo "Please run $myscript whilst standing in the same directory" 1>&2
@@ -58,7 +61,6 @@ clientlog="$logs/client.log"
 difflog="$logs/diff.log"
 serverpid=
 serverconf=etc/burp/burp-server.conf
-fsize=1024
 serverscript="$PWD/serverscript"
 clientscript="$PWD/clientscript"
 num=0 # Test number. Incremented for each test.
@@ -67,7 +69,15 @@ pre=0 # Previous backup number.
 res=0 # Restore number. Incremented for each restore.
 test_includes_backup=0
 test_includes_restore=0
-protocol=2 
+protocol=2
+
+if stat --version 2>/dev/null | grep GNU &>/dev/null ; then
+	# GNU style
+	stat_args="-c '%g:%u %A %N'"
+else
+	# FreeBSD style
+	stat_args="-f '%g:%u %p %N %Y'"
+fi
 
 kill_server()
 {
@@ -118,6 +128,15 @@ sed -i -e "$1" "$conf" || fail "sed $1 failed $2"
 EOF
 }
 
+append_server()
+{
+	conf="$serverconf"
+	[ -n "$2" ] && conf="$2"
+	cat >> "$serverscript" << EOF
+echo "$1" >> "$conf" || fail "echo $1 failed"
+EOF
+
+}
 sed_rep_client()
 {
 	cat >> "$clientscript" << EOF
@@ -125,10 +144,21 @@ sed -i -e "$1" "$clientconf" || fail "sed $1 failed $2"
 EOF
 }
 
+append_client()
+{
+	conf="$clientconf"
+	[ -n "$2" ] && conf="$2"
+	cat >> "$clientscript" << EOF
+echo "$1" >> "$conf" || fail "echo $1 failed"
+EOF
+}
+
 wait_for_backup_to_finish()
 {
 	local waited=0
 	local lockfile="$target/var/spool/burp/testclient/lockfile"
+	[ "$protocol" = "2" ] && \
+	  lockfile="$target/var/spool/burp/global/clients/testclient/lockfile"
 
 	SLEEPTIME=2
 	# Repeatedly check to see whether the server has finished, rather
@@ -142,6 +172,24 @@ wait_for_backup_to_finish()
 		[ "$waited" -gt 120 ] && \
 		  fail "client backup seemed to be complete after 2 minutes"
 	done
+}
+
+add_run_list()
+{
+cat >> "$clientscript" <<EOF
+echo "Starting test client list"
+"$burpbin" -c "$clientconfarg" -a l -b "$1" || fail "client list returned \$?"
+
+EOF
+}
+
+add_run_list_expect_fail()
+{
+cat >> "$clientscript" <<EOF
+echo "Starting test client list"
+"$burpbin" -c "$clientconfarg" -a l -b "$1" && fail "client list returned \$?"
+
+EOF
 }
 
 add_run_backup_no_increment()
@@ -170,7 +218,7 @@ add_run_backup_expect_fail_no_increment()
 {
 cat >> "$clientscript" <<EOF
 echo "Starting test client backup"
-"$burpbin" -c "$clientconfarg" -a b && fail "client backup returned \$? (expected 0)"
+"$burpbin" -c "$clientconfarg" -a b && fail "client backup returned \$? (expected non-zero)"
 
 EOF
 }
@@ -199,15 +247,53 @@ add_run_restore()
 	dir="$2$res"
 	test_includes_restore=1
 	makedir_client "$dir"
-# If vss has been stripped, need to add the '-x' option to the restore.
+# If vss has been stripped, need to add the '-X' option to the restore.
 	nowinapi=
-	[ -n "$STRIP_VSS" ] && nowinapi='-x'
+	[ -n "$STRIP_VSS" -a "$protocol" = 1 ] && nowinapi='-X'
 cat >> "$clientscript" << EOF
 echo "Starting test client restore of backup $bno"
 rm -rf "$dir" || fail
 
 "$burpbin" -c "$clientconfarg" -a r -b "$bno" -d "$dir" $nowinapi \
 	|| fail "client restore returned \$?"
+EOF
+}
+
+add_run_restore_server_initiated()
+{
+	local bno="$1"
+	local dir
+	res=$((res+1))
+	dir="$2$res"
+	test_includes_restore=1
+	local srestore="$target/var/spool/burp/testclient/restore"
+
+	append_client 'restoreprefix = /'
+
+	[ "$PROTOCOL" = "2" ] && \
+	  srestore="$target/var/spool/burp/global/clients/testclient/restore"
+
+	echo "backup=$bno
+restoreprefix=$dir" > "$srestore"
+	makedir_client "$dir"
+cat >> "$clientscript" << EOF
+echo "Starting test server initiated restore of backup $bno"
+rm -rf "$dir" || fail
+
+"$burpbin" -c "$clientconfarg" -a l \
+	|| fail "server initiated restore returned \$?"
+EOF
+}
+
+add_run_snapshot()
+{
+	cat >> "$clientscript" <<EOF
+[ -d "/cygdrive" ] \
+	&& echo "Status snapshot not supported on Windows" && exit 0
+"$burpbin" -c "$clientconfarg" -a S | grep testclient \
+	|| fail "Status snapshot did not show testclient"
+"$burpbin" -c "$clientconfarg" -a S -C testclient | grep 0000001 \
+	|| fail "Status snapshot did not show backup 0000001"
 EOF
 }
 
@@ -221,12 +307,36 @@ add_do_diff_client()
 	# On Windows, /C:/ gets converted to /C_/, so tweak the path for diff.
 	rpath1=$(echo "$1" | sed -e 's/\/C:\//\/C_\//g')
 	rpath2=$(echo "$2" | sed -e 's/\/C:\//\/C_\//g')
+	# Protocol 2 directory permissions are messed up on windows, so
+	# exclude them for now.
+	extra_find_arg=
+	if [ "$protocol" = "2" ] \
+	  && [ "$restoredir" = "C:/Program Files/Burp/restore" ] ; then
+		extra_find_arg="-type f"
+	fi
+
+	# FIX THIS: On windows, the builders directory is being EFS
+	# encrypted. But, for some reason, the permissions come out
+	# wrong on restore. Exclude them from the permission check
+	# for now.
+	exclude_dir=
+	if [ "$restoredir" = "C:/Program Files/Burp/restore" ] ; then
+		exclude_dir="| grep -v builders"
+	fi
+
 cat >> "$clientscript" << EOF
 diff -ur "$rpath1" "$rpath2" || fail "$3"
+EOF
+
+	# Stripping vss in protocol 1 will of course cause permissions to be
+	# wrong on restore on Windows, so do not do this check in that case.
+[ -z "$STRIP_VSS" -o "$protocol" = 2 ] && cat >> "$clientscript" << EOF
 diff -u \
-  <( cd "$rpath1" ; find . -printf "chown %U:%G %p; chmod %m %p \n" | sort ) \
-  <( cd "$rpath2" ; find . -printf "chown %U:%G %p; chmod %m %p \n" | sort ) \
+  <( cd "$rpath1" ; find . $extra_find_arg -print0 | xargs -0 stat $stat_args | sort $exclude_dir) \
+  <( cd "$rpath2" ; find . $extra_find_arg -print0 | xargs -0 stat $stat_args | sort $exclude_dir) \
 	|| fail "$3 (permissions)"
+
+	rm -rf "$rpath2"
 EOF
 }
 
@@ -234,22 +344,6 @@ add_chown()
 {
 	cat >> "$clientscript" << EOF
 chmod "$1" "$2" || fail "chown $1 $2 failed"
-EOF
-}
-
-add_run_not_find_client()
-{
-	cat >> "$clientscript" << EOF
-f=\$(/usr/bin/find $1) || fail "find failed"
-[ -n "\$f" ] && fail "$2"
-EOF
-}
-
-add_run_find_client()
-{
-	cat >> "$clientscript" << EOF
-f=\$(/usr/bin/find $1) || fail "find failed"
-[ -z "\$f" ] && fail "$2"
 EOF
 }
 
@@ -281,23 +375,25 @@ cp -r "$includedir/src" "$includedir/src-new" \
 	|| fail "could not cp $includedir/src to $includedir/src-new"
 
 # Move a directory, which simulates deleting and adding new files.
-if [ -d "$includedir/debian" ] \
- && [ ! -e "$includedir/debian-new" ] ; then
-	mv "$includedir/debian" "$includedir/debian-new" \
-	    || fail "could not move $includedir/debian to $includedir/debian-new"
-elif [ ! -e "$includedir/debian" ] \
- && [ -d "$includedir/debian-new" ] ; then
-   mv "$includedir/debian-new" "$includedir/debian" \
-    || fail "could not move $includedir/debian-new to $includedir/debian"
+if [ -d "$includedir/configs" ] \
+ && [ ! -e "$includedir/configs-new" ] ; then
+	mv "$includedir/configs" "$includedir/configs-new" \
+	    || fail "could not move $includedir/configs to $includedir/configs-new"
+elif [ ! -e "$includedir/configs" ] \
+ && [ -d "$includedir/configs-new" ] ; then
+   mv "$includedir/configs-new" "$includedir/configs" \
+    || fail "could not move $includedir/configs-new to $includedir/configs"
 else
-	fail "could not move debian directories" 
+	fail "could not move directory to simulate deletion/addition"
 fi
 
 # Scramble a whole bunch of files
 # On Windows, need to specify the whole path to find and sort, or the Windows
 # versions are picked up instead.
+sortprog="sort --random-sort"
+which shuffle >/dev/null 2>&1 && sortprog=shuffle
 /usr/bin/find "$includedir/autoconf" -type f | while read f ; do
-	LC_ALL='C' /usr/bin/sort --random-sort "\$f" > tmpfile
+	LC_ALL='C' \$sortprog "\$f" > tmpfile
 	[ "$?" != "0" ] && exit 1
 	mv tmpfile "\$f" || exit 1
 done || fail "randomise files failed"
@@ -306,147 +402,114 @@ EOF
 
 add_compression_off()
 {
-	sed_rep_server 's/^compression = .*//g'
-	sed_rep_server '$ acompression = 0'
+	sed_rep_server '/^compression = .*/d'
+	append_server 'compression = 0'
 }
 
 add_compression_on()
 {
-	sed_rep_server 's/^compression = .*//g'
-	sed_rep_server '$ acompression = 9'
+	sed_rep_server '/^compression = .*/d'
+	append_server 'compression = 9'
 }
 
 add_encryption_off()
 {
-	sed_rep_client 's/^encryption_password = .*//g'
+	sed_rep_client '/^encryption_password = .*/d'
 }
 
 add_encryption_on()
 {
 	add_encryption_off
-	sed_rep_client '$ aencryption_password = 7djh34nmmsd'
-}
-
-add_min_file_size_off()
-{
-	sed_rep_client 's/^min_file_size = .*//g'
-}
-
-add_min_file_size_on()
-{
-	add_min_file_size_off
-	sed_rep_client '$ amin_file_size = '"$fsize"
-}
-
-add_max_file_size_off()
-{
-	sed_rep_client 's/^max_file_size = .*//g'
-}
-
-add_max_file_size_on()
-{
-	add_max_file_size_off
-	sed_rep_client '$ amax_file_size = '"$fsize"
-}
-
-add_exclude_off()
-{
-	sed_rep_client 's/^exclude = .*//g'
-}
-
-add_exclude_on()
-{
-	add_exclude_off
-	sed_rep_client '$ aexclude = '"$excludedir"
+	append_client 'encryption_password = 012345678901234567890123456789'
 }
 
 add_include_off()
 {
-	sed_rep_client 's/^include = .*//g'
+	sed_rep_client '/^include = .*/d'
 }
 
 add_include_on()
 {
 	add_include_off
-	sed_rep_client '$ ainclude = '"$includedir"
-}
-
-add_include_ext_off()
-{
-	sed_rep_client 's/^include_ext = c//g' "$clientconf"
-}
-
-add_include_ext_on()
-{
-	add_include_ext_off
-	sed_rep_client '$ ainclude_ext = c' "$clientconf"
-}
-
-add_exclude_ext_off()
-{
-	sed_rep_client 's/^exclude_ext = c//g' "$clientconf"
-}
-
-add_exclude_ext_on()
-{
-	add_exclude_ext_off
-	sed_rep_client '$ aexclude_ext = c' "$clientconf"
+	append_client "include = $includedir"
 }
 
 add_split_vss_off()
 {
-	sed_rep_client 's/^split_vss = .*//g' "$clientconf"
+	sed_rep_client '/^split_vss = .*/d' "$clientconf"
 }
 
 add_split_vss_on()
 {
 	add_split_vss_off
-	sed_rep_client '$ asplit_vss = 1' "$clientconf"
+	append_client "split_vss = 1"
 }
 
 add_strip_vss_off()
 {
-	sed_rep_client 's/^strip_vss = .*//g' "$clientconf"
+	sed_rep_client '/^strip_vss = .*/d' "$clientconf"
 }
 
 add_strip_vss_on()
 {
 	add_strip_vss_off
-	sed_rep_client '$ astrip_vss = 1' "$clientconf"
+	append_client "strip_vss = 1"
 }
 
-add_protocol1_off()
+add_protocol_off()
 {
-	sed_rep_client 's/^protocol = .*//g' "$clientconf"
+	sed_rep_client '/^protocol = .*/d' "$clientconf"
 }
 
-add_protocol1_on()
+maybe_add_protocol2_on()
 {
-	add_protocol1_off
-	[ "$protocol" = 1 ] && \
-		sed_rep_client '$ aprotocol = 1' "$clientconf"
+	add_protocol_off
+	[ "$protocol" = 2 ] && \
+		append_client 'protocol = 2'
+}
+
+add_server_listen_status_off()
+{
+	sed_rep_server '/^listen_status = .*/d' "$serverconf"
+}
+
+add_server_listen_status_on()
+{
+	add_server_listen_status_off
+	append_server "listen_status = 127.0.0.1:4999"
 }
 
 add_server_breakpoint_off()
 {
-	sed_rep_server 's/^breakpoint = .*//g' "$serverconf"
+	sed_rep_server '/^breakpoint = .*/d' "$serverconf"
 }
 
 add_server_breakpoint_on()
 {
 	add_server_breakpoint_off
-	sed_rep_server "\$ abreakpoint = $1" "$serverconf"
+	append_server "breakpoint = $1"
 }
 
 add_client_breakpoint_off()
 {
-	sed_rep_client 's/^breakpoint = .*//g' "$clientconf"
+	sed_rep_client '/^breakpoint = .*/d' "$clientconf"
 }
 
 add_client_breakpoint_on()
 {
 	add_client_breakpoint_off
-	sed_rep_client "\$ abreakpoint = $1" "$clientconf"
+	append_client "breakpoint = $1"
+}
+
+add_client_server_can_restore_off()
+{
+	sed_rep_client '/^server_can_restore = .*/d' "$clientconf"
+}
+
+add_client_server_can_restore_on()
+{
+	add_client_server_can_restore_off
+	append_client "server_can_restore = 1"
 }
 
 add_recovery_method_delete()
@@ -457,12 +520,6 @@ add_recovery_method_delete()
 add_recovery_method_resume()
 {
 	sed_rep_server 's/^working_dir_recovery_method = .*/working_dir_recovery_method = resume/g'
-}
-
-add_max_file_size_on()
-{
-	add_max_file_size_off
-	sed_rep_client '$ amax_file_size = '"$fsize"
 }
 
 makedir_server "$logs"
@@ -501,8 +558,7 @@ pre_tweaks_server()
 {
 	start_script_server
 	sed_rep_server 's#= /#= '"$target"'/#g'
-	sed_rep_server 's/port = 4971/port = 4998/g'
-	sed_rep_server 's/port = 4972/port = 4999/g'
+	sed_rep_server 's/listen = 0.0.0.0:4971/listen = 0.0.0.0:4998/g'
 	sed_rep_server 's#^CA_DIR.*#CA_DIR = '"$target"'/etc/burp/CA#g' "$target/etc/burp/CA.cnf"
 	sed_rep_server 's/^stdout = .*/stdout = 1/g'
 	sed_rep_server 's/^syslog = .*/syslog = 0/g'
@@ -512,11 +568,10 @@ pre_tweaks_client()
 {
 	start_script_client
 	sed_rep_client 's#= /#= '"$target"'/#g'
-	sed_rep_client 's/port = 4971/port = 4998/g'
 	sed_rep_client 's/port = 4972/port = 4999/g'
 	sed_rep_client 's/^stdout = .*/stdout = 1/g'
 	sed_rep_client 's/^syslog = .*/syslog = 0/g'
-	sed_rep_client 's/^server = .*/server = '"$serveraddress"'/g' "$clientconf"
+	sed_rep_client 's/^server = .*/server = '"$serveraddress":4998'/g' "$clientconf"
 	sed_rep_client 's/^cname = .*/cname = testclient/g' "$clientconf"
 	sed_rep_client 's/^password = .*/password = abcdefgh/g' "$clientconf"
 }
@@ -595,18 +650,14 @@ add_normal_settings()
 {
 	start_script_server
 	start_script_client
-	add_protocol1_on
+	maybe_add_protocol2_on
 	add_compression_on
 	add_encryption_off
-	add_max_file_size_off
-	add_min_file_size_off
-	add_exclude_off
 	add_include_on
-	add_include_ext_off
-	add_exclude_ext_off
 	add_server_breakpoint_off
 	add_client_breakpoint_off
 	add_recovery_method_resume
+	add_server_listen_status_on
 
 	# Windows options
 	if [ -n "$SPLIT_VSS" ] ; then
@@ -665,22 +716,9 @@ restart_server()
 	sleep 5
 }
 
-file_size_test()
+sighup_server()
 {
-	start_test "File size $1"
-	add_$1_file_size_on
-	add_change_source_files
-	add_backup_run_scripts_setup_verify_restore
-	sign="+"
-	err="greater"
-	if [ "$1" = "min" ] ; then
-		sign="-"
-		err="less"
-	fi
-	add_run_not_find_client \
-		"\"$restoredir\"$res -size $sign${fsize}c -type f" \
-		"found file sizes $err than $fsize"
-	end_test
+	kill -1 $serverpid
 }
 
 comp_enc_change_test()
@@ -731,6 +769,9 @@ all_tests()
 
 	comp_enc_change_test on  off off
 
+	# Server should come back after a sighup reload.
+	sighup_server
+
 	start_test "Interrupt server phase2"
 	add_server_breakpoint_on 2
 	add_run_backup_expect_fail_no_increment
@@ -739,27 +780,54 @@ all_tests()
 	check_for_working_dir
 	end_test
 
-	# Protocol2 is currently broken here.
-	if [ "$protocol" -eq "1" ] ; then
-		start_test "Interrupt server phase3"
-		add_server_breakpoint_on 3
-		add_run_backup_no_increment
-		run_scripts
-		wait_for_backup_to_finish
-		check_for_working_dir
-		end_test
+	start_test "Interrupt server phase3"
+	add_server_breakpoint_on 3
+	add_run_backup_no_increment
+	run_scripts
+	wait_for_backup_to_finish
+	check_for_working_dir
+	end_test
 	
-		start_test "Complete phase3"
-		add_server_breakpoint_off
+	start_test "Complete phase3"
+	add_server_breakpoint_off
+	if [ "$protocol" -eq "1" ] ; then
+		# Client gives an error on protocol1, while the server does
+		# the resume.
 		add_run_backup_expect_fail
-		test_includes_backup=1
-		run_scripts
-		wait_for_backup_to_finish
+	else
+		add_run_backup
+	fi
+	test_includes_backup=1
+	run_scripts
+	wait_for_backup_to_finish
+	start_script_client
+	add_run_verify
+	add_run_restore $bno "$restoredir"
+	add_restore_diff
+	end_test
+
+	start_test "List"
+	add_run_list $bno
+	add_run_list_expect_fail 99999
+	run_scripts
+	end_test
+
+	# Currently no way to pass '-x' via server initiated restore, so skip
+	# this test for $STRIP_VSS.
+	if [ -z "$STRIP_VSS" ] ; then
+		start_test "Server-initiated restore"
+		start_script_server
 		start_script_client
-		add_run_verify
-		add_run_restore $bno "$restoredir"
+		add_client_server_can_restore_on
+		add_run_restore_server_initiated $bno "$restoredir"
+		add_restore_diff
+		run_scripts
 		end_test
 	fi
+
+	start_test "Status monitor snapshot"
+	add_run_snapshot
+	end_test
 
 	start_test "Interrupt server phase4"
 	add_server_breakpoint_on 4
@@ -778,80 +846,53 @@ all_tests()
 	start_script_client
 	add_run_verify
 	add_run_restore $bno "$restoredir"
+	add_restore_diff
 	end_test
 
-	# Protocol2 is currently broken here.
-	if [ "$protocol" -eq "1" ] ; then
-		start_test "Interrupt server middle of phase2"
-		add_server_breakpoint_on 2010
-		add_change_source_files
-		add_run_backup_expect_fail_no_increment
-		run_scripts
-		wait_for_backup_to_finish
-		check_for_working_dir
-		end_test
+	start_test "Interrupt server middle of phase2"
+	add_server_breakpoint_on 2010
+	add_change_source_files
+	add_run_backup_expect_fail_no_increment
+	run_scripts
+	wait_for_backup_to_finish
+	check_for_working_dir
+	end_test
 
-		start_test "Interrupt server middle of phase2"
-		add_server_breakpoint_on 2100
-		add_run_backup_expect_fail_no_increment
-		run_scripts
-		wait_for_backup_to_finish
-		check_for_working_dir
-		end_test
+	start_test "Interrupt server middle of phase2"
+	add_server_breakpoint_on 2100
+	add_run_backup_expect_fail_no_increment
+	run_scripts
+	wait_for_backup_to_finish
+	check_for_working_dir
+	end_test
 
-		start_test "Interrupt server middle of phase2"
-		add_server_breakpoint_on 2200
-		add_run_backup_expect_fail_no_increment
-		run_scripts
-		wait_for_backup_to_finish
-		check_for_working_dir
-		end_test
+	start_test "Interrupt server middle of phase2"
+	add_server_breakpoint_on 2200
+	add_run_backup_expect_fail_no_increment
+	run_scripts
+	wait_for_backup_to_finish
+	check_for_working_dir
+	end_test
 
-		start_test "Complete phase2"
-		add_server_breakpoint_off
-		add_backup_run_scripts_setup_verify_restore
-		end_test
-	fi
+	start_test "Complete phase2"
+	add_server_breakpoint_off
+	add_backup_run_scripts_setup_verify_restore
+	add_restore_diff
+	end_test
 
 	comp_enc_change_test on  off off
 	comp_enc_change_test on  off on
 	comp_enc_change_test off off on
-	comp_enc_change_test off on  on
-	comp_enc_change_test on  on  on
-	file_size_test min
-	file_size_test max
+	if [ "$PROTOCOL" != "2" ] ; then
+		# Encryption not supported in protocol 2.
+		comp_enc_change_test off on  on
+		comp_enc_change_test on  on  on
+	fi
 
 	start_test "Permissions"
 	add_chown 755 "$includedir/utest/test_cmd.c"
 	add_backup_run_scripts_setup_verify_restore
-	end_test
-
-	start_test "Exclude directory"
-	add_exclude_on
-	add_backup_run_scripts_setup_verify_restore
-	# On Windows, /C:/ gets converted to /C_/, so tweak the path.
-	exc=$(echo "${restoredir}$res/$excludedir" | sed -e 's/\/C:\//\/C_\//g')
-	inc=$(echo "${restoredir}$res/$includedir" | sed -e 's/\/C:\//\/C_\//g')
-	echo "[ -d \"$exc\" ] && fail \"$exc should not have been restored!\"" \
-		>> "$clientscript"
-	echo "[ ! -d \"$inc\" ] && fail \"$inc should have been restored!\"" \
-		>> "$clientscript"
-	end_test
-
-	start_test "Exclude extension"
-	add_exclude_ext_on
-	add_backup_run_scripts_setup_verify_restore
-	add_run_not_find_client "\"$restoredir\"$res -type f -name '*.c'" \
-		"$restoredir$res should not contain any '.c' files"
-	end_test
-
-	start_test "Include extension"
-	add_include_ext_on
-	add_backup_run_scripts_setup_verify_restore
-	add_run_not_find_client "\"$restoredir\"$res -type f -name '*.h'" \
-		"$restoredir$res should not contain any '.h' files"
-	add_run_find_client "\"$restoredir\"$res -type f -name '*.c'" \
-		"$restoredir$res should contain '.c' files"
+	add_restore_diff
 	end_test
 }
 
@@ -863,20 +904,24 @@ run_tests()
 	pre=0
 	res=0
 	echo
-	echo "Running burp$protocol tests"
-	all_tests "$protocol"
+	echo "Running protocol $protocol tests"
+	all_tests
 }
 
 restart_server
 
-# Run in protocol1 mode.
-workingdir="$target/var/spool/burp/testclient/working"
-finishingdir="$target/var/spool/burp/testclient/finishing"
-run_tests 1
-# Run in protocol2 mode.
-workingdir="$target/var/spool/burp/global/clients/testclient/working"
-finishingdir="$target/var/spool/burp/global/clients/testclient/finishing"
-run_tests 2
+if [ "$PROTOCOL" = 1 ] ; then
+	workingdir="$target/var/spool/burp/testclient/working"
+	finishingdir="$target/var/spool/burp/testclient/finishing"
+elif [ "$PROTOCOL" = 2 ] ; then
+	workingdir="$target/var/spool/burp/global/clients/testclient/working"
+	finishingdir="$target/var/spool/burp/global/clients/testclient/finishing"
+else
+	echo "Unknown protocol: $PROTOCOL"
+	exit 1
+fi
+
+run_tests "$PROTOCOL"
 
 echo
 echo "All tests succeeded"

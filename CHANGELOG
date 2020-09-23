@@ -1,3 +1,859 @@
+2020-08-02 Changes in burp-2.3.34:
+  * 18: Option to look at the timer script regularly.
+  * From Demid R.:
+    - Add max_parallel_backups feature.
+
+2020-07-01 Changes in burp-2.3.32:
+  * 686: Better email message when resuming is not possible.
+    -  Add a configuration item to allow you to notify failure when a
+       working directory is deleted.
+  * Protect against hard-link attacks on restore by unlinking first.
+  * Bug fix for resuming when the previous backup is empty.
+
+2020-06-03 Changes in burp-2.3.30:
+  * 847: bfile should always obey set_attribs_on_close.
+         Fixes running the Windows client from a fat32 partition.
+
+2020-05-01 Changes in burp-2.3.28:
+  * 864: Separate files-only release for windows.
+  * 861: Try to make hostname calls in burp_ca more robust.
+  * 854: Fix "Directory: '(null)'" log message.
+  * 855: Talk about the -d option in docs/restoring.txt.
+
+2020-05-01 Changes in burp-2.3.26:
+  * From Dan Tihelka:
+    - Initial systemd socket activation support proof-of-concept.
+  * 467: Sherlock221B's suggestion for accelerating protocol2 rabin:
+         Skip min block size minus window size.
+  * Socket activation fixes and cleanup.
+  * 860: Fix incorrect cron summary example.
+
+2020-03-01 Changes in burp-2.3.24:
+  * 848: Protocol 2 - warn and skip on verify/restore of unsupported
+    file types.
+  * From Dan Tihelka:
+    Improve systemd services a bit
+    - Use type=simple and foreground mode in the server's service file.
+      The forking is not necessary under systemd and it also nicely catches all
+      the stdout/stderr messages when running in "foreground"
+    - Create client service and timer units.
+      The client is triggered every 30 minutes by the timer unit.
+  * Move systemd files to a generic systemd directory.
+    - Remove unmaintained distro-specific init scripts and specfiles.
+
+2020-02-01 Changes in burp-2.3.22:
+  * 845: Fix possible segfault in server-side listing.
+  * 841: Fix protocol2 bug where cname was overwritten.
+  * Man page and README tweaks.
+
+2020-01-01 Changes in burp-2.3.20:
+  * 597: Protocol 2 - prune the sparse index.
+  * 800: Correct counters after resume.
+  * 837: Fix bug where user= config causes exit.
+  * Tidy up README.
+  * From Orsiris de Jong:
+    - Add Centos 8 building instructions to README.
+  * From Bob Ryan:
+    - Add smb2 magic id.
+
+2019-12-01 Changes in burp-2.3.18:
+  * 30: Add option to take a list of paths for restore.
+  * Add '-a p' option, for outputing parseable file lists.
+  * 832: Try to be more generic about IO_REPARSE tags.
+  * From Vitalio:
+    - Implement support of keeping readall capabilities after UID/GID switch.
+
+2019-10-06 Changes in burp-2.3.16:
+  * 832: Avoid 'could not stat' on OneDrive reparse points.
+  * Upgrade Windows depkgs to:
+     - openssl-1.1.1d.
+     - pcre-8.43.
+
+2019-09-01 Changes in burp-2.3.14:
+  * 823: Fix server-initiated restore without a restoreprefix causing
+         the client side's restoreprefix to be doubled.
+  * From Orsiris de Jong:
+    - Backup tool script 0.5.0 for burp
+
+2019-08-01 Changes in burp-2.3.12:
+  * Fix Windows memory breakage when restoring long paths.
+  * Add long directories to tests.
+  * Simplify windows mempool code.
+  * Ability to choose to attempt to strip VSS on Windows restore or not, as
+    well as disabling the Windows restore api, with '-x' and '-X' and options.
+
+2019-07-01 Changes in burp-2.3.10:
+  * Upgrade Windows depkgs to openssl-1.1.1c.
+  * 739: Log each client command in the server storage directory.
+  * 817: Bug fix - send winattr field in phase1.
+  * 816: Bug fix - vss trailing data readonly problem on restore.
+
+2019-06-01 Changes in burp-2.3.8:
+  * 653: Seed functionality.
+  * 815: .nobackup/.exclude does not stop the directory itself from being
+         in the backup, only the contents.
+
+2019-05-01 Changes in burp-2.3.6:
+  * 812: Fix counters missing received/sent bytes broken in 2.3.4.
+  * 808: Fix for ssl_peer_cn when server:port syntax is used.
+  * From Orsiris de Jong:
+    - 809: Updates to Windows upgrade script:
+      + Better path fallback and optional conf file update
+      + Removed duplicate error handling
+      + Comments and smaller improvements
+      + 813: Disable config file update by default
+  * From Bob Ryan:
+    - 811: Add ceph (cephfs) fs magic alias.
+
+2019-04-01 Changes in burp-2.3.4:
+  * Feature sponsored by Orsiris de Jong:
+    - 782: Server failover feature.
+           You may specify multiple server:port combinations in the client
+           burp.conf. They will each be tried in turn until a connection is
+           made. Orsiris's use case is that he has clients that may or not be
+           on restricted networks where ports are blocked. You may also
+           configure the client to try the next server:port if a backup
+           actually failed.
+  * 800: Create backup_stats before phase4, so that it exists if a backup
+         is interrupted during phase4 and resumed.
+  * 803: Man page notes about file encoding and encryption_password.
+  * 806: Error out on protocol 2 with encryption_password set.
+  * From melak:
+    - Manpage clarification about compression/encryption and protocol version.
+
+2019-03-03 Changes in burp-2.3.2:
+  * 796: Fix not compressing log on phase3/4 resume.
+  * 797: Fix wide-character restores on Windows.
+  * 794: Fix burp not starting with only one listen address.
+  * 735: restore_client client_can_X behaviour.
+    - Obey the original client permissions.
+    - Add super_client option, which behaves as restore_client used to.
+    - Also add client_can_monitor permission.
+  * Correct 'listen' section in the manpage.
+    - There is no longer a default or compile-time options.
+  * Run utests with valgrind in automatic testing suite.
+  * Fix valgrind errors.
+  * Fix minor memory leaks in timer code.
+  * Fix potential buffer overruns when decoding attribs.
+  * 769: ca_name and ca_server_name cannot be the same, so error
+    early, to avoid certificate problems.
+  * 774: Fix incorrect action names passed to server_post_script.
+  * 775: Fix empty action in server_post_script.
+  * 790: On restore, mention target directory in the client output.
+  * Use librsync's rs_strerror() for better error messages.
+  * Update freebsd test instance to freebsd 12.
+    - Fix compiler warnings.
+  * Remove LT_INIT, it seems to cause more problems than it solves.
+  * Fix 'PACKAGE_URL undeclared' for older versions of autoconf.
+  * From Orsiris de Jong:
+    - Backup tool script minor fixes
+
+2019-02-23 Changes in burp-2.2.18:
+  * 797: Fix wide-character restores on Windows.
+  * 794: Fix burp not starting with only one listen address.
+
+2019-02-02 Changes in burp-2.3.0:
+  * 777: Make include_glob able to detect windows drive letters.
+  * From Olivier Cherrier:
+    - NetBSD/OpenBSD fix for burp_ca.
+  * 780: More logging for VSS.
+  * Remove non-widechar Windows functions.
+  * From Calogero Lo Leggio:
+    - Remove debian packaging files from upstream repository
+  * From Orsiris de Jong:
+    - Backup tool script 0.4.6.
+
+2019-01-01 Changes in burp-2.2.16:
+  * 786: Don't run relative attack detection on CMD_FINGERPRINT.
+  * 785: Fix incorrect xattr buffer size.
+  * 784: Fix compiler warning d->d_name always evaluates to true.
+  * From Michael Hanselmann:
+    - Remove unused sbuf_print_alloc_stats prototype
+
+2018-12-12 Changes in burp-2.2.14:
+  * Fix restoring with compressed/encrypted trailing vss data.
+  * Protect the client against restoring over symlinks that point
+    outside of the desired destination directory. Giving a restore
+    directory is now mandatory. Make '-d /' work on Windows.
+  * 753: More logging for VSS.
+  * Protect against malicious relative paths in sbuf parsing.
+  * 766: Don't run xattr tests if the filesystem doesn't support them.
+  * Check lengths in xattr/extrameta/acl.
+  * Avoid path attacks via cname.
+  * Fix 'configure --enable-xattr=no'.
+  * Buffer safety check in asfd::extract_buf().
+  * Clean up burp_ca and make it more secure.
+  * Fix buffer overrun in client-side long list.
+  * Fix buffer overrun in asfd_do_read_ssl().
+  * 766: Correct gzip os type in utest/server/test_restore.c.
+  * From Michael Hanselmann:
+    - Add option to verify client certificate early.
+    - Use "O_NOFOLLOW" as appropriate.
+    - Sanitise autoupgrade os name.
+    - Random delay on password mismatch.
+    - Sleep before giving auth failure message.
+    - 772: Ensure O_NOATIME is passed to system calls.
+    - 770: In extra_comms: Avoid calling unlink(2) with NULL.
+    - 768: In run_script: Limit number of arguments to avoid stack overflow.
+    - 767: Avoid interactive question on CentOS when overwriting binary.
+
+2018-10-01 Changes in burp-2.2.12:
+  * From ziirish:
+    - 253: 'logic' rules parser with new exclude_logic option.
+  * 753: Send error to server when there is a VSS problem.
+  * 754: Fixes for find_logic code.
+  * 756: Man page correction about number of notify args.
+    Also rename 'warnings' to 'warning_count' in notify_script.
+  * 675: Stdout command line options.
+    '-v' now overrides stdout=0 in the config file, to be 1.
+    '-Q' now overrides stdout=1 in the config file, to be 0, and turns
+         off the progress counter.
+    '-v' used to be the version option - that is now '-V'.
+  * 743: Fix broken status monitor command parsing.
+  * 759: Log backup start/resume/complete/failure in the main log.
+  * 760: Fix and prevent possibility of infinite loops on error in asfd code.
+  * 758, 763: Read errors should interrupt backing up a file.
+
+2018-09-01 Changes in burp-2.2.10:
+  * 737, 738: Multiple listen addresses.
+  * 747: Fix for ACLs not getting restored on directories, and fix metadata
+    client side counters.
+  * 744: Fix for truncated .created file.
+  * 750: fail_on_warning config option.
+  * From ziirish:
+    - 742: Clarify backup_script_pre documentation.
+    - 746: Add '-o' flag to override configuration options on the command line.
+    - 3: Implement 'include_regex' .
+  * From Orsiris de Jong and hakong:
+    - 740: Updates for backup tool script, including calendar.
+  * From pablodav:
+    - Fix Windows upgrade script getting stuck after execution.
+  * Add j:response-markers-on/off monitor commands.
+  * Fix utests for travis mac builds, they have a new gzip version.
+
+2018-08-01 Changes in burp-2.2.8:
+  * Do not try to log remotely with client side post_scripts.
+  * 693: Fix RS_BLAKE2_SIG_MAGIC detection.
+  * 734: Fix typo in retention doc.
+  * 728: On error in protocol2, print the last tried file.
+  * 731: Minor documentation update from Iznohak:
+    - Remove references to yajl.
+    - Clarify usage of backup_tool_script on the burp server.
+    - Remove unimplemented diff options.
+    - Reorder man page examples and group them by action.
+
+2018-06-22 Changes in burp-2.2.6:
+  * 726: Fix 'burp -t' missing fields.
+  * 720: Bug fix for falling back to server name when ssl_peer_cn
+    is not set
+  * 721: Take note of restore_interrupt return correctly.
+  * 721: restore_interrupt should return error.
+  * 723: Make iobuf_to_printable accept newlines.
+
+2018-06-01 Changes in burp-2.2.4:
+  * 718: '[b/Kb/Mb/Gb]' -> '[B/KB/MB/GB]' in man page.
+  * 716: '0000000 never' instead of 'never' in status monitor.
+  * 710: max_resume_attempts option - if exceeded, delete working dir.
+  * 714: DST mktime fix.
+  * 715: Edit backup_tool_script.txt for spelling and formatting, put on
+         the website.
+  * 700: Attempt to fix "stats file: had an exception".
+  * Add more logging around manio_tell when resuming.
+  * Fix/run code coverage.
+
+2018-05-01 Changes in burp-2.2.2:
+  * 645: Update burp-cross-tools Windows libraries to use docker (thanks to
+    josvo for hints):
+    - binutils-2.29.1
+    - gcc-7.3.0
+    - gmp-6.1.2
+    - isl-0.18
+    - mingw-w64-v5.0.3
+    - mpc-1.1.0
+    - mpfr-4.0.1
+  * From Orsiris de Jong:
+    - 703: Add server port to Windows installer.
+    - 693: Update Windows to librsync-2.0.2.
+  * 693: Increase protocol1 strong length from 8 to 16.
+  * 713: Fix for slow down after xattr warnings.
+  * Add file descriptor number to asfd->desc, for better logging.
+
+2018-04-01 Changes in burp-2.2.0:
+  * 643: Protocol 2 restore load only up to the block that is needed.
+  * 680: Strip trailing slashes from cross_filesystem option.
+  * 689: Make list show working/finishing backups.
+  * 707: Fix superfluous newlines on file vanished warnings.
+  * From Orsiris de Jong:
+         - 661: Add backup_tool_script housekeeping script.
+  * All the fixes from burp-2.1.32.
+
+2018-04-01 Changes in burp-2.1.32:
+  * 696: Tests for some Windows installer command line switches, and
+         use of hostname for cname.
+  * 698: Fix for 'could not open current/incexc' warning on first backup.
+  * 699: Remove use of strcasestr so that AIX is happy.
+  * From Orsiris de Jong:
+    - 701: Fix for broken Windows installer command line switches.
+    - Man page tweak for rblk_memory_max.
+  * From jirib:
+    - spec file tweak for uthash.
+
+2018-03-04 Changes in burp-2.1.30:
+  * Revert "reopen syslog for child processes after fork".
+  * Use iobuf_to_printable everywhere that iobufs are printed.
+  * Don't run ncurses utests if you don't HAVE_NCURSES.
+  * Bug fix for some utests accidentally closing stdin.
+  * Protocol 2: Hash table for rblk lookups on restore/verify.
+    Add rblk_memory_max option for configuring its size.
+  * From Orsiris de Jong:
+    - Replaced bits (b) with bytes (B) for quotas in man page.
+  * From John Stoffel:
+    - configure check for pkg-config.
+
+2018-02-01 Changes in burp-2.1.28:
+  * Set Windows creation time on restore.
+  * From gfa-:
+    - Fix for bedup junk files.
+  * Unit test for bedup maximum hardlink code.
+  * librsync_max_size option - only use librsync on files less than the
+    given size.
+  * Reopen syslog for child processes after fork.
+  * Add a docs/restoring.txt file.
+  * Tweak ratelimit man page descriptions.
+
+2018-01-01 Changes in burp-2.1.26:
+  * On non-Windows, strip vss on restore with the '-x' option.
+  * Make 'burp -a m' work on a Windows console.
+  * Monitor detect from storage when server side protocol unset.
+  * Tweak man page 'backup_script_pre' section.
+  * Fix all utests for openbsd 6.2.
+  * Fewer warnings about the last backup on restore/verify.
+  * Different setsockopt parameters for bulk packets with ipv6.
+  * Log the return code of SSL_get_verify_result when it fails, so that
+    we have a chance of knowing why "Certificate doesn't verify".
+  * Make it a fatal error when bedup's do_hardlink() fails. Unlink the
+    temporary path when bedup's do_rename() fails. This should stop
+    bedup generating lots of mess when these things happen.
+  * From Pablo Estigarribia:
+    - Add additional entries to fstypes.
+  * From BobRyanConsulting:
+    - Add cifs entry to fstypes.
+  * Note in docs/timer_script.txt about the internal timer_script.
+  * Add Windows build tools to its own repo, and make the scripts download
+    the sources: https://github.com/grke/burp-cross-tools
+  * Make burp work with the new Windows build tools.
+
+2017-12-01 Changes in burp-2.1.24:
+  * Internalise the timer script.
+  * Protocol2: Log a warning when a block cannot be retrieved during
+    restore, and attempt to continue.
+  * Fix for protocol 2 warnings not appearing on server side.
+  * Fix encryption_password key length issue reintroduced in 2.1.18.
+    Backups made by 2.1.18 to 2.1.22 using encryption_password should be
+    considered broken.
+  * Don't log version warning twice.
+  * From Sergey Moskovkin:
+    - Bug fix for rewriting the pidfile after forking - truncate first.
+  * From Josef:
+    - Include btrfs in fstype list.
+  * From josvo:
+    - Allow 'always' as an option to the timer script.
+  * From DerGatt:
+    - Small man page correction.
+
+2017-11-01 Changes in burp-2.1.22:
+  * On certificate exchange, do not rewrite the client config file if there
+    are no changes.
+  * Limit 'set file owner' warnings on restore when not root
+  * On restore, don't send Windows VSS directory data to non-Windows clients.
+  * On restore, don't send to split VSS data to non-Windows.
+  * Fix travis for osx, where brew is now installing librsync 2.0.1.
+  * Add 'monitor_exe' client option, in order to set where to look for the
+    burp executable when forking a monitor client. This might be needed on
+    systems that don't have any sensible way to self-determine a process' own
+    path, such as openbsd.
+  * From josvo:
+    - Use ComputerName from Windows registry as suggested cname.
+  * From Orsiris de Jong:
+    - Added /nopowermode option to the Windows installer, with checkbox.
+      This allows you to run timed backups when the laptop is not plugged in.
+    - Update README and src/win32/README files.
+    - Update Windows cross-tools and depkgs README file.
+  * From trustchk:
+    - Update README for AIX.
+  * Upgrade Windows depkgs to librsync-1.0.1.
+  * Upgrade Windows depkgs to pcre-8.41.
+  * Upgrade Windows depkgs to zlib-1.2.11.
+
+2017-10-01 Changes in burp-2.1.20:
+  * On server daemonise(), rewrite the pid/prog to the lockfile
+    without trying to open it a second time. This should avoid permission
+    problems after chuser/chgrp.
+  * Fix for 'success notification on failed backup'.
+  * Check fileno() for errors in asfd.c.
+  * List the mtime instead of the more recent of mtime/ctime.
+  * Fix client_lockdir option.
+
+2017-09-01 Changes in burp-2.1.18:
+  * From qm2k:
+    - Fix buffer overrun and slightly refactor xstrsplit in glob_windows.c
+    - Add Content-Type to notification emails.
+    - Windows exclude_fs functionality.
+  * Add Content-Type to summary emails.
+  * Fix missing newlines on WARNING/MESSAGEs logged by the server.
+  * Make 'orig_client=<the same client>' work OK.
+  * Drop privileges after main pidfile creation (instead of before).
+  * Be slightly more helpful with SSL error messages.
+
+2017-08-10 Changes in burp-2.1.16:
+  * Fix encryption_password key length issue introduced in 2.1.14.
+    Backups made by 2.1.14 using encryption_password should be considered
+    broken.
+  * Follow AC_INIT defines throughout the codebase, including the Windows
+    installer.
+  * Log strerror(errno) when failing to write a lock.
+  * From Orsiris de Jong:
+    - Add systemd file for running Burp without root privileges.
+
+2017-08-01 Changes in burp-2.1.14:
+  * From Marek Szuba:
+    - Use pkg-config to detect ncurses.
+  * From Orsiris de Jong:
+    - Fix burp service file for RHEL / CentOS 7 - should be 'forking'.
+  * From Xaltonon:
+    - Add proper key-derivation (and IV) for client encryption.
+  * Make key derived encryption transparent, and add salt.
+  * Upgrade Windows depkgs to openssl-1.1.0f.
+
+2017-07-01 Changes in burp-2.1.12:
+ * From moenoel:
+   - Fix segfault when sb->link.buf is NULL.
+ * Respond correctly to bfd->read returning an error - fixes client side
+   segfault.
+ * Fix for server side autoupgrade path corruption.
+ * Add README link to the ansible wiki.
+ * From ziirish:
+   - Add the ability to reset strlists through the special ':=' syntax.
+   - Fix missing globfree.
+ * Fix a possible segfault in server protocol2 backup phase2.
+ * Fix missing Windows log timestamps. Fix 'resumed' timestamps.
+ * Minor typo in man page, for include_fs.
+ * Make sure iobuf buffer is printable before trying to log it.
+   Also, print the length.
+
+2017-06-01 Changes in burp-2.1.10:
+ * Features sponsored by VSHN (https://vshn.ch/):
+   + Ability to listen on multiple port/status_port numbers, individually
+   configurable with additional max_children/max_status_children.
+   + Add the ability for the client to connect to different server ports
+   according to whether it is doing backup/restore/verify/list/delete.
+   + Allow restore during a backup.
+   + JSON output/input supports multiple actions on the same client.
+ * Fix for restore interrupt on transfer_gzfile_inl() failing.
+ * More UTF-8 in paths, from Alexey Kovalenko.
+ * Add offsets to timestamps.
+ * Take note of warnings from the status server.
+ * Log timestamps of resumes in a file called 'resumed' inside the
+   backup directory that was resumed.
+ * Write '.created' when client directory is initially created.
+ * qm2k's patch to limit notify_script to 1000 lines of log.
+ * Fix two more bugs in relinking deleted hardlink master records.
+ * Add Dave Ludlow's comments to the Windows2008 bare metal file.
+
+2017-05-01 Changes in burp-2.1.8:
+ * Fix two bugs in relinking deleted hardlink master records.
+ * Fix status monitor failing if client password is not set.
+ * trustchk's AIX: Complete initial support.
+ * Increase size of d_name on windows.
+ * chrisv5179's fixes for error handling in burp_ca.
+ * moenoel's include_fs option.
+ * moenoel's partial fixes for strip_from_path().
+ * Fix for problems with truncating incexc file.
+
+2017-04-01 Changes in burp-2.1.6:
+ * Fix for bug treating too many files as new (a problem since 2.1.2).
+ * Fix for changed/same counters being reversed in the monitor.
+ * Set times on symlinks instead of dereferencing them.
+ * Fix bug with backup_script_reserved_args = 0.
+ * moenoel's burp_ca fix for SunOS.
+ * trustchk's addition of ZFS to fstypes so that it can be excluded using
+   exclude_fs.
+
+2017-03-01 Changes in burp-2.1.4:
+ * Protocol 1: When a file that is deleted on the client side was one that
+   others hardlink to, do not treat the new first entry as a new file - link
+   it in from the previous backup.
+ * Protocol 2: It is OK if the cfiles directory already exists when trying to
+   mkdir it.
+ * Set windows d_name buffer to MAX_PATH.
+ * Tests for run_action.
+
+2017-02-01 Changes in burp-2.1.2:
+ * Protocol 2 fixes:
+   - Client side empty block memory leak
+   - server side empty blocks lock up
+   - server side limit number of paths loaded into memory
+   - metadata protocol2 restore removing security capabilities
+ * Don't try to set file times on Windows junction points.
+ * Create 'bsparse' for recreating the sparse index.
+ * Cleanup code in protocol1/backup_phase2.c.
+ * Reinhard Biegel's fixes:
+   - bad open call when ca_conf is not set
+   - config check logic for ca_burp_ca
+
+2017-01-01 Changes in burp-2.1.0:
+ * Fix certificate and csr permissions on receive_a_file().
+ * Fix for metadata restore removing security capabilities.
+ * Fix for 'burp -a S' not outputting all clients.
+ * Compile and run utests on Windows.
+ * Delete unused Windows build code and icons.
+ * Update manpage for server_script_pre/server_script_post.
+ * Upgrade Windows dpkgs to openssl-1.1.0c and pcre-8.39.
+
+2017-01-01 Changes in burp-2.0.54:
+ * Fix certificate and csr permissions on receive_a_file().
+ * Fix for metadata restore removing security capabilities.
+ * Fix for 'burp -a S' not outputting all clients.
+
+2016-11-07 Changes in burp-2.0.52:
+  * Make compilation with openssl-1.1.0 work.
+  * Fix for client side autoupgrade.
+  * Rename 'enum page' so that compilation on Solaris 10 works.
+
+2016-11-02 Changes in burp-2.0.50:
+  * Bug fix for excluding directories directly inside /.
+  * Fix for dindex regeneration concurrency accidently resulting in
+    protocol2 data files getting deleted prematurely.
+
+2016-10-01 Changes in burp-2.0.48:
+  * Fix server-side segfault on re-encoding Windows attributes.
+  * Stop server child hanging on verify/restore when gzipped file is corrupt.
+  * If a file is missing on verify/restore, continue to verify/restore more
+    files.
+  * Make server initiated restores work in protocol 2.
+  * Benjamin Sans' fixes for cname_ options:
+    + manpage misses some returns
+    + use globalcs while authenticating client
+    + fix unit test
+    + allow to change cname_fqdn and cname_lowercase on already setup servers
+  * Add better docs for the cname_ options.
+  * On the client side, make OPT_CNAME_FQDN and OPT_CNAME_LOWERCASE
+    affect the cname retrieved from the ssl cert, as well as the
+    cname when the certificate is generated in the first place.
+  * Fix chuser/chgrp when switching with orig_client.
+  * Fix server-initiated restores with orig_client.
+  * Add end-to-end test for a server-initiated restore.
+  * Avi Rozen's fixes:
+    + for possible hardlink truncation on restore.
+    + for burpfs support:
+      - monitor/browse: link field added to file entries
+      - monitor/browse: use "*" as browse directory in order to dump all files
+      - fixed handling of NULL browse directory
+
+2016-09-04 Changes in burp-2.0.46:
+  * Fix server segfault in no-fork mode.
+  * Counter fixes for protocol1.
+  * Server to client counters via JSON.
+  * Replace deprecated readdir_r() with readdir().
+  * Make asfds count received and sent bytes instead of trying to do
+    it inside the backup/restore/verify code.
+  * Don't count metadata in the phase1 estimate counts.
+  * Add cname_lowercase to force lowercase cname on server-side (from
+    Benjamin Sans).
+  * Add cname_fqdn option to allow stripping FQDN (from Benjamin Sans).
+  * Switch to pure C for non-Windows (from Ruben Kerkhof).
+  * Make 'burp -a e' work again.
+  * Remove restore_spool.
+  * Make 'burp -a s/S' output the 'burp -a m' log lines on error.
+  * Re-enable chuser_and_or_chgrp code, which got broken during the
+    automake/autoconf refactoring a few versions ago.
+  * Remove unused configs/install script.
+  * Use /proc/%d/exec to figure out the path to run when forking a
+    monitor 'burp -a m' process.
+  * Fix for the debian init script so that it understands $BURP_USER
+    (from Peter Maloney).
+
+2016-07-30 Changes in burp-2.0.44:
+  * Default to protocol 1.
+  * Another attempt to remove network timeout from champ chooser main socket.
+  * Fix building with explicitly added --enable-xattr.
+  * Enable SE_SECURITY_NAME privilege on Windows. Should fix permission
+    problems on attempting to back up:
+	C:\Program Files\WindowsApps
+	C:\Windows\InfusedApps
+
+2016-06-30 Changes in burp-2.0.42:
+  * Remove network timeout from champ chooser main socket.
+  * Tests for monitor cache.
+  * Deduplicate the current manifest locally in backup_phase2.
+  * Some protocol 2 counter improvements.
+  * More coverage for cmd.c.
+  * Tests for src/server/extra_comms.c
+  * Tests for src/client/extra_comms.c
+  * Local time in the top corner of the monitor.
+  * Fix C++11 -Wliteral-suffix warnings.
+  * Make sure that places that are checking RS_DEFAULT_STRONG_LEN have
+    included librsync.h.
+  * Bug fix for restore_script_pre running instead of restore_script_post.
+  * Correct mistakes in the manpage about the status monitor.
+  * Bug fix for status client ncurses with -C showing last backup only.
+  * Fallback to /usr/sbin/burp for the forked 'burp -a m' process.
+  * A small tidy up in protocol1 phase4.
+  * Fix pathcmp on raspberry pis.
+  * Fix bug in rabin fingerprinting due to signedness on the window.
+  * Make the server verify checksums during a protocol2 backup.
+  * Fix bug that let clients overwrite existing protocol2 data files.
+  * Correct rabin.h include in src/server/restore.c.
+  * Rabin fingerprinting should be using unsigned char.
+  * Rabin fingerprinting should reset window after every block.
+
+2016-05-30 Changes in burp-2.0.40:
+  * Tidy symlink/readlink functions.
+  * Yopito's patches to help RHEL5 builds.
+  * Fix 'burp -a S', which has been broken up to this point in burp-2.0.x.
+  * Add more unit tests.
+  * Fix for writing statuses down multiple server status child pipes.
+  * Fix for loading initial running client status server data.
+  * Fix bugs in sorting paths with characters with ASCII values higher
+    than 127. Make my_alphasort() use pathcmp(), like burp-1 did.
+  * Clean up network_timeout, ratelimit, streamtype and fdtype.
+  * Tidy up setup_signals().
+  * Make path to CRL configurable.
+  * Stéphane Berthelot's fix for too many lines for each client in the
+    status monitor summary.
+  * Fix segfault when using '-C <client> -a s'.
+  * Fix compilation without ncurses.
+  * Upgrade Windows depkgs to openssl-1.0.2h.
+  * Upgrade Windows depkgs to pcre-8.38.
+
+2016-04-30 Changes in burp-2.0.38:
+  * Add 'enabled' option (from Benjamin Sans).
+  * Fix bugs in protocol2 delete_unused_data_files().
+  * Remove some hardcoded paths in scripts.
+  * Add ecryptfs to the list of file types that can be excluded (from
+    scosu).
+  * Added ubuntu baremetal restore instructions (from Wybren Buijs).
+  * Use an asfd for stdout in status_client_ncurses.
+  * Make rubble cleanup with working_dir_recovery_method=delete delete
+    unused data files.
+  * Fix bno printf 32bit compile warnings.
+  * Fix bug in server side restore regex parsing introduced in 2.0.36.
+  * Don't try to set IPTOS_THROUGHPUT if it is not defined.
+  * Fix and tidy up include_glob test.
+  * Fix champ_chooser to try until max_tries instead of 10 seconds (from
+    Stéphane Berthelot)
+  * Add glob_after_script_pre option to evaaluate glob after script pre
+    execution (from Benjamin Sans).
+  * Adapt rpm spec file for 2.0.36, test on CentOS7 (from Marco Fretz).
+  * Fix protocol2 backup deletion not obeying multiple 'keep' values.
+
+2016-03-31 Changes in burp-2.0.36:
+  * Support xattrs and acls in protocol2.
+  * Fix acl+xattr bug introduced in 2.0.28.
+  * Fix default acl bug that has existed forever.
+  * Fix acl memory leak.
+  * Some tests for status_client_ncurses.c.
+  * Add server_can_override_includes option.
+  * Fix Travis Darwin builds.
+  * More test coverage for champ_chooser.
+
+2016-02-29 Changes in burp-2.0.34:
+  * Add support for glibc's additional algorithms in crypt(3)-style passwords
+    ("passwd" configuration option).
+  * Unit tests for check_passwd.
+  * Bug fix for acls - use acl_free() instead of free_w().
+  * Make server accept 'restoreend_ok' and 'restoreend ok'.
+  * Make client send 'restoreend ok', the same as burp 1.4.40.
+  * Some work on protocol2 xattr support.
+  * Implement labels being passed via status monitor.
+  * Use localtime() instead of gmtime() in cntr_print().
+  * Better locking for burp_ca.
+  * Make close_zp() not crash on OpenBSD on Z_RET_ERROR.
+  * Add Travis file.
+  * Turn on all tests for NetBSD.
+  * Fix dindex filename in protocol 2 phase 4 regenerate client index.
+
+2016-01-31 Changes in burp-2.0.32:
+  * Tweak README install instructions.
+  * Fix ncurses output option.
+  * Fixes for ncurses support on OpenIndiana.
+  * Header inclusion order fixes.
+  * NetBSD be64toh and le64toh cleanup.
+  * Make xattr code compile on NetBSD.
+  * Attempt SSL_accept again on SSL_ERROR_WANT_READ.
+  * Fix 'make distcheck'.
+  * Add 'make install-config' and 'make install-all' commands.
+  * Use AC_CHECK_TYPES to check for struct utimbuf.
+  * Replace flock locking with bash file creation locking.
+  * Portability fixes in test_main.
+  * Make xattr.c depend more on detected functionality, less on OS.
+  * Compiler warning fixes on various platforms.
+  * Fixes so that burp runs on DragonFlyBSD.
+  * Fix a protocol2 champsock problem for FreeBSD.
+  * Use the BSD-style xattr functions on NetBSD.
+  * FreeBSD now fully added to automatic test system.
+  * Simplify checks for endian conversion functions.
+  * Install bedup, bsigs, and vss_strip.
+  * Don't try to create sockets with mknod.
+  * Fix xattr test so that ordering doesn't matter.
+  * Add keepalive flag to sockets.
+  * Remove child status pipe from the connections that timeout.
+  * Mark log functions as printf-like, clean up format warnings.
+  * Allow for setting test verbosity from environment.
+  * NetBSD fix - getaddrinfo: don't lookup http service.
+  * Set timezone to UTC before calling mktime, otherwise Solaris uses the
+    system timezone.
+  * Use gmtime instead of localtime, to fix test failures on OpenIndiana and
+    OmniOS.
+  * Fix AM_PROC_CC_C_O warning with older automake versions.
+  * Fix base64 decoding test on NetBSD.
+  * Fix test_fzp for older zlib versions.
+  * Updated yajl in burp-depgs in order to fix a Windows XP linking bug.
+
+2016-01-03 Changes in burp-2.0.30:
+  * Ruben Kerkhof has rewritten the automake/configure system.
+  * Make CMD_INTERRUPT work in protocol 2.
+  * Tests for restore.
+  * Tests for backup phase2.
+  * Tests for champ_server.
+  * Tests for slist.
+  * Fix minor memory leaks.
+  * Bug fix for deleting the current backup.
+  * Correct documentation about ca_crl_check.
+  * Fix listing all backups and using '-d'.
+  * Fix status monitor segfault on exit.
+
+2015-11-30 Changes in burp-2.0.28:
+  * Use the same maximum blocksize as rsync ((int32_t)1<<17).
+  * Clean up client side librsync load_signature code.
+  * Add freebsd to AWS automatic build (actual tests not working yet).
+  * Parallel test runs.
+  * Update Debian autoupgrade script.
+  * A lot more unit test coverage.
+  * Always flush asfd at the end of tasks.
+  * Make bad regexes produce error messages.
+  * Make bad restore regexes produce a message on the client side.
+  * Bug fix to make bad strlist regexes not match everything.
+  * Fix memory leaks in xattr.c.
+  * Fix memory leaks in cntr.c and cstat.c.
+  * Fix segfaults in cstat.c.
+  * Get basic diff to work.
+  * On restore, always open deltas via zlib, so it doesn't matter whether
+    they have been compressed or not.
+  * Make it possible to use '-b all' on restore/verify. Use '-b all' in
+    tests.
+  * Don't quit the restore if inflating or patching failed - move on to
+    the next file.
+  * Fix listing all backups.
+  * Remove json list option.
+  * Don't build separate .a files. Just use .o files.
+  * Fix protocol 1 EFS restore breakage.
+  * Add some EFS files to the Windows tests.
+  * Fix winattr values not being preserved on changed files.
+  * Fix for yajl sprintf_s.
+
+2015-10-31 Changes in burp-2.0.26:
+  * Paid for by an anonymous user: add a new screen to the Windows installer
+    for choosing 'include' directories.
+  * Upgrade Windows depkgs to openssl-1.0.2d.
+  * Upgrade Windows depkgs to librsync-1.0.0.
+  * Add internal CRL revocation feature based on a patch from Sebastien
+    Couppey (as opposed to using the old ssl_extra_checks_script server pre
+    script).
+  * Fix protocol2 bug where rblk wasn't initialised.
+  * Add linux i386 machine to automatic tests.
+  * Use -Werror when build utests.
+  * Delete unused protocol2 data files.
+  * Eliminate compile warnings from the Windows build and add  -Werror
+    to the Windows CFLAGS.
+  * Change dhfile.pem generation command to use -dsaparam and 2048 bits.
+  * Fix memory leak in protocol2 restore.
+  * Fix protocol2 problem where new candidates wouldn't be loaded during
+    backups.
+  * Make sure split/strip_vss don't break protocol 2.
+  * Unit test client/auth.c by overriding asfd function pointers.
+  * Fix iobuf_free() bug.
+  * Code coverage report for all files.
+  * Start unit testing client restore.
+  * Preparation for fixing restore interrupt for protocol 2
+
+2015-09-30 Changes in burp-2.0.24:
+  * Another fix for sigchld handling.
+  * Tests for delete algorithm.
+  * Tests for bu_get.
+  * Fix a bug where deleting with multiple keep settings and no hardlinked
+    archives would result in too many backups getting removed in the oldest
+    keep range.
+  * During backup, read compression settings from the attribs buffer sent from
+    the client rather than relying on the server config being correct.
+  * Fix a bug where interrupting the server whilst it was deleting old
+    backups would result in the next backup erroneously being given a backup
+    number incremented from the timestamp in the 'deleteme' directory.
+  * Fix the 'manual_delete' option so that it works on backups instead of
+    just the rubble left behind by a librsync=1 backup. Add the option to the
+    man page as it was missing.
+  * Add acl=[0|1] and xattr=[0|1] options so that acls and xattrs can be
+    turned on and off at runtime.
+  * Ensure all logw() messages end with a newline.
+
+2015-09-04 Changes in burp-2.0.22:
+  * Make protocol2 resume work. Add unit tests for resume components.
+  * Store manifest fingerprints and md5sums in binary instead of strings,
+    plus related endian fixes.
+  * Fix '-a l' regex so that it isn't split in two at the right-most
+    colon.
+  * Fix possible buffer overrun when encoding attribs.
+  * Fix protocol 1 phase 2 resume bug introduced in 2.0.20.
+  * Fix protocol 1 phase 2 bug where librsync was never used.
+  * Fix possible protocol 2 phase 2 segfaults.
+  * Make protocol 1 and 2 share the same code for phase 3.
+  * Set default_md=sha256 in CA.cnf.
+  * Use 'stat' for checking ssl files instead of 'lstat', and log if
+    the ssl file was not found.
+  * Fix path for server initiated backup via timer_script.
+  * Use getpid() for random delay seed so that I can get rid of OS specific
+    clock code and '-lrt' link flag.
+  * Get xattr working on Mac OSX. This should mean that resource forks and
+    finder info backup/restore is working.
+  * Fix Windows protocol1 restore segfault when using split_vss.
+  * Fix directories in Windows protocol1 strip_vss mode.
+  * Fix from Patrick Van der Veken to correct typo in timer_script that
+    meant month settings were broken.
+  * Make listing a non-existent backup give an error.
+  * Stop using scandir with a comparison function, in order to avoid
+    problems with compilation on Macs.
+  * Fix bug where Windows backups with split_vss was saving CMD_METADATA
+    instead of CMD_VSS.
+  * Prevent warnings when listing backups that contain metadata.
+  * Fix for SIGHUP causing server to stop listening.
+  * Use flock to stop simultaneous runs of burp_ca, hopefully preventing CA
+    corruption.
+  * Unit tests for src/client/find.c, enabling the removal of some of the
+    time consuming end-to-end tests.
+  * Fix 'nobackup' conf item.
+  * Don't use absolute path to 'sort' in 'make test'.
+  * Fix bug where fs_name_max could get set to an incorrect value on the
+    server side, causing scandir to fail at the end of a backup.
+  * Fix for a growing list of defunct child processes on busy servers, where
+    overlapping sigchlds would get conflated into one, and waitpid would only
+    get run once.
+  * Set the server address in linux client burp.conf to "::1" if IPv6 is
+    supported, and "127.0.0.1" otherwise.
+  * Substitute 127.0.0.1 for the default burp.conf server address if the OS
+    doesn't have IPv6.
+  * Fix for server side restore file causing '-a m' to exit.
+  * Fix large file support for 32 bit machines.
+  * Let the champ chooser continue if candidate_add_fresh could not read a
+    new candidate file.
+  * On the server, log the client address and port for every connection.
+  * Upgrade Windows depkgs to openssl-1.0.1p.
+
+2015-07-01 Changes in burp-1.4.40:
+  * Fix '-a l' regex so that it isn't split in two at the right-most colon.
+  * Set default_md=sha256 in CA.cnf.
+  * Correct logp format strings in quota.c.
+  * Upgrade Windows depkgs to openssl-1.0.1o.
+
 2015-05-30 Changes in burp-2.0.20:
   * Fix conf bug that was causing the server to segfault when the client
     used the -C option. Also add unit test for it.
@@ -62,7 +918,7 @@
   * Fix bug where 'burp -a S' was limited to 24 lines.
   * Make 'burp -a S' not truncate client names.
   * Implement glob '. /some/dir/*' conf syntax on non-Windows machines.
-  * Changes to support librsync-1.0.0.  
+  * Changes to support librsync-1.0.0.
   * When listing a directory, include a '.' entry to indicate the directory
     itself.
   * When listing a directory, send an error if the directory was not found.
@@ -618,7 +1474,7 @@
   * Add Bas van den Dikkenberg's tweaks for getting burp into official Debian
     and Ubuntu repositories. Burp is now in debian sid and ubuntu precise.
   * Make the server tell the client what extra_comms features it supports, so
-    that, in future, old servers are more likely to work with new clients. 
+    that, in future, old servers are more likely to work with new clients.
   * Improve 'make clean'.
   * Add option to strip off leading path components on restore.
   * Fix segfault that was happening on the server when SSL_accept() failed.
@@ -799,7 +1655,7 @@
 2011-03-18 Changes in burp-1.1.22:
   * Added scheduling.
   * Added email notifications.
-  * Fixed autoconf. Programs like ccache should now work. 
+  * Fixed autoconf. Programs like ccache should now work.
   * Strip whitespace from end of conf lines, ignore quotes around conf lines.
   * Updated the Windows build tools.
 

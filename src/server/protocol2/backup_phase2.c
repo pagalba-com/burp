@@ -1,32 +1,92 @@
-#include "include.h"
-#include "../protocol1/resume.h"
+#include "../../burp.h"
+#include "../../alloc.h"
+#include "../../asfd.h"
+#include "../../async.h"
+#include "../../attribs.h"
 #include "../../base64.h"
 #include "../../cmd.h"
+#include "../../cntr.h"
+#include "../../cstat.h"
+#include "../../handy.h"
 #include "../../hexmap.h"
-#include "champ_chooser/include.h"
+#include "../../iobuf.h"
+#include "../../log.h"
 #include "../../server/manio.h"
 #include "../../protocol2/blist.h"
+#include "../../protocol2/rabin/rabin.h"
 #include "../../slist.h"
+#include "../child.h"
+#include "../manios.h"
+#include "../resume.h"
+#include "champ_chooser/champ_client.h"
+#include "champ_chooser/champ_server.h"
+#include "champ_chooser/hash.h"
 #include "dpth.h"
+#include "backup_phase2.h"
+
+#define END_SIGS		0x01
+#define END_BACKUP		0x02
+#define END_REQUESTS		0x04
+#define END_BLK_REQUESTS	0x08
+
+#define BLKS_MAX_UNREQUESTED	BLKS_MAX_IN_MEM/4
+// This needs to be greater than BLKS_MAX_UNREQUESTED
+#define SLIST_MAX_IN_MEM	BLKS_MAX_IN_MEM
+
+static int breaking=0;
+static int breakcount=0;
 
 static int data_needed(struct sbuf *sb)
 {
-	if(sb->path.cmd==CMD_FILE) return 1;
+	if(sb->path.cmd==CMD_FILE)
+		return 1;
+	if(sb->path.cmd==CMD_METADATA)
+		return 1;
 	return 0;
 }
 
+static int manio_component_to_chfd(struct asfd *chfd, char *path)
+{
+	struct iobuf wbuf;
+	iobuf_from_str(&wbuf, CMD_MANIFEST, path);
+	return chfd->write(chfd, &wbuf);
+}
+
+static int unchanged(struct sbuf *csb, struct sbuf *sb,
+	struct manios *manios, struct asfd *chfd)
+{
+	int ret=-1;
+	char *fpath=NULL;
+	if(!(fpath=strdup_w(manios->changed->offset->fpath, __func__)))
+		goto end;
+	if(manio_copy_entry(csb, sb,
+		manios->current, manios->unchanged,
+		/*seed_src*/NULL, /*seed_dst*/NULL)<0)
+			goto end;
+	if(strcmp(fpath, manios->changed->offset->fpath))
+	{
+		// If the copy crossed a manio boundary, we should tell the
+		// champ server to load the previous one as a candidate.
+		if(manio_component_to_chfd(chfd, fpath))
+			goto end;
+	}
+	ret=0;
+end:
+	free_w(&fpath);
+	return ret;
+}
+
 // Return -1 for error, 0 for entry not changed, 1 for entry changed (or new).
-static int found_in_current_manifest(struct asfd *asfd,
-	struct sbuf *csb, struct sbuf *sb,
-	struct manio *cmanio, struct manio *unmanio,
-	struct blk **blk, struct conf **confs)
+static int found_in_current_manifest(struct sbuf *csb, struct sbuf *sb,
+	struct manios *manios, struct asfd *chfd,
+	struct cntr *cntr)
 {
 	// Located the entry in the current manifest.
 	// If the file type changed, I think it is time to back it up again
 	// (for example, EFS changing to normal file, or back again).
 	if(csb->path.cmd!=sb->path.cmd)
 	{
-		if(manio_forward_through_sigs(asfd, &csb, blk, cmanio, confs)<0)
+		if(manio_forward_through_sigs(csb, manios->current)<0)
 			return -1;
 		return 1;
 	}
@@ -37,59 +97,78 @@ static int found_in_current_manifest(struct asfd *asfd,
 	  && csb->statp.st_ctime==sb->statp.st_ctime)
 	{
 		// Got an unchanged file.
-		if(manio_copy_entry(asfd, &csb, sb,
-			blk, cmanio, unmanio, confs)<0) return -1;
-		return 0;
+		cntr_add_same(cntr, sb->path.cmd);
+		// No actual data saved - goes in counters_n.
+		if(manio_write_cntr(manios->counters_n, sb, CNTR_MANIO_SAME))
+			return -1;
+		return unchanged(csb, sb, manios, chfd);
 	}
 
 	if(csb->statp.st_mtime==sb->statp.st_mtime
 	  && csb->statp.st_ctime!=sb->statp.st_ctime)
 	{
+		// FIX THIS:
 		// File data stayed the same, but attributes or meta data
 		// changed. We already have the attributes, but may need to
 		// get extra meta data.
-		// FIX THIS
-		if(manio_copy_entry(asfd, &csb, sb,
-			blk, cmanio, unmanio, confs)<0) return -1;
-		return 0;
+		cntr_add_same(cntr, sb->path.cmd);
+		// No actual data saved - goes in counters_n.
+		if(manio_write_cntr(manios->counters_n, sb, CNTR_MANIO_SAME))
+			return -1;
+		return unchanged(csb, sb, manios, chfd);
 	}
 
 	// File data changed.
-	if(manio_forward_through_sigs(asfd, &csb, blk, cmanio, confs)<0)
+	cntr_add_changed(cntr, sb->path.cmd);
+	// Data has been saved - goes in counters_d, or the counters
+	// will be out of sequence.
+	if(manio_write_cntr(manios->counters_d, sb, CNTR_MANIO_CHANGED))
+		return -1;
+
+	if(manio_forward_through_sigs(csb, manios->current)<0)
 		return -1;
 	return 1;
 }
 
 // Return -1 for error, 0 for entry not changed, 1 for entry changed (or new).
-static int entry_changed(struct asfd *asfd, struct sbuf *sb,
-	struct manio *cmanio, struct manio *unmanio, struct conf **confs)
+static int entry_changed(struct sbuf *sb,
+	struct manios *manios, struct asfd *chfd, struct sbuf **csb,
+	struct cntr *cntr)
 {
 	static int finished=0;
-	static struct sbuf *csb=NULL;
-	static struct blk *blk=NULL;
+	int pcmp;
 
-	if(finished) return 1;
+	if(finished)
+	{
+		// Data has been saved - goes in counters_d, or the counters
+		// will be out of sequence.
+		if(manio_write_cntr(manios->counters_d, sb, CNTR_MANIO_NEW))
+			return -1;
+		cntr_add_new(cntr, sb->path.cmd);
+		return 1;
+	}
 
-	if(!csb && !(csb=sbuf_alloc(confs))) return -1;
-
-	if(csb->path.buf)
+	if(*csb && (*csb)->path.buf)
 	{
 		// Already have an entry.
 	}
 	else
 	{
 		// Need to read another.
-		if(!blk && !(blk=blk_alloc())) return -1;
-		switch(manio_sbuf_fill(cmanio, asfd, csb, blk, NULL, confs))
+		switch(manio_read(manios->current, *csb))
 		{
 			case 1: // Reached the end.
-				sbuf_free(&csb);
-				blk_free(&blk);
+				sbuf_free(csb);
 				finished=1;
+				cntr_add_new(cntr, sb->path.cmd);
+				// Data has been saved - goes in counters_d,
+				// or the counters will be out of sequence.
+				if(manio_write_cntr(manios->counters_d,
+					sb, CNTR_MANIO_NEW)) return -1;
 				return 1;
 			case -1: return -1;
 		}
-		if(!csb->path.buf)
+		if(!(*csb)->path.buf)
 		{
 			logp("Should have a path at this point, but do not, in %s\n", __func__);
 			return -1;
@@ -99,42 +178,47 @@ static int entry_changed(struct asfd *asfd, struct sbuf *sb,
 
 	while(1)
 	{
-		switch(sbuf_pathcmp(csb, sb))
+		if(!(pcmp=sbuf_pathcmp(*csb, sb)))
+			return found_in_current_manifest(*csb, sb,
+					manios, chfd, cntr);
+		else if(pcmp>0)
 		{
-			case 0: return found_in_current_manifest(asfd, csb, sb,
-					cmanio, unmanio, &blk, confs);
-			case 1: return 1;
-			case -1:
-				// Behind - need to read more data from the old
-				// manifest.
-				switch(manio_sbuf_fill(cmanio, asfd,
-					csb, blk, NULL, confs))
-				{
-					case -1: return -1;
-					case 1:
-					{
-						// Reached the end.
-						sbuf_free(&csb);
-						blk_free(&blk);
-						return 1;
-					}
-				}
-				// Got something, go back around the loop.
+			cntr_add_new(cntr, sb->path.cmd);
+			// Data has been saved - goes in counters_d,
+			// or the counters will be out of sequence.
+			if(manio_write_cntr(manios->counters_d,
+				sb, CNTR_MANIO_NEW)) return -1;
+			return 1;
 		}
+//		cntr_add_deleted(cntr, (*csb)->path.cmd);
+		// Behind - need to read more data from the old manifest.
+		switch(manio_read(manios->current, *csb))
+		{
+			case 1: // Reached the end.
+				sbuf_free(csb);
+				cntr_add_new(cntr, sb->path.cmd);
+				// Data has been saved - goes in counters_d,
+				// or the counters will be out of sequence.
+				if(manio_write_cntr(manios->counters_d,
+					sb, CNTR_MANIO_NEW)) return -1;
+				return 1;
+			case -1: return -1;
+		}
+		// Got something, go back around the loop.
 	}
 
 	return 0;
 }
 
-static int add_data_to_store(struct conf **confs,
-	struct blist *blist, struct iobuf *rbuf, struct dpth *dpth)
+static int add_data_to_store(struct cntr *cntr,
+	struct slist *slist, struct iobuf *rbuf, struct dpth *dpth)
 {
 	static struct blk *blk=NULL;
 
 	// Find the first one in the list that was requested.
 	// FIX THIS: Going up the list here, and then later
 	// when writing to the manifest is not efficient.
-	for(blk=blist->head;
+	for(blk=slist->blist->head;
 		blk && (!blk->requested || blk->got==BLK_GOT); blk=blk->next)
 	{
 	//	logp("try: %d %d\n", blk->index, blk->got);
@@ -142,16 +226,27 @@ static int add_data_to_store(struct conf **confs,
 	if(!blk)
 	{
 		logp("Received data but could not find next requested block.\n");
-		if(!blist->head) logp("and blist->head is null\n");
-		else logp("head index: %d\n", blist->head->index);
+		if(!slist->blist->head)
+			logp("and slist->blist->head is null\n");
+		else
+			logp("head index: %" PRIu64 "\n", slist->blist->head->index);
 		return -1;
 	}
+
+// FIX THIS
+#ifndef UTEST
+	if(blk_verify(blk->fingerprint, blk->md5sum, rbuf->buf, rbuf->len)<=0)
+	{
+		logp("ERROR: Block %" PRIu64 " from client did not verify.\n",
+			blk->index);
+		return -1;
+	}
+#endif
 
 	// Add it to the data store straight away.
 	if(dpth_protocol2_fwrite(dpth, rbuf, blk)) return -1;
 
-	cntr_add(get_cntr(confs[OPT_CNTR]), CMD_DATA, 0);
-	cntr_add_recvbytes(get_cntr(confs[OPT_CNTR]), blk->length);
+	cntr_add(cntr, CMD_DATA, 0);
 
 	blk->got=BLK_GOT;
 	blk=blk->next;
@@ -159,29 +254,29 @@ static int add_data_to_store(struct conf **confs,
 	return 0;
 }
 
-static int set_up_for_sig_info(struct slist *slist, struct blist *blist, struct sbuf *inew)
+static int set_up_for_sig_info(struct slist *slist, struct iobuf *attr,
+	uint64_t index)
 {
 	struct sbuf *sb;
 
 	for(sb=slist->add_sigs_here; sb; sb=sb->next)
 	{
-		if(!sb->protocol2->index) continue;
-		if(inew->protocol2->index==sb->protocol2->index) break;
+		if(!sb->protocol2->index)
+			continue;
+		if(index==sb->protocol2->index)
+			break;
 	}
 	if(!sb)
 	{
-		logp("Could not find %lu in request list %d\n",
-			inew->protocol2->index, sb->protocol2->index);
+		logp("Could not find %" PRIu64 " in request list\n", index);
 		return -1;
 	}
 	// Replace the attribs with the more recent values.
-	if(sb->attr.buf) free(sb->attr.buf);
-	sb->attr.buf=inew->attr.buf;
-	sb->attr.len=inew->attr.len;
-	inew->attr.buf=NULL;
+	iobuf_free_content(&sb->attr);
+	iobuf_move(&sb->attr, attr);
 
 	// Mark the end of the previous file.
-	slist->add_sigs_here->protocol2->bend=blist->tail;
+	slist->add_sigs_here->protocol2->bend=slist->blist->tail;
 
 	slist->add_sigs_here=sb;
 
@@ -198,80 +293,88 @@ static void dump_blks(const char *msg, struct blk *b)
 }
 */
 
-static int add_to_sig_list(struct slist *slist, struct blist *blist,
-	struct iobuf *rbuf, struct dpth *dpth, struct conf **confs)
+static int add_to_sig_list(struct slist *slist, struct iobuf *rbuf)
 {
 	// Goes on slist->add_sigs_here
 	struct blk *blk;
 	struct protocol2 *protocol2;
 
 	if(!(blk=blk_alloc())) return -1;
-	blist_add_blk(blist, blk);
+	blist_add_blk(slist->blist, blk);
 
 	protocol2=slist->add_sigs_here->protocol2;
-        if(!protocol2->bstart) protocol2->bstart=blk;
-        if(!protocol2->bsighead) protocol2->bsighead=blk;
+	if(!protocol2->bstart) protocol2->bstart=blk;
+	if(!protocol2->bsighead) protocol2->bsighead=blk;
 
-	if(split_sig(rbuf, blk)) return -1;
+	if(blk_set_from_iobuf_sig(blk, rbuf)) return -1;
 
 	// Need to send sigs to champ chooser, therefore need to point
 	// to the oldest unsent one if nothing is pointed to yet.
-	if(!blist->blk_for_champ_chooser) blist->blk_for_champ_chooser=blk;
+	if(!slist->blist->blk_for_champ_chooser)
+		slist->blist->blk_for_champ_chooser=blk;
 
 	return 0;
 }
 
-static int deal_with_read(struct iobuf *rbuf,
-	struct slist *slist, struct blist *blist, struct conf **confs,
-	int *sigs_end, int *backup_end, struct dpth *dpth)
+static int deal_with_read(struct iobuf *rbuf, struct slist *slist,
+	struct cntr *cntr, uint8_t *end_flags, struct dpth *dpth)
 {
 	int ret=0;
-	static struct sbuf *inew=NULL;
-
-	if(!inew && !(inew=sbuf_alloc(confs))) goto error;
+	static struct iobuf attr;
+	static uint64_t index;
 
 	switch(rbuf->cmd)
 	{
 		/* Incoming block data. */
 		case CMD_DATA:
-			if(add_data_to_store(confs, blist, rbuf, dpth))
+			if(add_data_to_store(cntr, slist, rbuf, dpth))
 				goto error;
 			goto end;
 
 		/* Incoming block signatures. */
 		case CMD_ATTRIBS_SIGS:
-			// New set of stuff incoming. Clean up.
-			if(inew->attr.buf) free(inew->attr.buf);
-			iobuf_move(&inew->attr, rbuf);
-			inew->protocol2->index=decode_file_no(&inew->attr);
+
+			iobuf_init(&attr);
+			iobuf_move(&attr, rbuf);
+			index=decode_file_no(&attr);
 
 			// Need to go through slist to find the matching
 			// entry.
-			if(set_up_for_sig_info(slist, blist, inew)) goto error;
+			if(set_up_for_sig_info(slist, &attr, index))
+				goto error;
 			return 0;
 		case CMD_SIG:
-			if(add_to_sig_list(slist, blist,
-				rbuf, dpth, confs))
-					goto error;
+			if(add_to_sig_list(slist, rbuf))
+				goto error;
 			goto end;
 
 		/* Incoming control/message stuff. */
 		case CMD_MESSAGE:
 		case CMD_WARNING:
-			log_recvd(rbuf, confs, 0);
+		{
+			log_recvd(rbuf, cntr, 0);
 			goto end;
+		}
 		case CMD_GEN:
 			if(!strcmp(rbuf->buf, "sigs_end"))
 			{
-				*sigs_end=1;
+				(*end_flags)|=END_SIGS;
 				goto end;
 			}
 			else if(!strcmp(rbuf->buf, "backup_end"))
 			{
-				*backup_end=1;
+				(*end_flags)|=END_BACKUP;
 				goto end;
 			}
 			break;
+		case CMD_INTERRUPT:
+		{
+			uint64_t file_no;
+			file_no=base64_to_uint64(rbuf->buf);
+			if(slist_del_sbuf_by_index(slist, file_no))
+				goto error;
+			goto end;
+		}
 		default:
 			break;
 	}
@@ -279,21 +382,13 @@ static int deal_with_read(struct iobuf *rbuf,
 	iobuf_log_unexpected(rbuf, __func__);
 error:
 	ret=-1;
-	sbuf_free(&inew);
 end:
-	if(rbuf->buf) { free(rbuf->buf); rbuf->buf=NULL; }
+	iobuf_free_content(rbuf);
 	return ret;
 }
 
-static int encode_req(struct blk *blk, char *req)
-{
-	char *p=req;
-	p+=to_base64(blk->index, p);
-	*p=0;
-	return 0;
-}
-
-static int get_wbuf_from_sigs(struct iobuf *wbuf, struct slist *slist, struct blist *blist, int sigs_end, int *blk_requests_end, struct dpth *dpth, struct conf **confs)
+static int get_wbuf_from_sigs(struct iobuf *wbuf, struct slist *slist,
+	uint8_t *end_flags)
 {
 	static char req[32]="";
 	struct sbuf *sb=slist->blks_to_request;
@@ -303,11 +398,11 @@ static int get_wbuf_from_sigs(struct iobuf *wbuf, struct slist *slist, struct bl
 	if(!sb)
 	{
 		slist->blks_to_request=NULL;
-		if(sigs_end && !*blk_requests_end)
+		if((*end_flags)&END_SIGS && !((*end_flags)&END_BLK_REQUESTS))
 		{
 			iobuf_from_str(wbuf,
 				CMD_GEN, (char *)"blk_requests_end");
-			*blk_requests_end=1;
+			(*end_flags)|=END_BLK_REQUESTS;
 		}
 		return 0;
 	}
@@ -320,26 +415,21 @@ static int get_wbuf_from_sigs(struct iobuf *wbuf, struct slist *slist, struct bl
 			slist->blks_to_request=sb->next;
 			printf("move to next\n");
 		}
-		if(sigs_end && !*blk_requests_end)
+		if((*end_flags)&END_SIGS && !((*end_flags)&END_BLK_REQUESTS))
 		{
 			iobuf_from_str(wbuf,
 				CMD_GEN, (char *)"blk_requests_end");
-			*blk_requests_end=1;
+			(*end_flags)|=END_BLK_REQUESTS;
 		}
 		return 0;
 	}
 
 	if(sb->protocol2->bsighead->got==BLK_INCOMING)
-	{
-//		if(sigs_end
-//		  && deduplicate(sb->protocol2->bsighead, dpth, confs, wrap_up))
-//			return -1;
 		return 0;
-	}
 
 	if(sb->protocol2->bsighead->got==BLK_NOT_GOT)
 	{
-		encode_req(sb->protocol2->bsighead, req);
+		base64_from_uint64(sb->protocol2->bsighead->index, req);
 		iobuf_from_str(wbuf, CMD_DATA_REQ, req);
 		sb->protocol2->bsighead->requested=1;
 	}
@@ -357,16 +447,16 @@ static int get_wbuf_from_sigs(struct iobuf *wbuf, struct slist *slist, struct bl
 	return 0;
 }
 
-static void get_wbuf_from_files(struct iobuf *wbuf, struct slist *slist, struct manio *p1manio, int *requests_end)
+static void get_wbuf_from_files(struct iobuf *wbuf, struct slist *slist,
+	struct manios *manios, uint8_t *end_flags, uint64_t *file_no)
 {
-	static uint64_t file_no=1;
 	struct sbuf *sb=slist->last_requested;
 	if(!sb)
 	{
-		if(manio_closed(p1manio) && !*requests_end)
+		if(!manios->phase1 && !((*end_flags)&END_REQUESTS))
 		{
 			iobuf_from_str(wbuf, CMD_GEN, (char *)"requests_end");
-			*requests_end=1;
+			(*end_flags)|=END_REQUESTS;
 		}
 		return;
 	}
@@ -380,79 +470,115 @@ static void get_wbuf_from_files(struct iobuf *wbuf, struct slist *slist, struct 
 	// Only need to request the path at this stage.
 	iobuf_copy(wbuf, &sb->path);
 	sb->flags |= SBUF_SENT_PATH;
-	sb->protocol2->index=file_no++;
-}
-
-static void sanity_before_sbuf_free(struct slist *slist, struct sbuf *sb)
-{
-	// It is possible for the markers to drop behind.
-	if(slist->tail==sb) slist->tail=sb->next;
-	if(slist->last_requested==sb) slist->last_requested=sb->next;
-	if(slist->add_sigs_here==sb) slist->add_sigs_here=sb->next;
-	if(slist->blks_to_request==sb) slist->blks_to_request=sb->next;
+	sb->protocol2->index=(*file_no)++;
 }
 
 static void get_wbuf_from_index(struct iobuf *wbuf, uint64_t index)
 {
 	static char *p;
 	static char tmp[32];
-//printf("%s: %d\n", __func__, index);
 	p=tmp;
 	p+=to_base64(index, tmp);
 	*p='\0';
 	iobuf_from_str(wbuf, CMD_WRAP_UP, tmp);
 }
 
-static int sbuf_needs_data(struct sbuf *sb, struct asfd *asfd,
-        struct asfd *chfd, struct manio *chmanio,
-        struct slist *slist, struct blist *blist,
-        struct dpth *dpth, int backup_end, struct conf **confs)
+static int write_endfile(struct sbuf *sb, struct manios *manios)
 {
+	struct iobuf endfile;
+
+	if(sb->flags & SBUF_END_WRITTEN_TO_MANIFEST)
+		return 0;
+	if(!iobuf_is_filedata(&sb->path))
+		return 0;
+
+	sb->flags |= SBUF_END_WRITTEN_TO_MANIFEST;
+	// FIX THIS: Should give a proper length and md5sum.
+	iobuf_from_str(&endfile, CMD_END_FILE, (char *)"0:0");
+	return iobuf_send_msg_fzp(&endfile, manios->changed->fzp);
+}
+
+static void blist_adjust_head(struct blist *blist, struct sbuf *sb)
+{
+	struct blk *b;
+	while(blist->head!=sb->protocol2->bstart)
+	{
+		b=blist->head->next;
+		if(blist->head==blist->blk_from_champ_chooser)
+			blist->blk_from_champ_chooser=b;
+		blk_free(&blist->head);
+		blist->head=b;
+	}
+	if(!blist->head)
+		blist->tail=NULL;
+}
+
+static int sbuf_needs_data(struct sbuf *sb, struct asfd *asfd,
+	struct asfd *chfd, struct manios *manios,
+	struct slist *slist, int end_flags)
+{
+	int ret=-1;
 	struct blk *blk;
-	static struct iobuf *wbuf=NULL;
+	static struct iobuf wbuf;
+	struct blist *blist=slist->blist;
+	static int unrequested=0;
 
 	if(!(sb->flags & SBUF_HEADER_WRITTEN_TO_MANIFEST))
 	{
-		if(manio_write_sbuf(chmanio, sb)) goto error;
+		if(manio_write_sbuf(manios->changed, sb)) goto end;
 		sb->flags |= SBUF_HEADER_WRITTEN_TO_MANIFEST;
 	}
 
-        if(!wbuf && !(wbuf=iobuf_alloc())) return -1;
-
 	while((blk=sb->protocol2->bstart)
 		&& blk->got==BLK_GOT
-		&& (blk->next || backup_end))
+		&& (blk->next || end_flags&END_BACKUP))
 	{
 		if(blk->got_save_path
 		  && !blk_is_zero_length(blk))
 		{
-			if(manio_write_sig_and_path(chmanio, blk)) goto error;
-			if(chmanio->sig_count==0)
+			if(breaking && breakcount--==0)
+			{
+				breakpoint(breaking, __func__);
+				goto end;
+			}
+			if(manio_write_sig_and_path(manios->changed, blk))
+				goto end;
+			if(manios->changed->sig_count==0)
 			{
 				// Have finished a manifest file. Want to start
 				// using it as a dedup candidate now.
-				iobuf_from_str(wbuf, CMD_MANIFEST,
-					chmanio->offset.fpath);
-				if(chfd->write(chfd, wbuf)) goto error;
+				if(manio_component_to_chfd(chfd,
+					manios->changed->offset->ppath))
+						goto end;
 
-				if(!blk->requested)
-				{
-					// Also let the client know, so that it
-					// can free memory if there was a long
-					// consecutive number of unrequested
-					// blocks.
-					get_wbuf_from_index(wbuf, blk->index);
-					if(asfd->write(asfd, wbuf)) goto error;
-				}
+				// The champ chooser has the candidate. Now,
+				// empty our local hash table.
+				hash_delete_all();
+				// Add the most recent block, so identical
+				// adjacent blocks are deduplicated well.
+				if(hash_load_blk(blk))
+					goto end;
 			}
+		}
+
+		if(!blk->requested)
+			unrequested++;
+
+		if(unrequested>BLKS_MAX_UNREQUESTED)
+		{
+			unrequested=0;
+			// Let the client know that it can free memory if there
+			// was a long consecutive number of unrequested blocks.
+			get_wbuf_from_index(&wbuf, blk->index);
+			if(asfd->write(asfd, &wbuf))
+				goto end;
 		}
 
 		if(blk==sb->protocol2->bend)
 		{
-			slist->head=sb->next;
-			if(!(blist->head=sb->protocol2->bstart)) blist->tail=NULL;
-			sanity_before_sbuf_free(slist, sb);
-			sbuf_free(&sb);
+			blist_adjust_head(blist, sb);
+			if(write_endfile(sb, manios)) return -1;
+			slist_advance(slist);
 			return 1;
 		}
 
@@ -461,21 +587,21 @@ static int sbuf_needs_data(struct sbuf *sb, struct asfd *asfd,
 		sb->protocol2->bstart=blk->next;
 		if(blk==blist->blk_from_champ_chooser)
 			blist->blk_from_champ_chooser=blk->next;
-
-		//printf("freeing blk %d\n", blk->index);
-		blk_free(&blk);
 	}
-
-	if(!(blist->head=sb->protocol2->bstart)) blist->tail=NULL;
-	return 0;
-error:
-	return -1;
+	if(!blk && sb && !sb->protocol2->bend && (end_flags&END_BACKUP))
+	{
+		// Write endfile for the very last file.
+		if(write_endfile(sb, manios)) return -1;
+	}
+	ret=0;
+end:
+	blist_adjust_head(blist, sb);
+	return ret;
 }
 
 static int write_to_changed_file(struct asfd *asfd,
-	struct asfd *chfd, struct manio *chmanio,
-	struct slist *slist, struct blist *blist,
-	struct dpth *dpth, int backup_end, struct conf **confs)
+	struct asfd *chfd, struct manios *manios,
+	struct slist *slist, int end_flags)
 {
 	struct sbuf *sb;
 	if(!slist) return 0;
@@ -484,8 +610,8 @@ static int write_to_changed_file(struct asfd *asfd,
 	{
 		if(sb->flags & SBUF_NEED_DATA)
 		{
-			switch(sbuf_needs_data(sb, asfd, chfd, chmanio, slist,
-				blist, dpth, backup_end, confs))
+			switch(sbuf_needs_data(sb, asfd, chfd, manios, slist,
+				end_flags))
 			{
 				case 0: return 0;
 				case 1: continue;
@@ -496,63 +622,51 @@ static int write_to_changed_file(struct asfd *asfd,
 		else
 		{
 			// No change, can go straight in.
-			if(manio_write_sbuf(chmanio, sb)) return -1;
+			if(manio_write_sbuf(manios->changed, sb)) return -1;
+			if(write_endfile(sb, manios)) return -1;
 
 			// Move along.
-			slist->head=sb->next;
-
-			sanity_before_sbuf_free(slist, sb);
-			sbuf_free(&sb);
+			slist_advance(slist);
 		}
 	}
 	return 0;
 }
 
-/*
-static void dump_slist(struct slist *slist, const char *msg)
-{
-	struct sbuf *sb;
-	printf("%s\n", msg);
-	for(sb=slist->head; sb; sb=sb->next)
-		printf("%s\n", sb->path);
-}
-*/
-
-static int maybe_add_from_scan(struct asfd *asfd,
-	struct manio *p1manio, struct manio *cmanio,
-	struct manio *unmanio, struct slist *slist, struct conf **confs)
+static int maybe_add_from_scan(struct manios *manios,
+	struct slist *slist, struct asfd *chfd, struct sbuf **csb,
+	struct cntr *cntr)
 {
 	int ret=-1;
-	static int ars;
-	static int ec=0;
 	struct sbuf *snew=NULL;
 
 	while(1)
 	{
-		if(manio_closed(p1manio)) return 0;
+		sbuf_free(&snew);
+		if(!manios->phase1) return 0;
 		// Limit the amount loaded into memory at any one time.
-		if(slist && slist->head)
-		{
-			if(slist->head->protocol2->index
-			  - slist->tail->protocol2->index>4096)
-				return 0;
-		}
-		if(!(snew=sbuf_alloc(confs))) goto end;
+		if(slist->count>SLIST_MAX_IN_MEM)
+			return 0;
+		if(!(snew=sbuf_alloc(PROTO_2))) goto end;
 
-		if((ars=manio_sbuf_fill_phase1(p1manio,
-			asfd, snew, NULL, NULL, confs))<0) goto end;
-		else if(ars>0) return 0; // Finished.
-
-		if(!(ec=entry_changed(asfd, snew, cmanio, unmanio, confs)))
+		switch(manio_read(manios->phase1, snew))
 		{
-			// No change, no need to add to slist.
-			continue;
+			case 0: break;
+			case 1: manio_close(&manios->phase1);
+				ret=0; // Finished.
+			default: goto end;
 		}
-		else if(ec<0) goto end; // Error.
+
+		switch(entry_changed(snew, manios, chfd, csb, cntr))
+		{
+			case 0: continue; // No change.
+			case 1: break;
+			default: goto end; // Error.
+		}
 
 		if(data_needed(snew)) snew->flags|=SBUF_NEED_DATA;
 
 		slist_add_sbuf(slist, snew);
+		snew=NULL;
 	}
 	return 0;
 end:
@@ -561,51 +675,40 @@ end:
 }
 
 static int append_for_champ_chooser(struct asfd *chfd,
-	struct blist *blist, int sigs_end)
+	struct blist *blist, int end_flags)
 {
 	static int finished_sending=0;
-	static struct iobuf *wbuf=NULL;
-	if(!wbuf)
-	{
-		if(!(wbuf=iobuf_alloc())
-		  || !(wbuf->buf=(char *)malloc_w(CHECKSUM_LEN, __func__)))
-			return -1;
-		wbuf->cmd=CMD_SIG;
-	}
+	static struct iobuf wbuf;
+	static struct blk *blk=NULL;
+
 	while(blist->blk_for_champ_chooser)
 	{
+		blk=blist->blk_for_champ_chooser;
 		// If we send too many blocks to the champ chooser at once,
 		// it can go faster than we can send paths to completed
 		// manifests to it. This means that deduplication efficiency
 		// is reduced (although speed may be faster).
 		// So limit the sending.
-		if(blist->blk_for_champ_chooser->index
+		if(blk->index
 		  - blist->head->index > MANIFEST_SIG_MAX)
 			return 0;
 
-		// FIX THIS: Maybe convert depending on endian-ness.
-		memcpy(wbuf->buf, 
-			&blist->blk_for_champ_chooser->fingerprint,
-			FINGERPRINT_LEN);
-		memcpy(wbuf->buf+FINGERPRINT_LEN,
-			blist->blk_for_champ_chooser->md5sum,
-			MD5_DIGEST_LENGTH);
-		wbuf->len=CHECKSUM_LEN;
+		blk_to_iobuf_sig(blk, &wbuf);
 
-		switch(chfd->append_all_to_write_buffer(chfd, wbuf))
+		switch(chfd->append_all_to_write_buffer(chfd, &wbuf))
 		{
 			case APPEND_OK: break;
 			case APPEND_BLOCKED:
 				return 0; // Try again later.
 			default: return -1;
 		}
-		blist->blk_for_champ_chooser=blist->blk_for_champ_chooser->next;
+		blist->blk_for_champ_chooser=blk->next;
 	}
-	if(sigs_end && !finished_sending && !blist->blk_for_champ_chooser)
+	if(end_flags&END_SIGS
+	  && !finished_sending && !blist->blk_for_champ_chooser)
 	{
-		wbuf->cmd=CMD_GEN;
-		wbuf->len=snprintf(wbuf->buf, CHECKSUM_LEN, "%s", "sigs_end");
-		switch(chfd->append_all_to_write_buffer(chfd, wbuf))
+		iobuf_from_str(&wbuf, CMD_GEN, (char *)"sigs_end");
+		switch(chfd->append_all_to_write_buffer(chfd, &wbuf))
 		{
 			case APPEND_OK: break;
 			case APPEND_BLOCKED:
@@ -629,9 +732,37 @@ static int mark_not_got(struct blk *blk, struct dpth *dpth)
 	if(!(path=dpth_protocol2_mk(dpth))) return -1;
 
 	// FIX THIS: make dpth give us the path in a uint8 array.
-	savepathstr_to_bytes(path, blk->savepath);
+	blk->savepath=savepathstr_with_sig_to_uint64(path);
 	blk->got_save_path=1;
-	if(dpth_protocol2_incr_sig(dpth)) return -1;
+	// Load it into our local hash table.
+	if(hash_load_blk(blk))
+		return -1;
+	if(dpth_protocol2_incr_sig(dpth))
+		return -1;
+	return 0;
+}
+
+static struct hash_strong *in_local_hash(struct blk *blk)
+{
+	static struct hash_weak *hash_weak;
+
+	if(!(hash_weak=hash_weak_find(blk->fingerprint)))
+		return NULL;
+	return hash_strong_find(hash_weak, blk->md5sum);
+}
+
+static int simple_deduplicate_blk(struct blk *blk)
+{
+	static struct hash_strong *hash_strong;
+	if(blk->got!=BLK_INCOMING)
+		return 0;
+	if((hash_strong=in_local_hash(blk)))
+	{
+		blk->savepath=hash_strong->savepath;
+		blk->got_save_path=1;
+		blk->got=BLK_GOT;
+		return 1;
+	}
 	return 0;
 }
 
@@ -643,13 +774,20 @@ static int mark_up_to_index(struct blist *blist,
 	// Mark everything that was not got, up to the given index.
 	for(blk=blist->blk_from_champ_chooser;
 	  blk && blk->index!=index; blk=blk->next)
+	{
+		if(simple_deduplicate_blk(blk))
+			continue;
 		if(mark_not_got(blk, dpth))
 			return -1;
+	}
 	if(!blk)
 	{
-		logp("Could not find index from champ chooser: %lu\n", index);
+		logp("Could not find index from champ chooser: %" PRIu64 "\n",
+			index);
 		return -1;
 	}
+	simple_deduplicate_blk(blk);
+
 //logp("Found index from champ chooser: %lu\n", index);
 //printf("index from cc: %d\n", index);
 	blist->blk_from_champ_chooser=blk;
@@ -659,17 +797,13 @@ static int mark_up_to_index(struct blist *blist,
 static int deal_with_sig_from_chfd(struct iobuf *rbuf, struct blist *blist,
 	struct dpth *dpth)
 {
-	uint64_t fileno;
-	// FIX THIS: Consider endian-ness.
-	if(rbuf->len!=FILENO_LEN+SAVE_PATH_LEN)
-	{
-		logp("Tried to extract file number from buffer with wrong length: %u!=%u in %s\n", rbuf->len, FILENO_LEN+SAVE_PATH_LEN, __func__);
+	static struct blk b;
+	if(blk_set_from_iobuf_index_and_savepath(&b, rbuf))
 		return -1;
-	}
-	memcpy(&fileno, rbuf->buf, FILENO_LEN);
-	if(mark_up_to_index(blist, fileno, dpth)) return -1;
-	memcpy(blist->blk_from_champ_chooser->savepath,
-		rbuf->buf+FILENO_LEN, SAVE_PATH_LEN);
+
+	if(mark_up_to_index(blist, b.index, dpth))
+		return -1;
+	blist->blk_from_champ_chooser->savepath=b.savepath;
 	blist->blk_from_champ_chooser->got=BLK_GOT;
 	blist->blk_from_champ_chooser->got_save_path=1;
 	return 0;
@@ -678,23 +812,17 @@ static int deal_with_sig_from_chfd(struct iobuf *rbuf, struct blist *blist,
 static int deal_with_wrap_up_from_chfd(struct iobuf *rbuf, struct blist *blist,
 	struct dpth *dpth)
 {
-	uint64_t fileno;
-	// FIX THIS: Consider endian-ness.
-	if(rbuf->len!=FILENO_LEN)
-	{
-		logp("Tried to extract file number from buffer with wrong length: %u!=%u in %s\n", rbuf->len, FILENO_LEN, __func__);
+	static struct blk b;
+	if(blk_set_from_iobuf_wrap_up(&b, rbuf))
 		return -1;
-	}
-	memcpy(&fileno, rbuf->buf, FILENO_LEN);
-	if(mark_up_to_index(blist, fileno, dpth)) return -1;
-	if(mark_not_got(blist->blk_from_champ_chooser, dpth)) return -1;
 
+	if(mark_up_to_index(blist, b.index, dpth)) return -1;
+	if(mark_not_got(blist->blk_from_champ_chooser, dpth)) return -1;
 	return 0;
 }
 
-static int deal_with_read_from_chfd(struct asfd *asfd, struct asfd *chfd,
-	struct blist *blist, uint64_t *wrap_up, struct dpth *dpth,
-	struct conf **confs)
+static int deal_with_read_from_chfd(struct asfd *chfd,
+	struct blist *blist, struct dpth *dpth, struct cntr *cntr)
 {
 	int ret=-1;
 
@@ -706,7 +834,7 @@ static int deal_with_read_from_chfd(struct asfd *asfd, struct asfd *chfd,
 			// Get these for blks that the champ chooser has found.
 			if(deal_with_sig_from_chfd(chfd->rbuf, blist, dpth))
 				goto end;
-			cntr_add_same(get_cntr(confs[OPT_CNTR]), CMD_DATA);
+			cntr_add_same(cntr, CMD_DATA);
 			break;
 		case CMD_WRAP_UP:
 			if(deal_with_wrap_up_from_chfd(chfd->rbuf, blist, dpth))
@@ -722,117 +850,177 @@ end:
 	return ret;
 }
 
-static struct asfd *get_asfd_from_list_by_fdtype(struct async *as,
-	enum asfd_fdtype fdtype)
+static int check_for_missing_work_in_slist(struct slist *slist)
 {
-	struct asfd *a;
-	for(a=as->asfd; a; a=a->next)
-		if(a->fdtype==fdtype) return a;
-	return NULL;
+	struct sbuf *sb=NULL;
+
+	if(slist->blist->head)
+	{
+		logp("ERROR: finishing but still want block: %" PRIu64 "\n",
+			slist->blist->head->index);
+		return -1;
+	}
+
+	for(sb=slist->head; sb; sb=sb->next)
+	{
+		if(!(sb->flags & SBUF_END_WRITTEN_TO_MANIFEST))
+		{
+			logp("ERROR: finishing but still waiting for: %s\n",
+				iobuf_to_printable(&slist->head->path));
+			return -1;
+		}
+	}
+	return 0;
 }
 
-int backup_phase2_server_protocol2(struct async *as, struct sdirs *sdirs,
-	int resume, struct conf **confs)
+#ifndef UTEST
+static
+#endif
+int do_backup_phase2_server_protocol2(struct async *as, struct asfd *chfd,
+	struct sdirs *sdirs, int resume, struct conf **confs)
 {
 	int ret=-1;
-	int sigs_end=0;
-	int backup_end=0;
-	int requests_end=0;
-	int blk_requests_end=0;
+	uint8_t end_flags=0;
 	struct slist *slist=NULL;
-	struct blist *blist=NULL;
-	struct iobuf *wbuf=NULL;
+	struct iobuf wbuf;
 	struct dpth *dpth=NULL;
-	struct manio *cmanio=NULL;	// current manifest
-	struct manio *p1manio=NULL;	// phase1 scan manifest
-	struct manio *chmanio=NULL;	// changed manifest
-	struct manio *unmanio=NULL;	// unchanged manifest
+	man_off_t *pos_phase1=NULL;
+	man_off_t *pos_current=NULL;
+	struct manios *manios=NULL;
 	// This is used to tell the client that a number of consecutive blocks
 	// have been found and can be freed.
-	uint64_t wrap_up=0;
-	struct asfd *asfd=as->asfd;
-	struct asfd *chfd;
-	chfd=get_asfd_from_list_by_fdtype(as, ASFD_FD_SERVER_TO_CHAMP_CHOOSER);
+	struct asfd *asfd=NULL;
+	struct cntr *cntr=NULL;
+	struct sbuf *csb=NULL;
+	uint64_t file_no=1;
+	int fail_on_warning=0;
+	struct cntr_ent *warn_ent=NULL;
+
+	if(!as)
+	{
+		logp("async not provided to %s()\n", __func__);
+		goto end;
+	}
+	if(!sdirs)
+	{
+		logp("sdirs not provided to %s()\n", __func__);
+		goto end;
+	}
+	if(!confs)
+	{
+		logp("confs not provided to %s()\n", __func__);
+		goto end;
+	}
+	asfd=as->asfd;
+	if(!asfd)
+	{
+		logp("asfd not provided to %s()\n", __func__);
+		goto end;
+	}
+	if(!chfd)
+	{
+		logp("chfd not provided to %s()\n", __func__);
+		goto end;
+	}
+	cntr=get_cntr(confs);
+	fail_on_warning=get_int(confs[OPT_FAIL_ON_WARNING]);
+	if(cntr)
+		warn_ent=cntr->ent[CMD_WARNING];
+
+	if(get_int(confs[OPT_BREAKPOINT])>=2000
+	  && get_int(confs[OPT_BREAKPOINT])<3000)
+	{
+		breaking=get_int(confs[OPT_BREAKPOINT]);
+		breakcount=breaking-2000;
+	}
+
+	blks_generate_init();
 
 	logp("Phase 2 begin (recv backup data)\n");
 
-	//if(champ_chooser_init(sdirs->data, confs)
-	if(!(cmanio=manio_alloc())
-	  || !(p1manio=manio_alloc())
-	  || !(chmanio=manio_alloc())
-	  || !(unmanio=manio_alloc())
-	  || manio_init_read(cmanio, sdirs->cmanifest)
-	  || manio_init_read(p1manio, sdirs->phase1data)
-	  || manio_init_write(chmanio, sdirs->changed)
-	  || manio_init_write(unmanio, sdirs->unchanged)
-	  || !(slist=slist_alloc())
-	  || !(blist=blist_alloc())
-	  || !(wbuf=iobuf_alloc())
-	  || !(dpth=dpth_alloc())
+	if(!(dpth=dpth_alloc())
 	  || dpth_protocol2_init(dpth,
-		sdirs->data, get_int(confs[OPT_MAX_STORAGE_SUBDIRS])))
+		sdirs->data,
+		get_string(confs[OPT_CNAME]),
+		sdirs->cfiles,
+		get_int(confs[OPT_MAX_STORAGE_SUBDIRS])))
 			goto end;
+	if(resume)
+	{
+		if(do_resume(&pos_phase1, &pos_current,
+			sdirs, dpth, confs))
+				goto end;
+		if(cntr_send_sdirs(asfd, sdirs, confs, CNTR_STATUS_BACKUP))
+			goto end;
+	}
 
-	// The phase1 manifest looks the same as a protocol1 one.
-	manio_set_protocol(p1manio, PROTO_1);
-
-	if(resume && do_resume(p1manio, sdirs, dpth, confs))
-                goto end;
-
-	if(manio_closed(p1manio)
-	  && manio_open_next_fpath(p1manio))
+	if(!(manios=manios_open_phase2(sdirs,
+		pos_phase1, pos_current, PROTO_2))
+	  || !(slist=slist_alloc())
+	  || !(csb=sbuf_alloc(PROTO_2)))
 		goto end;
 
-	while(!backup_end)
+	iobuf_free_content(asfd->rbuf);
+
+	memset(&wbuf, 0, sizeof(struct iobuf));
+	while(!(end_flags&END_BACKUP))
 	{
-		if(maybe_add_from_scan(asfd,
-			p1manio, cmanio, unmanio, slist, confs))
+		if(check_fail_on_warning(fail_on_warning, warn_ent))
+			goto end;
+
+		if(timed_operation(CNTR_STATUS_BACKUP,
+			csb && csb->path.buf?csb->path.buf:"",
+			asfd, sdirs, confs))
 				goto end;
 
-		if(!wbuf->len)
+		if(maybe_add_from_scan(manios, slist, chfd, &csb, cntr))
+			goto end;
+
+		if(!wbuf.len)
 		{
-			if(get_wbuf_from_sigs(wbuf, slist, blist,
-			  sigs_end, &blk_requests_end, dpth, confs))
+			if(get_wbuf_from_sigs(&wbuf, slist, &end_flags))
 				goto end;
-			if(!wbuf->len)
+			if(!wbuf.len)
 			{
-				get_wbuf_from_files(wbuf, slist,
-					p1manio, &requests_end);
+				get_wbuf_from_files(&wbuf, slist,
+					manios, &end_flags, &file_no);
 			}
 		}
 
-		if(wbuf->len
-		  && asfd->append_all_to_write_buffer(asfd, wbuf)==APPEND_ERROR)
+		if(wbuf.len
+		 && asfd->append_all_to_write_buffer(asfd, &wbuf)==APPEND_ERROR)
 			goto end;
 
-		append_for_champ_chooser(chfd, blist, sigs_end);
+		if(append_for_champ_chooser(chfd, slist->blist, end_flags))
+			goto end;
 
 		if(as->read_write(as))
 		{
-			logp("error in %s\n", __func__);
+			logp("error from as->read_write in %s\n", __func__);
 			goto end;
 		}
 
 		while(asfd->rbuf->buf)
 		{
-			if(deal_with_read(asfd->rbuf, slist, blist,
-				confs, &sigs_end, &backup_end, dpth))
+			if(deal_with_read(asfd->rbuf, slist, cntr,
+				&end_flags, dpth))
 					goto end;
-			// Get as much out of the
-			// readbuf as possible.
-			if(asfd->parse_readbuf(asfd)) goto end;
+			// Get as much out of the readbuf as possible.
+			if(asfd->parse_readbuf(asfd))
+				goto end;
 		}
 		while(chfd->rbuf->buf)
 		{
-			if(deal_with_read_from_chfd(asfd, chfd,
-				blist, &wrap_up, dpth, confs)) goto end;
-			// Get as much out of the
-			// readbuf as possible.
-			if(chfd->parse_readbuf(chfd)) goto end;
+			if(deal_with_read_from_chfd(chfd,
+				slist->blist, dpth, cntr))
+					goto end;
+			// Get as much out of the readbuf as possible.
+			if(chfd->parse_readbuf(chfd))
+				goto end;
 		}
 
-		if(write_to_changed_file(asfd, chfd, chmanio,
-			slist, blist, dpth, backup_end, confs))
+		if(write_to_changed_file(asfd, chfd, manios,
+			slist, end_flags))
 				goto end;
 	}
 
@@ -842,22 +1030,20 @@ int backup_phase2_server_protocol2(struct async *as, struct sdirs *sdirs,
 	// sb->protocol2->bend set.
 	if(slist->head && slist->head->next)
 	{
-		slist->head=slist->head->next;
-		if(write_to_changed_file(asfd, chfd, chmanio,
-			slist, blist, dpth, backup_end, confs))
+		struct sbuf *sb=NULL;
+		sb=slist->head;
+		slist->head=sb->next;
+		sbuf_free(&sb);
+		if(write_to_changed_file(asfd, chfd, manios,
+			slist, end_flags))
 				goto end;
 	}
 
-	if(manio_close(unmanio)
-	  || manio_close(chmanio))
+	if(manios_close(&manios))
 		goto end;
 
-	if(blist->head)
-	{
-		logp("ERROR: finishing but still want block: %lu\n",
-			blist->head->index);
+	if(check_for_missing_work_in_slist(slist))
 		goto end;
-	}
 
 	// Need to release the last left. There should be one at most.
 	if(dpth->head && dpth->head->next)
@@ -868,21 +1054,44 @@ int backup_phase2_server_protocol2(struct async *as, struct sdirs *sdirs,
 	}
 	if(dpth_release_all(dpth)) goto end;
 
+	if(check_fail_on_warning(fail_on_warning, warn_ent))
+		goto end;
+
 	ret=0;
 end:
+	if(ret)
+	{
+		if(slist && slist->head)
+			logp("  last tried file: %s\n",
+				iobuf_to_printable(&slist->head->path));
+	}
 	logp("End backup\n");
+	sbuf_free(&csb);
 	slist_free(&slist);
-	blist_free(&blist);
-	iobuf_free_content(asfd->rbuf);
-	iobuf_free_content(chfd->rbuf);
-	// Write buffer did not allocate 'buf'. 
-	if(wbuf) wbuf->buf=NULL;
-	iobuf_free(&wbuf);
-	dpth_release_all(dpth);
+	if(asfd) iobuf_free_content(asfd->rbuf);
+	if(chfd) iobuf_free_content(chfd->rbuf);
 	dpth_free(&dpth);
-	manio_free(&cmanio);
-	manio_free(&p1manio);
-	manio_free(&chmanio);
-	manio_free(&unmanio);
+	manios_close(&manios);
+	man_off_t_free(&pos_phase1);
+	man_off_t_free(&pos_current);
+	blks_generate_free();
+	hash_delete_all();
+	return ret;
+}
+
+int backup_phase2_server_protocol2(struct async *as, struct sdirs *sdirs,
+	int resume, struct conf **confs)
+{
+	int ret=-1;
+	struct asfd *chfd=NULL;
+	if(!(chfd=champ_chooser_connect(as, sdirs, confs, resume)))
+	{
+		logp("problem connecting to champ chooser\n");
+		goto end;
+	}
+	ret=do_backup_phase2_server_protocol2(as, chfd, sdirs, resume, confs);
+end:
+	if(chfd) as->asfd_remove(as, chfd);
+	asfd_free(&chfd);
 	return ret;
 }

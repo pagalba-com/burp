@@ -1,7 +1,8 @@
 #ifndef _SBUF_PROTOCOL2_H
 #define _SBUF_PROTOCOL2_H
 
-#include "include.h"
+#include "../burp.h"
+#include "../bfile.h"
 
 // Structure used only by protocol2 style functionality.
 struct protocol2
@@ -9,9 +10,8 @@ struct protocol2
 	ssize_t bytes_read;
 
 	uint64_t index;
-	uint32_t encryption;
 
-	BFILE bfd;
+	struct BFILE bfd;
 
 	struct blk *bstart;
 	struct blk *bend;
@@ -19,6 +19,6 @@ struct protocol2
 };
 
 extern struct protocol2 *sbuf_protocol2_alloc(void);
-extern void sbuf_protocol2_free_content(struct protocol2 *protocol2);
+extern void sbuf_protocol2_free_content();
 
 #endif

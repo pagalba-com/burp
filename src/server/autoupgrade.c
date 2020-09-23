@@ -1,9 +1,16 @@
-#include "include.h"
+#include "../burp.h"
+#include "../asfd.h"
+#include "../async.h"
 #include "../cmd.h"
+#include "../handy.h"
+#include "../log.h"
+#include "../prepend.h"
+#include "autoupgrade.h"
 
 // Return -1 on error or success, 0 to continue normally.
-int autoupgrade_server(struct async *as,
-	long ser_ver, long cli_ver, const char *os, struct conf **confs)
+int autoupgrade_server(struct asfd *asfd,
+	long ser_ver, long cli_ver, const char *os, struct cntr *cntr,
+	const char *autoupgrade_dir)
 {
 	int ret=-1;
 	char *path=NULL;
@@ -14,9 +21,6 @@ int autoupgrade_server(struct async *as,
 	char *script_path_specific=NULL;
 	struct stat stats;
 	struct stat statp;
-	struct asfd *asfd;
-	const char *autoupgrade_dir=get_string(confs[OPT_AUTOUPGRADE_DIR]);
-	asfd=as->asfd;
 
 	if(!autoupgrade_dir)
 	{
@@ -84,26 +88,26 @@ int autoupgrade_server(struct async *as,
 	if(asfd->write_str(asfd, CMD_GEN, "autoupgrade ok"))
 		goto end;
 
-	if(send_a_file(asfd, script_path, confs))
+	if(send_a_file(asfd, script_path, cntr))
 	{
 		logp("Problem sending %s\n", script_path);
 		goto end;
 	}
-	if(send_a_file(asfd, package_path, confs))
+	if(send_a_file(asfd, package_path, cntr))
 	{
 		logp("Problem sending %s\n", package_path);
 		goto end;
 	}
-	ret=0;
+	if(asfd_flush_asio(asfd))
+		goto end;
 	/* Clients currently exit after forking, so exit ourselves. */
 	logp("Expecting client to upgrade - now exiting\n");
-	asfd_free(&as->asfd);
 	exit(0);
 end:
-	if(path) free(path);
-	if(base_path) free(base_path);
-	if(script_path_specific) free(script_path_specific);
-	if(script_path_top) free(script_path_top);
-	if(package_path) free(package_path);
+	free_w(&path);
+	free_w(&base_path);
+	free_w(&script_path_specific);
+	free_w(&script_path_top);
+	free_w(&package_path);
 	return ret;
 }

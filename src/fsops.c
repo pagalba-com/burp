@@ -1,11 +1,18 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "fsops.h"
+#include "fzp.h"
+#include "log.h"
 #include "pathcmp.h"
+#include "prepend.h"
 
-#include <dirent.h>
+#ifndef HAVE_WIN32
+#include <sys/un.h>
+#endif
 
 uint32_t fs_name_max=0;
-uint32_t fs_path_max=0;
 uint32_t fs_full_path_max=0;
+static uint32_t fs_path_max=0;
 
 void close_fd(int *fd)
 {
@@ -15,43 +22,20 @@ void close_fd(int *fd)
 	*fd=-1;
 }
 
-int close_fp(FILE **fp)
-{
-	if(!*fp) return 0;
-	if(fclose(*fp))
-	{
-		logp("fclose failed: %s\n", strerror(errno));
-		*fp=NULL;
-		return -1;
-	}
-	*fp=NULL;
-	return 0;
-}
-
-int gzclose_fp(gzFile *fp)
-{
-	int e;
-	if(!*fp) return 0;
-	if((e=gzclose(*fp)))
-	{
-		const char *str=NULL;
-		if(e==Z_ERRNO) str=strerror(errno);
-		else str=gzerror(*fp, &e);
-		logp("gzclose failed: %d (%s)\n", e, str?:"");
-		*fp=NULL;
-		return -1;
-	}
-	*fp=NULL;
-	return 0;
-}
-
 int is_dir_lstat(const char *path)
 {
-        struct stat buf;
+	struct stat buf;
+	if(lstat(path, &buf))
+		return -1;
+	return S_ISDIR(buf.st_mode);
+}
 
-        if(lstat(path, &buf)) return 0;
-
-        return S_ISDIR(buf.st_mode);
+int is_reg_lstat(const char *path)
+{
+	struct stat buf;
+	if(lstat(path, &buf))
+		return -1;
+	return S_ISREG(buf.st_mode);
 }
 
 int is_dir(const char *path, struct dirent *d)
@@ -76,18 +60,15 @@ int mkpath(char **rpath, const char *limit)
 	int ret=-1;
 	char *cp=NULL;
 	struct stat buf;
-#ifdef HAVE_WIN32
-	int windows_stupidity=0;
-#endif
+
 	if((cp=strrchr(*rpath, '/')))
 	{
 		*cp='\0';
 #ifdef HAVE_WIN32
 		if(strlen(*rpath)==2 && (*rpath)[1]==':')
 		{
-			(*rpath)[1]='\0';
-			windows_stupidity++;
-		}
+			// We are down to the drive letter, which is OK.
+		} else
 #endif
 		if(!**rpath)
 		{
@@ -144,16 +125,12 @@ int mkpath(char **rpath, const char *limit)
 
 	ret=0;
 end:
-#ifdef HAVE_WIN32
-	if(windows_stupidity) (*rpath)[1]=':';
-#endif
 	if(cp) *cp='/';
 	return ret;
 }
 
 int build_path(const char *datadir, const char *fname, char **rpath, const char *limit)
 {
-	//logp("build path: '%s/%s'\n", datadir, fname);
 	if(!(*rpath=prepend_s(datadir, fname))) return -1;
 	if(mkpath(rpath, limit))
 	{
@@ -178,11 +155,11 @@ int do_rename(const char *oldpath, const char *newpath)
 
 int build_path_w(const char *path)
 {
+	int ret;
 	char *rpath=NULL;
-	if(build_path(path, "", &rpath, NULL))
-		return -1;
+	ret=build_path(path, "", &rpath, NULL);
 	free_w(&rpath);
-	return 0;
+	return ret;
 }
 
 #define RECDEL_ERROR			-1
@@ -197,19 +174,21 @@ static void get_max(int32_t *max, int32_t default_max)
 	(*max)++;
 }
 
-static int do_recursive_delete(const char *d, const char *file, uint8_t delfiles, int32_t name_max)
+static int do_recursive_delete(const char *d, const char *file,
+	uint8_t delfiles, int32_t name_max,
+	uint8_t ignore_not_empty_errors)
 {
 	int ret=RECDEL_ERROR;
 	DIR *dirp=NULL;
 	struct dirent *entry=NULL;
-	struct dirent *result;
 	struct stat statp;
 	char *directory=NULL;
 	char *fullpath=NULL;
 
 	if(!file)
 	{
-		if(!(directory=prepend_s(d, ""))) goto end;
+		if(!(directory=prepend_s(d, "")))
+			goto end;
 	}
 	else if(!(directory=prepend_s(d, file)))
 	{
@@ -226,36 +205,39 @@ static int do_recursive_delete(const char *d, const char *file, uint8_t delfiles
 
 	if(!(dirp=opendir(directory)))
 	{
-		logp("opendir %s: %s\n", directory, strerror(errno));
+		logp("opendir %s in %s: %s\n",
+			directory, __func__, strerror(errno));
 		goto end;
 	}
 
-	if(!(entry=(struct dirent *)
-		malloc_w(sizeof(struct dirent)+name_max+100, __func__)))
-			goto end;
-
 	while(1)
 	{
-		if(readdir_r(dirp, entry, &result) || !result)
+		errno=0;
+		if(!(entry=readdir(dirp)))
 		{
+			if(errno)
+			{
+				logp("error in readdir in %s: %s\n",
+					__func__, strerror(errno));
+				goto end;
+			}
 			// Got to the end of the directory.
 			ret=RECDEL_OK;
 			break;
 		}
 
-		if(entry->d_ino==0
-		  || !strcmp(entry->d_name, ".")
-		  || !strcmp(entry->d_name, ".."))
+		if(!filter_dot(entry))
 			continue;
 		free_w(&fullpath);
 		if(!(fullpath=prepend_s(directory, entry->d_name)))
 			goto end;
 
-		if(is_dir(fullpath, entry))
+		if(is_dir(fullpath, entry)>0)
 		{
 			int r;
 			if((r=do_recursive_delete(directory, entry->d_name,
-				delfiles, name_max))==RECDEL_ERROR)
+				delfiles, name_max,
+				ignore_not_empty_errors))==RECDEL_ERROR)
 					goto end;
 			// do not overwrite ret with OK if it previously
 			// had ENTRIES_REMAINING
@@ -278,22 +260,51 @@ static int do_recursive_delete(const char *d, const char *file, uint8_t delfiles
 
 	if(ret==RECDEL_OK && rmdir(directory))
 	{
-		logp("rmdir %s: %s\n", directory, strerror(errno));
-		ret=RECDEL_ERROR;
+		if(errno!=ENOTEMPTY || !ignore_not_empty_errors)
+		{
+			logp("rmdir %s: %s\n", directory, strerror(errno));
+			ret=RECDEL_ERROR;
+		}
 	}
 end:
 	if(dirp) closedir(dirp);
 	free_w(&fullpath);
 	free_w(&directory);
-	free_v((void **)&entry);
 	return ret;
 }
 
-int recursive_delete(const char *d, const char *file, uint8_t delfiles)
+static int do_recursive_delete_w(const char *path, uint8_t delfiles,
+	uint8_t ignore_not_empty_errors)
 {
 	int32_t name_max;
 	get_max(&name_max, _PC_NAME_MAX);
-	return do_recursive_delete(d, file, delfiles, name_max);
+	return do_recursive_delete(path,
+		NULL, delfiles, name_max, ignore_not_empty_errors);
+}
+
+int recursive_delete(const char *path)
+{
+	struct stat statp;
+	// We might have been given a file entry, instead of a directory.
+	if(!lstat(path, &statp) && !S_ISDIR(statp.st_mode))
+	{
+		if(unlink(path))
+		{
+			logp("unlink %s: %s\n", path, strerror(errno));
+			return RECDEL_ENTRIES_REMAINING;
+		}
+	}
+	return do_recursive_delete_w(path, 1, 0/*ignore_not_empty_errors*/);
+}
+
+int recursive_delete_dirs_only(const char *path)
+{
+	return do_recursive_delete_w(path, 0, 0/*ignore_not_empty_errors*/);
+}
+
+int recursive_delete_dirs_only_no_warnings(const char *path)
+{
+	return do_recursive_delete_w(path, 0, 1/*ignore_not_empty_errors*/);
 }
 
 int unlink_w(const char *path, const char *func)
@@ -314,44 +325,266 @@ static void init_max(const char *path,
 	if(*max<default_max) *max=default_max;
 }
 
-void init_fs_max(const char *path)
+int init_fs_max(const char *path)
 {
+	struct stat statp;
+	if(stat(path, &statp))
+	{
+		logp("Path %s does not exist in %s\n", path, __func__);
+		return -1;
+	}
 	// Get system path and filename maximum lengths.
 	init_max(path, &fs_path_max, _PC_PATH_MAX, 1024);
 	init_max(path, &fs_name_max, _PC_NAME_MAX, 255);
 	fs_full_path_max=fs_path_max+fs_name_max;
-}
-
-int looks_like_tmp_or_hidden_file(const char *filename)
-{
-	if(!filename) return 0;
-	if(filename[0]=='.' // Also avoids '.' and '..'.
-	  // I am told that emacs tmp files end with '~'.
-	  || filename[strlen(filename)-1]=='~')
-		return 1;
 	return 0;
 }
 
-FILE *open_file(const char *fname, const char *mode)
+static int do_get_entries_in_directory(DIR *directory, char ***nl,
+	int *count, int (*compar)(const void *, const void *))
 {
-	FILE *fp=NULL;
+	int allocated=0;
+	char **ntmp=NULL;
+	struct dirent *result=NULL;
 
-	if(!(fp=fopen(fname, mode)))
+	*count=0;
+
+	// This here is doing a funky kind of scandir/alphasort
+	// that can also run on Windows.
+	while(1)
 	{
-		logp("could not open %s: %s\n", fname, strerror(errno));
-		return NULL;
+		errno=0;
+		if(!(result=readdir(directory)))
+		{
+			if(errno)
+			{
+				logp("error in readdir: %s\n",
+					strerror(errno));
+				goto error;
+			}
+			break;
+		}
+
+		if(!filter_dot(result))
+			continue;
+
+		if(*count==allocated)
+		{
+			if(!allocated) allocated=10;
+			else allocated*=2;
+
+			if(!(ntmp=(char **)
+			  realloc_w(*nl, allocated*sizeof(**nl), __func__)))
+				goto error;
+			*nl=ntmp;
+		}
+		if(!((*nl)[(*count)++]=strdup_w(result->d_name, __func__)))
+			goto error;
 	}
-	return fp;
+	if(*nl && compar)
+		qsort(*nl, *count, sizeof(**nl), compar);
+	return 0;
+error:
+	if(*nl)
+	{
+		int i;
+		for(i=0; i<*count; i++)
+			free_w(&((*nl)[i]));
+		free_v((void **)nl);
+	}
+	return -1;
 }
 
-gzFile gzopen_file(const char *fname, const char *mode)
+static int entries_in_directory(const char *path, char ***nl,
+	int *count, int atime, int follow_symlinks,
+	int (*compar)(const char **, const char **))
 {
-	gzFile fp=NULL;
+	int ret=0;
+	DIR *directory=NULL;
 
-	if(!(fp=gzopen(fname, mode)))
+	if(!fs_name_max)
 	{
-		logp("could not open %s: %s\n", fname, strerror(errno));
-		return NULL;
+		// Get system path and filename maximum lengths.
+		// FIX THIS: maybe this should be done every time a file system
+		// is crossed?
+		if(init_fs_max(path)) return -1;
 	}
-	return fp;
+#if defined(O_DIRECTORY) && defined(O_NOATIME)
+	int dfd=-1;
+	if((dfd=open(path, O_RDONLY|O_DIRECTORY|(atime?0:O_NOATIME)
+#ifdef O_NOFOLLOW
+	  |(follow_symlinks?0:O_NOFOLLOW)
+#endif
+	  ))<0
+	  || !(directory=fdopendir(dfd)))
+#else
+// Mac OS X appears to have no O_NOATIME and no fdopendir(), so it should
+// end up using opendir() here.
+	if(!(directory=opendir(path)))
+#endif
+	{
+#if defined(O_DIRECTORY) && defined(O_NOATIME)
+		close_fd(&dfd);
+#endif
+		ret=1;
+	}
+	else
+	{
+		if(do_get_entries_in_directory(directory, nl, count,
+			(int (*)(const void *, const void *))compar))
+				ret=-1;
+	}
+	if(directory) closedir(directory);
+	return ret;
 }
+
+int filter_dot(const struct dirent *d)
+{
+	if(!d
+	  || !strcmp(d->d_name, ".")
+	  || !strcmp(d->d_name, ".."))
+		return 0;
+	return 1;
+}
+
+static int my_alphasort(const char **a, const char **b)
+{
+	return pathcmp(*a, *b);
+}
+
+int entries_in_directory_alphasort(const char *path, char ***nl,
+	int *count, int atime, int follow_symlinks)
+{
+	return entries_in_directory(path, nl, count, atime, follow_symlinks,
+		my_alphasort);
+}
+
+#define FULL_CHUNK      4096
+
+int files_equal(const char *opath, const char *npath, int compressed)
+{
+	int ret=0;
+	size_t ogot;
+	size_t ngot;
+	unsigned int i=0;
+	struct fzp *ofp=NULL;
+	struct fzp *nfp=NULL;
+	static char obuf[FULL_CHUNK];
+	static char nbuf[FULL_CHUNK];
+
+	if(compressed)
+	{
+		ofp=fzp_gzopen(opath, "rb");
+		nfp=fzp_gzopen(npath, "rb");
+	}
+	else
+	{
+		ofp=fzp_open(opath, "rb");
+		nfp=fzp_open(npath, "rb");
+	}
+
+	if(!ofp && !nfp)
+	{
+		ret=1;
+		goto end;
+	}
+	if(!ofp && nfp)
+		goto end;
+	if(!nfp && ofp)
+		goto end;
+
+	while(1)
+	{
+		ogot=fzp_read(ofp, obuf, FULL_CHUNK);
+		ngot=fzp_read(nfp, nbuf, FULL_CHUNK);
+		if(ogot!=ngot)
+			goto end;
+		for(i=0; i<ogot; i++)
+		{
+			if(obuf[i]!=nbuf[i])
+				goto end;
+		}
+		if(ogot<FULL_CHUNK)
+			break;
+	}
+	ret=1;
+end:
+	fzp_close(&ofp);
+	fzp_close(&nfp);
+	return ret;
+}
+
+#ifndef HAVE_WIN32
+int mksock(const char *path)
+{
+	int fd=-1;
+	int ret=-1;
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family=AF_UNIX;
+	strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
+	if((fd=socket(addr.sun_family, SOCK_STREAM, 0))<0
+	  || (bind(fd, (struct sockaddr *)&addr, sizeof(addr)))<0)
+		goto end;
+	ret=0;
+end:
+	if(fd>=0) close(fd);
+	return ret;
+}
+
+int is_lnk_lstat(const char *path)
+{
+	struct stat buf;
+	if(lstat(path, &buf))
+		return -1;
+	return S_ISLNK(buf.st_mode);
+}
+
+int is_lnk_valid(const char *path)
+{
+	struct stat buf;
+	if(stat(path, &buf))
+		return 0;
+	return 1;
+}
+
+int do_symlink(const char *oldpath, const char *newpath)
+{
+	if(!symlink(oldpath, newpath))
+		return 0;
+	logp("could not symlink '%s' to '%s': %s\n",
+		newpath, oldpath, strerror(errno));
+	return -1;
+}
+
+static int do_readlink(const char *path, char buf[], size_t buflen)
+{
+	ssize_t len;
+	if((len=readlink(path, buf, buflen-1))<0)
+		return -1;
+	buf[len]='\0';
+	return 0;
+}
+
+int readlink_w(const char *path, char buf[], size_t buflen)
+{
+	struct stat statp;
+	if(lstat(path, &statp))
+		return -1;
+	if(S_ISLNK(statp.st_mode))
+		return do_readlink(path, buf, buflen);
+	return -1;
+}
+
+int readlink_w_in_dir(const char *dir, const char *lnk,
+	char buf[], size_t buflen)
+{
+	char *tmp=NULL;
+	if(!(tmp=prepend_s(dir, lnk)))
+		return -1;
+	readlink_w(tmp, buf, buflen);
+	free_w(&tmp);
+	return 0;
+}
+
+#endif

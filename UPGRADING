@@ -1,5 +1,83 @@
 Things to watch out for when upgrading.
 
+2.3.12
+------
+On Windows, the '-x' option has been split into two different options - '-x'
+and '-X'.
+'-x': Restore without using the Windows VSS api, and attempt to strip out any
+      VSS data. This now works the same as the non-Windows client, and is a new
+      option for Windows.
+'-X': Restore without using the Windows VSS api, and do not attempt to strip
+      out any VSS data. This option only exists on Windows, and was the
+      behaviour that you previously got with '-x'. Use this if your backup
+      contains no VSS data.
+
+2.3.4
+-----
+Clients will now error out if using protocol 2 and 'encryption_password' is
+set, because that option is not supported in protocol 2.
+
+2.3.2
+-----
+The 'restore_client' option now takes into consideration the 'client_can_X'
+settings of the original client before considering the 'client_can_X' settings
+of the restore client. To get the previous behaviour, where only the restore
+client's settings were considered, use the new 'super_client' option instead
+of 'restore_client'.
+
+2.2.14
+------
+For security, the burp client will no longer let you restore over symlinks
+that point outside of your desired destination directory. Specifying a
+'-d <directory>' with your restore parameters is now mandatory. If you wish
+to restore everything back to the original locations, you can give '-d /',
+which will also work on Windows clients. If you wish server-initiated restores
+to restore to original locations, you should add '-d /' to the timed job
+in the client side.
+
+2.2.12
+------
+The command line option to print the version number, is now '-V'.
+It has made way for the new '-v' option, which means 'log to stdout'.
+
+2.2.10
+------
+The server side options 'address', 'port', 'status_address', and 'status_port'
+have been removed. They have been replaced with 'listen' and 'listen_status'.
+
+2.0.42
+------
+A bug in generating protocol 2 rabin checksums was fixed. Any protocol 2
+backups made up to this point should be discarded.
+
+2.0.32
+------
+'make install' will now install everything except configuration files.
+'make install-config' will install configuration files, and will overwrite
+without warning.
+'make install-all' will install everything.
+
+2.0.30
+------
+The configure system has been rewritten and vastly improved. One difference
+to watch out for is that 'make install' will now overwrite any existing burp
+config files and scripts without any warning.
+
+2.0.26
+------
+The dhfile generation command in burp_ca has changed from 'openssl dhparam -out
+"$dhfile" 1024' to 'openssl dhparam -dsaparam -out "$dhfile" 2048' in order
+to make ssl key exchange more secure.
+Your existing /etc/burp/dhfile.pem on your burp server will not be regenerated
+unless you delete /etc/burp/dhfile.pem by hand (rm -f /etc/burp/dhfile.pem)
+and restart the burp server.
+
+2.0.22
+------
+The protocol2 manifest formats have changed. You should therefore not mix
+earlier 2.0.x servers and clients with this version, and protocol2 backups from
+earlier versions will no longer work.
+
 2.0.20
 ------
 The option 'working_dir_recovery_method = use' has been removed.

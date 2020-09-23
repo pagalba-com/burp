@@ -1,0 +1,115 @@
+#  Written by Robert Nelson, June 2006
+#
+# Heavily modified by Graham Keeling.
+
+include ../Makefile.inc
+
+ifeq ($(WIN64),yes)
+  SSL_DLL := libssl-1_1-x64.dll
+  CRYPTO_DLL := libcrypto-1_1-x64.dll
+  LIBGCC_DLL := libgcc_s_seh-1.dll
+else
+  SSL_DLL := libssl-1_1.dll
+  CRYPTO_DLL := libcrypto-1_1.dll
+  LIBGCC_DLL := libgcc_s_sjlj-1.dll
+endif
+
+DEFINES := \
+	-DPACKAGE_NAME="$(PACKAGE_NAME)" \
+	-DPACKAGE_TARNAME="$(PACKAGE_TARNAME)" \
+	-DPACKAGE_VERSION="$(PACKAGE_VERSION)" \
+	-DPACKAGE_URL="$(PACKAGE_URL)" \
+	-DOUT_DIR=..\\release$(BITS) \
+	-DSRC_DIR=release$(BITS) \
+	-DBITS=$(BITS) \
+	-DSSL_DLL=$(SSL_DLL) \
+	-DCRYPTO_DLL=$(CRYPTO_DLL) \
+	-DLIBGCC_DLL=$(LIBGCC_DLL) \
+
+INSTALL_EXE := $(BUILDDIR)/release$(BITS)/$(PACKAGE_TARNAME)-win$(BITS)-installer-$(PACKAGE_VERSION).exe
+
+BURP_BINARIES := \
+	compat.dll \
+	$(PACKAGE_TARNAME).exe \
+	$(PACKAGE_TARNAME)_ca.bat \
+	$(PACKAGE_TARNAME).conf \
+	openssl.conf \
+	utest.exe
+
+DEPKGS_BINARIES := \
+	$(SSL_DLL) \
+	$(CRYPTO_DLL) \
+	zlib1.dll \
+	libpcre-1.dll \
+	libpcreposix-0.dll \
+	libyajl.dll \
+	libcheck-0.dll \
+	openssl.exe
+
+MINGW_LIBS := \
+	$(LIBGCC_DLL)
+
+##########################################################################
+
+# Targets
+
+.PHONY: all clean installer
+
+all:		$(INSTALL_EXE)
+
+installer:	$(INSTALL_EXE)
+
+clean:
+	@echo "Cleaning `pwd`"
+	$(CMD_ECHO)-rm -f $(INSTALL_EXE)
+	$(CMD_ECHO)-rm -rf release$(BITS)
+	$(CMD_ECHO)-rm -rf winburp.nsi
+	$(CMD_ECHO)-rm -rf ConfigPage1.ini
+	$(CMD_ECHO)-rm -rf ConfigPage2.ini
+	$(CMD_ECHO)-rm -rf ConfigPage3.ini
+	$(CMD_ECHO)-rm -rf ConfigPage4.ini
+	$(CMD_ECHO)-rm -rf DumpLog.nsh
+
+#
+# Rules
+#
+
+define Convert_Binary
+release$(BITS)/$$(notdir $(1)): $(1)
+	$$(call checkdir,$$@)
+	$(ECHO_CMD)cp -f $$^ $$@
+	$(ECHO_CMD)$(STAB2CV) $$@
+endef
+
+define Copy_Binary
+release$(BITS)/$$(notdir $(1)): $(1)
+	$$(call checkdir,$$@)
+	$(ECHO_CMD)cp -f $$^ $$@
+endef
+
+$(foreach file,$(addprefix $(DEPKGS)/bin/, $(DEPKGS_BINARIES)),$(eval $(call Convert_Binary,$(file))))
+
+$(foreach file,$(addprefix $(BINDIR)/, $(BURP_BINARIES)),$(eval $(call Convert_Binary,$(file))))
+
+$(foreach file,$(addprefix $(MINGW_DLLDIR)/, $(MINGW_LIBS)),$(eval $(call Copy_Binary,$(file))))
+
+winburp.nsi:
+	cp ../installer/winburp.nsi .
+	cp ../installer/ConfigPage1.ini .
+	cp ../installer/ConfigPage2.ini .
+	cp ../installer/ConfigPage3.ini .
+	cp ../installer/ConfigPage4.ini .
+	cp ../installer/DumpLog.nsh .
+	cp ../installer/ReplaceInFile.nsh .
+
+$(INSTALL_EXE): winburp.nsi $(addprefix release$(BITS)/,$(BURP_BINARIES) $(DEPKGS_BINARIES) $(MINGW_LIBS))
+	# Some hackery to make the final structure nicer.
+	rm -f bin
+	mkdir bin
+	mkdir CA
+	mv release$(BITS)/* bin
+	mv bin/*.conf release$(BITS)
+	mv bin release$(BITS)
+	NSISDIR=$(NSIS_DIR) $(NSIS_DIR)/makensis -V3 $(DEFINES) winburp.nsi
+
+include $(BUILDDIR)/Makefile.rules

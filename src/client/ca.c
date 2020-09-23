@@ -1,5 +1,16 @@
-#include "include.h"
+#include "../burp.h"
+#include "../asfd.h"
+#include "../async.h"
 #include "../cmd.h"
+#include "../conf.h"
+#include "../conffile.h"
+#include "../fsops.h"
+#include "../handy.h"
+#include "../iobuf.h"
+#include "../log.h"
+#include "../run_script.h"
+#include "cvss.h"
+#include "ca.h"
 
 static int generate_key_and_csr(struct asfd *asfd,
 	struct conf **confs, const char *csr_path)
@@ -14,6 +25,9 @@ static int generate_key_and_csr(struct asfd *asfd,
 	logp("Running '%s --key --keypath %s --request --requestpath %s --name %s'\n", ca_burp_ca, ssl_key, csr_path, cname);
 #ifdef HAVE_WIN32
 	win32_enable_backup_privileges();
+#else
+	// FIX THIS
+	signal(SIGPIPE, SIG_IGN);
 #endif
 	args[a++]=ca_burp_ca;
 	args[a++]="--key";
@@ -43,50 +57,61 @@ static int rewrite_client_conf(struct conf **confs)
 {
 	int ret=-1;
 	char p[32]="";
-	FILE *dp=NULL;
-	FILE *sp=NULL;
+	struct fzp *dp=NULL;
+	struct fzp *sp=NULL;
 	char *tmp=NULL;
 	char buf[4096]="";
 	const char *conffile=get_string(confs[OPT_CONFFILE]);
 	const char *ssl_peer_cn=get_string(confs[OPT_SSL_PEER_CN]);
 
-	logp("Rewriting conf file: %s\n", conffile);
 	snprintf(p, sizeof(p), ".%d", getpid());
 	if(!(tmp=prepend(conffile, p)))
 		goto end;
-	if(!(sp=open_file(conffile, "rb"))
-	  || !(dp=open_file(tmp, "wb")))
+	if(!(sp=fzp_open(conffile, "rb"))
+	  || !(dp=fzp_open(tmp, "wb")))
 		goto end;
 
-	while(fgets(buf, sizeof(buf), sp))
+	while(fzp_gets(sp, buf, sizeof(buf)))
 	{
 		char *copy=NULL;
 		char *field=NULL;
 		char *value=NULL;
+		int r=0;
 
 		if(!(copy=strdup_w(buf, __func__)))
 			goto end;
-		if(conf_get_pair(buf, &field, &value)
+		if(conf_get_pair(buf, &field, &value, &r)
 		  || !field || !value
 		  || strcmp(field, "ssl_peer_cn"))
 		{
-			fprintf(dp, "%s", copy);
+			fzp_printf(dp, "%s", copy);
 			free_w(&copy);
 			continue;
 		}
 		free_w(&copy);
 #ifdef HAVE_WIN32
-		fprintf(dp, "ssl_peer_cn = %s\r\n", ssl_peer_cn);
+		fzp_printf(dp, "ssl_peer_cn = %s\r\n", ssl_peer_cn);
 #else
-		fprintf(dp, "ssl_peer_cn = %s\n", ssl_peer_cn);
+		fzp_printf(dp, "ssl_peer_cn = %s\n", ssl_peer_cn);
 #endif
 	}
-	close_fp(&sp);
-	if(close_fp(&dp))
+	fzp_close(&sp);
+	if(fzp_close(&dp))
 	{
 		logp("error closing %s in %s\n", tmp, __func__);
 		goto end;
 	}
+
+	if(files_equal(conffile, tmp, 0/*compressed*/))
+	{
+		// No need to overwrite if there were no differences.
+		ret=0;
+		unlink(tmp);
+		goto end;
+	}
+
+	logp("Rewriting conf file: %s\n", conffile);
+
 	// Nasty race conditions going on here. However, the new config
 	// file will get left behind, so at worse you will have to move
 	// the new file into the correct place by hand. Or delete everything
@@ -99,11 +124,11 @@ static int rewrite_client_conf(struct conf **confs)
 
 	ret=0;
 end:
-	close_fp(&sp);
-	close_fp(&dp);
+	fzp_close(&sp);
+	fzp_close(&dp);
 	if(ret)
 	{
-		logp("Rewrite failed\n");
+		logp("%s with %s failed\n", __func__, conffile);
 		unlink(tmp);
 	}
 	free_w(&tmp);
@@ -111,7 +136,7 @@ end:
 }
 
 static enum asl_ret csr_client_func(struct asfd *asfd,
-        struct conf **confs, void *param)
+        struct conf **confs, __attribute__((unused)) void *param)
 {
 	if(strncmp_w(asfd->rbuf->buf, "csr ok:"))
 	{
@@ -140,6 +165,7 @@ int ca_client_setup(struct asfd *asfd, struct conf **confs)
 	const char *ssl_key=get_string(confs[OPT_SSL_KEY]);
 	const char *ssl_cert=get_string(confs[OPT_SSL_CERT]);
 	const char *ssl_cert_ca=get_string(confs[OPT_SSL_CERT_CA]);
+	struct cntr *cntr=get_cntr(confs);
 
 	// Do not continue if we have one of the following things not set.
 	if(  !ca_burp_ca
@@ -151,7 +177,7 @@ int ca_client_setup(struct asfd *asfd, struct conf **confs)
 	  || !lstat(ssl_key, &statp))
 	{
 		if(asfd->write_str(asfd, CMD_GEN, "nocsr")
-		  || asfd->read_expect(asfd, CMD_GEN, "nocsr ok"))
+		  || asfd_read_expect(asfd, CMD_GEN, "nocsr ok"))
 		{
 			logp("problem reading from server nocsr\n");
 			goto end;
@@ -174,7 +200,7 @@ int ca_client_setup(struct asfd *asfd, struct conf **confs)
 	if(generate_key_and_csr(asfd, confs, csr_path)) goto end_cleanup;
 
 	// Then copy the csr to the server.
-	if(send_a_file(asfd, csr_path, confs)) goto end_cleanup;
+	if(send_a_file(asfd, csr_path, cntr)) goto end_cleanup;
 
 	snprintf(ssl_cert_tmp, sizeof(ssl_cert_tmp), "%s.%d",
 		ssl_cert, getpid());
@@ -182,10 +208,10 @@ int ca_client_setup(struct asfd *asfd, struct conf **confs)
 		ssl_cert_ca, getpid());
 
 	// The server will then sign it, and give it back.
-	if(receive_a_file(asfd, ssl_cert_tmp, confs)) goto end_cleanup;
+	if(receive_a_file(asfd, ssl_cert_tmp, cntr)) goto end_cleanup;
 
 	// The server will also send the CA certificate.
-	if(receive_a_file(asfd, ssl_cert_ca_tmp, confs)) goto end_cleanup;
+	if(receive_a_file(asfd, ssl_cert_ca_tmp, cntr)) goto end_cleanup;
 
 	// Possible race condition - the rename can delete the destination
 	// and then fail. Worse case, the user has to rename them by hand.

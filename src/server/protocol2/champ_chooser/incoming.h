@@ -1,6 +1,5 @@
-#include <assert.h>
-
-#include "include.h"
+#ifndef _CHAMP_CHOOSER_INCOMING_H
+#define _CHAMP_CHOOSER_INCOMING_H
 
 struct incoming
 {
@@ -13,5 +12,8 @@ struct incoming
 };
 
 extern struct incoming *incoming_alloc(void);
+extern void incoming_free(struct incoming **in);
 extern int incoming_grow_maybe(struct incoming *in);
 extern void incoming_found_reset(struct incoming *in);
+
+#endif

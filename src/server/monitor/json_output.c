@@ -1,8 +1,22 @@
-#include "include.h"
+#include "../../burp.h"
+#include "../../alloc.h"
+#include "../../asfd.h"
+#include "../../async.h"
 #include "../../bu.h"
 #include "../../cmd.h"
+#include "../../cstat.h"
+#include "../../fzp.h"
+#include "../../handy.h"
+#include "../../iobuf.h"
+#include "../../prepend.h"
+#include "../../strlist.h"
+#include "../../yajl_gen_w.h"
+#include "../timestamp.h"
+#include "browse.h"
+#include "json_output.h"
 
 static int pretty_print=1;
+static long version_2_1_8=0;
 
 void json_set_pretty_print(int value)
 {
@@ -15,32 +29,38 @@ static int write_all(struct asfd *asfd)
 	size_t w=0;
 	size_t len=0;
 	const unsigned char *buf;
+	struct iobuf wbuf;
 
 	yajl_gen_get_buf(yajl, &buf, &len);
 	while(len)
 	{
 		w=len;
 		if(w>ASYNC_BUF_LEN) w=ASYNC_BUF_LEN;
-		if((ret=asfd->write_strn(asfd, CMD_GEN /* not used */,
-			(const char *)buf, w)))
-				break;
+		iobuf_set(&wbuf, CMD_GEN /* not used */, (char *)buf, w);
+		if((ret=asfd->write(asfd, &wbuf)))
+			break;
 		buf+=w;
 		len-=w;
 	}
 	if(!ret && !pretty_print)
-		ret=asfd->write_strn(asfd, CMD_GEN /* not used */, "\n", 1);
+	{
+		iobuf_set(&wbuf, CMD_GEN /* not used */, (char *)"\n", 1);
+		ret=asfd->write(asfd, &wbuf);
+	}
 
 	yajl_gen_clear(yajl);
 	return ret;
 }
 
-static int json_start(struct asfd *asfd)
+static int json_start(void)
 {
 	if(!yajl)
 	{
 		if(!(yajl=yajl_gen_alloc(NULL)))
 			return -1;
 		yajl_gen_config(yajl, yajl_gen_beautify, pretty_print);
+		if(!version_2_1_8)
+			version_2_1_8=version_to_long("2.1.8");
 	}
 	if(yajl_map_open_w()) return -1;
 	return 0;
@@ -72,19 +92,6 @@ end:
 	return ret;
 }
 
-static long timestamp_to_long(const char *buf)
-{
-	struct tm tm;
-	const char *b=NULL;
-	if(!(b=strchr(buf, ' '))) return 0;
-	memset(&tm, 0, sizeof(struct tm));
-	if(!strptime(b, " %Y-%m-%d %H:%M:%S", &tm)) return 0;
-	// Tell mktime to use the daylight savings time setting
-	// from the time zone of the system.
-	tm.tm_isdst=-1;
-	return (long)mktime(&tm);
-}
-
 static int flag_matches(struct bu *bu, uint16_t flag)
 {
 	return (bu && (bu->flags & flag));
@@ -96,10 +103,10 @@ static int flag_wrap_str(struct bu *bu, uint16_t flag, const char *field)
 	return yajl_gen_str_w(field);
 }
 
-static gzFile open_backup_log(struct bu *bu, const char *logfile)
+static struct fzp *open_backup_log(struct bu *bu, const char *logfile)
 {
-	gzFile zp=NULL;
 	char *path=NULL;
+	struct fzp *fzp=NULL;
 
 	char logfilereal[32]="";
 	if(!strcmp(logfile, "backup"))
@@ -117,15 +124,15 @@ static gzFile open_backup_log(struct bu *bu, const char *logfile)
 
 	if(!(path=prepend_s(bu->path, logfilereal)))
 		goto end;
-	if(!(zp=gzopen_file(path, "rb")))
+	if(!(fzp=fzp_gzopen(path, "rb")))
 	{
 		if(astrcat(&path, ".gz", __func__)
-		  || !(zp=gzopen_file(path, "rb")))
+		  || !(fzp=fzp_gzopen(path, "rb")))
 			goto end;
 	}
 end:
 	free_w(&path);
-	return zp;
+	return fzp;
 
 }
 
@@ -133,18 +140,18 @@ static int flag_wrap_str_zp(struct bu *bu, uint16_t flag, const char *field,
 	const char *logfile)
 {
 	int ret=-1;
-	gzFile zp=NULL;
+	struct fzp *fzp=NULL;
 	if(!flag_matches(bu, flag)
 	  || !logfile || strcmp(logfile, field))
 		return 0;
-	if(!(zp=open_backup_log(bu, logfile))) goto end;
+	if(!(fzp=open_backup_log(bu, logfile))) goto end;
 	if(yajl_gen_str_w(field)) goto end;
 	if(yajl_array_open_w()) goto end;
-	if(zp)
+	if(fzp)
 	{
 		char *cp=NULL;
 		char buf[1024]="";
-		while(gzgets(zp, buf, sizeof(buf)))
+		while(fzp_gets(fzp, buf, sizeof(buf)))
 		{
 			if((cp=strrchr(buf, '\n'))) *cp='\0';
 			if(yajl_gen_str_w(buf))
@@ -154,7 +161,7 @@ static int flag_wrap_str_zp(struct bu *bu, uint16_t flag, const char *field,
 	if(yajl_array_close_w()) goto end;
 	ret=0;
 end:
-	gzclose_fp(&zp);
+	fzp_close(&fzp);
 	return ret;
 }
 
@@ -163,8 +170,9 @@ static int do_counters(struct cntr *cntr)
 	static char type[2];
 	struct cntr_ent *e;
 
-	cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count
-		=(unsigned long long)time(NULL);
+#ifndef UTEST
+	cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count=(uint64_t)time(NULL);
+#endif
 	if(yajl_gen_str_w("counters")
 	  || yajl_array_open_w()) return -1;
 	for(e=cntr->list; e; e=e->next)
@@ -207,10 +215,9 @@ static int do_counters(struct cntr *cntr)
 	return 0;
 }
 
-static int json_send_backup(struct asfd *asfd, struct cstat *cstat,
-	struct bu *bu, int print_flags,
-	const char *logfile, const char *browse,
-	struct conf **confs)
+static int json_send_backup(struct cstat *cstat, struct bu *bu,
+	int print_flags, const char *logfile, const char *browse,
+	int use_cache, long peer_version)
 {
 	long long bno=0;
 	long long timestamp=0;
@@ -233,7 +240,11 @@ static int json_send_backup(struct asfd *asfd, struct cstat *cstat,
 		return -1;
 	if(bu->flags & (BU_WORKING|BU_FINISHING))
 	{
-		if(do_counters(cstat->cntr)) return -1;
+		if(peer_version<=version_2_1_8)
+		{
+			if(do_counters(cstat->cntrs))
+				return -1;
+		}
 	}
 	if(print_flags
 	  && (bu->flags & (BU_LOG_BACKUP|BU_LOG_RESTORE|BU_LOG_VERIFY
@@ -276,7 +287,7 @@ static int json_send_backup(struct asfd *asfd, struct cstat *cstat,
 			if(yajl_gen_str_pair_w("directory", browse)) return -1;
 			if(yajl_gen_str_w("entries")) return -1;
 			if(yajl_array_open_w()) return -1;
-			if(browse_manifest(asfd, cstat, bu, browse, confs))
+			if(browse_manifest(cstat, bu, browse, use_cache))
 				return -1;
 			if(yajl_array_close_w()) return -1;
 			if(yajl_map_close_w()) return -1;
@@ -289,18 +300,70 @@ static int json_send_backup(struct asfd *asfd, struct cstat *cstat,
 	return 0;
 }
 
-static int json_send_client_start(struct asfd *asfd, struct cstat *cstat)
+static int str_array(const char *field, struct cstat *cstat)
+{
+	struct strlist *s=NULL;
+	if(!cstat->labels) return 0;
+	if(yajl_gen_str_w(field)
+	  || yajl_array_open_w())
+		return -1;
+	for(s=cstat->labels; s; s=s->next)
+		if(yajl_gen_str_w(s->path))
+			return -1;
+	if(yajl_array_close_w())
+		return -1;
+	return 0;
+}
+
+static int do_children(struct cntr *cntrs)
+{
+	struct cntr *c;
+	if(yajl_gen_str_w("children")
+	  || yajl_array_open_w())
+		return -1;
+	for(c=cntrs; c; c=c->next)
+	{
+		if(yajl_map_open_w()
+		  || yajl_gen_int_pair_w("pid", c->pid)
+		  || yajl_gen_int_pair_w("backup", c->bno)
+		  || yajl_gen_str_pair_w("action", cntr_status_to_action_str(c))
+		  || yajl_gen_str_pair_w("phase", cntr_status_to_str(c)))
+			return -1;
+		if(do_counters(c))
+			return -1;
+		if(yajl_map_close_w())
+			return -1;
+	}
+	if(yajl_array_close_w())
+		return -1;
+	return 0;
+}
+
+static int json_send_client_start(struct cstat *cstat, long peer_version)
 {
 	const char *run_status=run_status_to_str(cstat);
 
 	if(yajl_map_open_w()
-	  || yajl_gen_str_pair_w("name", cstat->name)
-	  || yajl_gen_str_pair_w("run_status", run_status))
+	  || yajl_gen_str_pair_w("name", cstat->name))
 		return -1;
-	if(cstat->run_status==RUN_STATUS_RUNNING)
+	if(str_array("labels", cstat))
+		return -1;
+	if(yajl_gen_str_pair_w("run_status", run_status))
+		return -1;
+	if(yajl_gen_int_pair_w("protocol", cstat->protocol))
+		return -1;
+	if(peer_version>version_2_1_8)
 	{
+		if(cstat->cntrs
+		  && do_children(cstat->cntrs))
+			return -1;
+	}
+	else if(cstat->cntrs)
+	{
+		// Best effort.
 		if(yajl_gen_str_pair_w("phase",
-			cntr_status_to_str(cstat->cntr))) return -1;
+			cntr_status_to_str(cstat->cntrs)))
+				return -1;
 	}
 	if(yajl_gen_str_w("backups")
 	  || yajl_array_open_w())
@@ -308,7 +371,7 @@ static int json_send_client_start(struct asfd *asfd, struct cstat *cstat)
 	return 0;
 }
 
-static int json_send_client_end(struct asfd *asfd)
+static int json_send_client_end(void)
 {
 	if(yajl_array_close_w()
 	  || yajl_map_close_w())
@@ -316,66 +379,74 @@ static int json_send_client_end(struct asfd *asfd)
 	return 0;
 }
 
-static int json_send_client_backup(struct asfd *asfd,
-	struct cstat *cstat, struct bu *bu1, struct bu *bu2,
-	const char *logfile, const char *browse, struct conf **confs)
+static int json_send_client_backup(struct cstat *cstat, struct bu *bu1,
+	struct bu *bu2, const char *logfile, const char *browse, int use_cache,
+	long peer_version)
 {
 	int ret=-1;
-	if(json_send_client_start(asfd, cstat)) return -1;
-	if((ret=json_send_backup(asfd, cstat,
-		bu1, 1 /* print flags */, logfile, browse, confs)))
+	if(json_send_client_start(cstat, peer_version))
+		return -1;
+	if((ret=json_send_backup(cstat, bu1,
+		1 /* print flags */, logfile, browse, use_cache, peer_version)))
 			goto end;
-	if((ret=json_send_backup(asfd, cstat,
-		bu2, 1 /* print flags */, logfile, browse, confs)))
+	if((ret=json_send_backup(cstat, bu2,
+		1 /* print flags */, logfile, browse, use_cache, peer_version)))
 			goto end;
 end:
-	if(json_send_client_end(asfd)) ret=-1;
+	if(json_send_client_end()) ret=-1;
 	return ret;
 }
 
-static int json_send_client_backup_list(struct asfd *asfd, struct cstat *cstat)
+static int json_send_client_backup_list(struct cstat *cstat, int use_cache,
+	long peer_version)
 {
 	int ret=-1;
 	struct bu *bu;
-	if(json_send_client_start(asfd, cstat)) return -1;
+	if(json_send_client_start(cstat, peer_version))
+		return -1;
 	for(bu=cstat->bu; bu; bu=bu->prev)
 	{
-		if(json_send_backup(asfd, cstat,
-			bu, 1 /* print flags */, NULL, NULL, NULL)) goto end;
+		if(json_send_backup(cstat, bu,
+			1 /* print flags */, NULL, NULL,
+			use_cache, peer_version))
+				goto end;
 	}
 	ret=0;
 end:
-	if(json_send_client_end(asfd)) ret=-1;
+	if(json_send_client_end()) ret=-1;
 	return ret;
 }
 
 int json_send(struct asfd *asfd, struct cstat *clist, struct cstat *cstat,
 	struct bu *bu, const char *logfile, const char *browse,
-	struct conf **confs)
+	int use_cache, long peer_version)
 {
 	int ret=-1;
 	struct cstat *c;
 
-	if(json_start(asfd)
+	if(json_start()
 	  || json_clients())
 		goto end;
 
 	if(cstat && bu)
 	{
-		if(json_send_client_backup(asfd, cstat, bu, NULL,
-			logfile, browse, confs)) goto end;
+		if(json_send_client_backup(cstat, bu, NULL,
+			logfile, browse, use_cache, peer_version))
+				goto end;
 	}
 	else if(cstat)
 	{
-		if(json_send_client_backup_list(asfd, cstat)) goto end;
+		if(json_send_client_backup_list(cstat,
+			use_cache, peer_version))
+				goto end;
 	}
 	else for(c=clist; c; c=c->next)
 	{
 		if(!c->permitted) continue;
-		if(json_send_client_backup(asfd, c,
+		if(json_send_client_backup(c,
 			bu_find_current(c->bu),
 			bu_find_working_or_finishing(c->bu),
-			NULL, NULL, NULL))
+			NULL, NULL, use_cache, peer_version))
 				goto end;
 	}
 
@@ -386,10 +457,10 @@ end:
 	return ret;
 }
 
-int json_cntr_to_file(struct asfd *asfd, struct cntr *cntr)
+int json_cntr(struct asfd *asfd, struct cntr *cntr)
 {
 	int ret=-1;
-	if(json_start(asfd)
+	if(json_start()
 	  || do_counters(cntr))
 		goto end;
 	ret=0;
@@ -398,10 +469,11 @@ end:
 	return ret;
 }
 
-int json_from_statp(const char *path, struct stat *statp)
+int json_from_entry(const char *path, const char *link, struct stat *statp)
 {
 	return yajl_map_open_w()
 	  || yajl_gen_str_pair_w("name", path)
+	  || yajl_gen_str_pair_w("link", link? link:"")
 	  || yajl_gen_int_pair_w("dev", statp->st_dev)
 	  || yajl_gen_int_pair_w("ino", statp->st_ino)
 	  || yajl_gen_int_pair_w("mode", statp->st_mode)
@@ -418,10 +490,26 @@ int json_from_statp(const char *path, struct stat *statp)
 	  || yajl_map_close_w();
 }
 
+int json_send_msg(struct asfd *asfd, const char *field, const char *msg)
+{
+	int save;
+	int ret=0;
+
+	// Turn off pretty printing so that we get it on one line.
+	save=pretty_print;
+	pretty_print=0;
+
+	if(json_start()
+	  || yajl_gen_str_pair_w(field, msg)
+	  || json_end(asfd))
+		ret=-1;
+
+	pretty_print=save;
+
+	return ret;
+}
+
 int json_send_warn(struct asfd *asfd, const char *msg)
 {
-	if(json_start(asfd)
-	  || yajl_gen_str_pair_w("warning", msg)
-	  || json_end(asfd)) return -1;
-	return 0;
+	return json_send_msg(asfd, "warning", msg);
 }

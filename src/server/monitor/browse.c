@@ -1,10 +1,20 @@
-#include "include.h"
+#include "../../burp.h"
+#include "../../alloc.h"
 #include "../../bu.h"
 #include "../../cmd.h"
+#include "../../cstat.h"
+#include "../../prepend.h"
+#include "../../sbuf.h"
+#include "../list.h"
+#include "../manio.h"
+#include "cache.h"
+#include "json_output.h"
+#include "browse.h"
 
-static int do_browse_manifest(struct asfd *srfd,
+static int do_browse_manifest(
 	struct manio *manio, struct sbuf *sb, const char *browse)
 {
+	int browse_all = (browse && !strncmp(browse, "*", 1))? 1:0;
 	int ret=-1;
 	int ars=0;
 	//char ls[1024]="";
@@ -16,12 +26,15 @@ static int do_browse_manifest(struct asfd *srfd,
 	{
 		int r;
 		sbuf_free_content(sb);
-		if((ars=manio_sbuf_fill(manio, NULL, sb, NULL, NULL, NULL)))
+		if((ars=manio_read(manio, sb)))
 		{
 			if(ars<0) goto end;
 			// ars==1 means it ended ok.
 			break;
 		}
+
+		if(manio->protocol==PROTO_2 && sb->endfile.buf)
+			continue;
 
 		if(sb->path.cmd!=CMD_DIRECTORY
 		  && sb->path.cmd!=CMD_FILE
@@ -31,11 +44,13 @@ static int do_browse_manifest(struct asfd *srfd,
 		  && !cmd_is_link(sb->path.cmd))
 			continue;
 
-		if((r=check_browsedir(browse, sb, blen, &last_bd_match))<0)
-			goto end;
-		if(!r) continue;
+		if(!browse_all) {
+			if((r=check_browsedir(browse, sb, blen, &last_bd_match))<0)
+				goto end;
+			if(!r) continue;
+		}
 
-		if(json_from_statp(sb->path.buf, &sb->statp)) goto end;
+		if(json_from_entry(sb->path.buf, sb->link.buf, &sb->statp)) goto end;
 	}
 
 	ret=0;
@@ -44,8 +59,8 @@ end:
 	return ret;
 }
 
-static int browse_manifest_start(struct asfd *srfd, struct cstat *cstat,
-	struct bu *bu, const char *browse, struct conf **confs)
+static int browse_manifest_start(struct cstat *cstat,
+	struct bu *bu, const char *browse, int use_cache)
 {
 	int ret=-1;
 	char *manifest=NULL;
@@ -54,31 +69,35 @@ static int browse_manifest_start(struct asfd *srfd, struct cstat *cstat,
 
 	if(!(manifest=prepend_s(bu->path,
 		cstat->protocol==PROTO_1?"manifest.gz":"manifest"))
-	  || !(manio=manio_alloc())
-	  || manio_init_read(manio, manifest)
-	  || !(sb=sbuf_alloc_protocol(cstat->protocol)))
+	  || !(manio=manio_open(manifest, "rb", cstat->protocol))
+	  || !(sb=sbuf_alloc(cstat->protocol)))
 		goto end;
-	manio_set_protocol(manio, cstat->protocol);
-	if(get_int(confs[OPT_MONITOR_BROWSE_CACHE]))
-		ret=cache_load(srfd, manio, sb, cstat, bu);
+	if(use_cache)
+		ret=cache_load(manio, sb, cstat->name, bu->bno);
 	else
-		ret=do_browse_manifest(srfd, manio, sb, browse);
+		ret=do_browse_manifest(manio, sb, browse);
 end:
 	free_w(&manifest);
-	manio_free(&manio);
+	manio_close(&manio);
 	sbuf_free(&sb);
 	return ret;
 }
 
-int browse_manifest(struct asfd *srfd, struct cstat *cstat,
-	struct bu *bu, const char *browse, struct conf **confs)
+int browse_manifest(struct cstat *cstat,
+	struct bu *bu, const char *browse, int use_cache)
 {
-	if(get_int(confs[OPT_MONITOR_BROWSE_CACHE]))
+	/* if browse directory is *, we dump all file entries, with full path
+           we also avoid caching the whole list */
+	if (browse && !strncmp(browse, "*", 1))
 	{
-		if(!cache_loaded(cstat, bu)
-		  && browse_manifest_start(srfd, cstat, bu, browse, confs))
+        	use_cache = 0;
+	}
+	if(use_cache)
+	{
+		if(!cache_loaded(cstat->name, bu->bno)
+		  && browse_manifest_start(cstat, bu, browse, use_cache))
 			return -1;
 		return cache_lookup(browse);
 	}
-	return browse_manifest_start(srfd, cstat, bu, browse, confs);
+	return browse_manifest_start(cstat, bu, browse, use_cache);
 }

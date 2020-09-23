@@ -1,0 +1,49 @@
+{
+    "clients": [
+        {
+            "name": "cli1",
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+                {
+                    "number": 1,
+                    "timestamp": 31536000,
+                    "flags": [
+                        "deletable",
+                        "current"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "cli2",
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+                {
+                    "number": 1,
+                    "timestamp": 31536000,
+                    "flags": [
+                        "deletable",
+                        "current"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "cli3",
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+                {
+                    "number": 1,
+                    "timestamp": 31536000,
+                    "flags": [
+                        "deletable",
+                        "current"
+                    ]
+                }
+            ]
+        }
+    ]
+}

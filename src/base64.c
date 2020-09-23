@@ -109,6 +109,9 @@ int from_base64(int64_t *value, const char *where)
 	int i=0;
 	int neg=0;
 
+	if(where[i]==' ')
+		i++;
+
 	/* Check if it is negative */
 	if(where[i]=='-')
 	{
@@ -118,7 +121,7 @@ int from_base64(int64_t *value, const char *where)
 	/* Construct value */
 	for(char c=where[i]; c && c!=' '; c=where[++i])
 	{
-		if(!isalnum(c) && c!='+' && c!='/')
+		if(!isalnum((unsigned char)c) && c!='+' && c!='/')
 			continue;
 		val<<=6;
 		val+=base64_map[(uint8_t)c];
@@ -126,4 +129,18 @@ int from_base64(int64_t *value, const char *where)
 
 	*value=neg?-(int64_t)val:(int64_t)val;
 	return i;
+}
+
+uint64_t base64_to_uint64(const char *buf)
+{
+	int64_t val=0;
+	from_base64(&val, buf);
+	return (uint64_t)val;
+}
+
+void base64_from_uint64(uint64_t src, char *buf)
+{
+	char *p=buf;
+	p+=to_base64(src, p);
+	*p=0;
 }

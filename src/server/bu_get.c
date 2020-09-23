@@ -1,26 +1,16 @@
 #include "../burp.h"
-
 #include "../alloc.h"
 #include "../bu.h"
-#include "../cstat.h"
+#include "../fsops.h"
 #include "../log.h"
 #include "../prepend.h"
 #include "sdirs.h"
 #include "timestamp.h"
-
-#include <netdb.h>
-#include <dirent.h>
+#include "bu_get.h"
 
 static int get_link(const char *dir, const char *lnk, char real[], size_t r)
 {
-	ssize_t len=0;
-	char *tmp=NULL;
-	if(!(tmp=prepend_s(dir, lnk)))
-		return -1;
-	if((len=readlink(tmp, real, r-1))<0) len=0;
-	real[len]='\0';
-	free_w(&tmp);
-	return 0;
+	return readlink_w_in_dir(dir, lnk, real, r);
 }
 
 static void have_backup_file_name(struct bu *bu,
@@ -43,10 +33,11 @@ static void have_backup_file_name_w(struct bu *bu,
 }
 
 static int maybe_add_ent(const char *dir, const char *d_name,
-	struct bu **bu_list, uint16_t flags, struct cstat *include_working)
+	struct bu **bu_list, uint16_t flags,
+	int include_working)
 {
 	int ret=-1;
-	char buf[32]="";
+	char buf[38]="";
 	struct stat statp;
 	char *fullpath=NULL;
 	char *timestamp=NULL;
@@ -63,11 +54,15 @@ static int maybe_add_ent(const char *dir, const char *d_name,
 
 	if((!lstat(fullpath, &statp) && !S_ISDIR(statp.st_mode))
 	  || lstat(timestamp, &statp) || !S_ISREG(statp.st_mode)
-	  || timestamp_read(timestamp, buf, sizeof(buf)))
+	  || timestamp_read(timestamp, buf, sizeof(buf))
+	// A bit of paranoia to protect against loading directories moved
+	// aside as if they were real storage directories.
+	  || strncmp(buf, d_name, 8))
 	{
 		ret=0; // For resilience.
 		goto error;
 	}
+
 	free_w(&timestamp);
 
 	if(!(timestampstr=strdup_w(buf, __func__)))
@@ -87,27 +82,6 @@ static int maybe_add_ent(const char *dir, const char *d_name,
 		have_backup_file_name_w(bu, "log", BU_LOG_BACKUP);
 		have_backup_file_name_w(bu, "restorelog", BU_LOG_RESTORE);
 		have_backup_file_name_w(bu, "verifylog", BU_LOG_VERIFY);
-		// Hack to include option for live counters.
-		if(include_working->run_status==RUN_STATUS_RUNNING)
-		{
-			switch(include_working->cntr->cntr_status)
-			{
-				case CNTR_STATUS_SCANNING:
-				case CNTR_STATUS_BACKUP:
-				case CNTR_STATUS_MERGING:
-				case CNTR_STATUS_SHUFFLING:
-					bu->flags|=BU_STATS_BACKUP;
-					break;
-				case CNTR_STATUS_VERIFYING:
-					bu->flags|=BU_STATS_VERIFY;
-					break;
-				case CNTR_STATUS_RESTORING:
-					bu->flags|=BU_STATS_VERIFY;
-					break;
-				default:
-					break;
-			}
-		}
 		if(!(bu->flags & BU_STATS_BACKUP))
 		  have_backup_file_name(bu, "backup_stats", BU_STATS_BACKUP);
 		if(!(bu->flags & BU_STATS_RESTORE))
@@ -116,6 +90,7 @@ static int maybe_add_ent(const char *dir, const char *d_name,
 		  have_backup_file_name(bu, "verify_stats", BU_STATS_VERIFY);
 	}
 
+	free_w(&hlinkedpath);
 	return 0;
 error:
 	free_w(&basename);
@@ -126,7 +101,7 @@ error:
 	return ret;
 }
 
-static void setup_indices(struct bu *bu_list)
+static void setup_indices(struct bu *bu_list, enum protocol protocol)
 {
 	int i;
 	int tr=0;
@@ -139,9 +114,18 @@ static void setup_indices(struct bu *bu_list)
 		// Enumerate the position of each entry.
 		bu->index=i++;
 
-		// Backups that come after hardlinked backups are deletable.
-		if((bu->flags & BU_HARDLINKED) && bu->next)
-			bu->next->flags|=BU_DELETABLE;
+		if(protocol==PROTO_2)
+		{
+			// All PROTO_2 backups are deletable.
+			bu->flags|=BU_DELETABLE;
+		}
+		else
+		{
+			// Backups that come after hardlinked backups are
+			// deletable.
+			if((bu->flags & BU_HARDLINKED) && bu->next)
+				bu->next->flags|=BU_DELETABLE;
+		}
 
 		// Also set up reverse linkage.
 		bu->prev=last;
@@ -163,44 +147,46 @@ static void setup_indices(struct bu *bu_list)
 	}
 }
 
-static int rev_alphasort(const struct dirent **a, const struct dirent **b)
-{
-	static int s;
-	if((s=strcmp((*a)->d_name, (*b)->d_name))>0)
-		return -1;
-	if(s<0)
-		return 1;
-	return 0;
-}
-
 static int do_bu_get_list(struct sdirs *sdirs,
-	struct bu **bu_list, struct cstat *include_working)
+	struct bu **bu_list, int include_working)
 {
 	int i=0;
 	int n=0;
 	int ret=-1;
-	char realwork[32]="";
-	char realfinishing[32]="";
-	char realcurrent[32]="";
+	char realwork[38]="";
+	char realfinishing[38]="";
+	char realcurrent[38]="";
 	struct dirent **dp=NULL;
-	const char *dir=sdirs->client;
+	const char *dir=NULL;
 	uint16_t flags=0;
+	struct stat statp;
+
+	if(!sdirs)
+	{
+		logp("%s() called with NULL sdirs\n", __func__);
+		goto end;
+	}
+
+	dir=sdirs->client;
 
 	if(get_link(dir, "working", realwork, sizeof(realwork))
 	  || get_link(dir, "finishing", realfinishing, sizeof(realfinishing))
 	  || get_link(dir, "current", realcurrent, sizeof(realcurrent)))
 		goto end;
 
-	if((n=scandir(dir, &dp, NULL, rev_alphasort))<0)
+	if(!stat(dir, &statp)
+	  && (n=scandir(dir, &dp, filter_dot, alphasort))<0)
 	{
 		logp("scandir failed in %s: %s\n", __func__, strerror(errno));
 		goto end;
 	}
-	for(i=0; i<n; i++)
+	i=n;
+	while(i--)
 	{
-		if(!dp[i]->d_ino
-		  || !strcmp(dp[i]->d_name, ".")
-		  || !strcmp(dp[i]->d_name, ".."))
+		// Each storage directory starts with a digit. The 'deleteme'
+		// directory does not. This check avoids loading 'deleteme'
+		// as a storage directory.
+		if(!isdigit(dp[i]->d_name[0]))
 			continue;
 		flags=0;
 		if(!strcmp(dp[i]->d_name, realcurrent))
@@ -221,13 +207,14 @@ static int do_bu_get_list(struct sdirs *sdirs,
 			include_working)) goto end;
 	}
 
-	setup_indices(*bu_list);
+	setup_indices(*bu_list, sdirs->protocol);
 
 	ret=0;
 end:
 	if(dp)
 	{
-		for(i=0; i<n; i++) free(dp[i]);
+		for(i=0; i<n; i++)
+			free(dp[i]);
 		free(dp);
 	}
 	return ret;
@@ -235,20 +222,20 @@ end:
 
 int bu_get_list(struct sdirs *sdirs, struct bu **bu_list)
 {
-	return do_bu_get_list(sdirs, bu_list, NULL);
+	return do_bu_get_list(sdirs, bu_list, 0/*include_working*/);
 }
 
-int bu_get_list_with_working(struct sdirs *sdirs, struct bu **bu_list,
-	struct cstat *cstat)
+int bu_get_list_with_working(struct sdirs *sdirs, struct bu **bu_list)
 {
-	return do_bu_get_list(sdirs, bu_list, cstat);
+	return do_bu_get_list(sdirs, bu_list, 1/*include_working*/);
 }
 
 int bu_get_current(struct sdirs *sdirs, struct bu **bu_list)
 {
-	char real[32]="";
+	char real[38]="";
 	// FIX THIS: should not need to specify "current".
 	if(get_link(sdirs->client, "current", real, sizeof(real)))
 		return -1;
-	return maybe_add_ent(sdirs->client, real, bu_list, BU_CURRENT, NULL);
+	return maybe_add_ent(sdirs->client, real, bu_list, BU_CURRENT,
+		0/*include_working*/);
 }

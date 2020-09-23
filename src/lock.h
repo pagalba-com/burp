@@ -8,20 +8,19 @@ enum lockstat
 	GET_LOCK_GOT
 };
 
-typedef struct lock lock_t;
-
 struct lock
 {
 	int fd;
 	enum lockstat status;
 	char *path;
-	lock_t *next;
+	struct lock *next;
 };
 
 extern struct lock *lock_alloc(void);
 extern int lock_init(struct lock *lock, const char *path);
 extern struct lock *lock_alloc_and_init(const char *path);
 extern void lock_free(struct lock **lock);
+extern int lock_write_pid(struct lock *lock);
 
 // Need to test lock->status to find out what happened when calling these.
 extern void lock_get_quick(struct lock *lock);

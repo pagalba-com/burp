@@ -1,29 +1,87 @@
-#include "include.h"
+#include "../../burp.h"
+#include "../../action.h"
+#include "../../alloc.h"
+#include "../../asfd.h"
+#include "../../async.h"
+#include "../../attribs.h"
 #include "../../cmd.h"
+#include "../../cntr.h"
+#include "../../conf.h"
+#include "../../log.h"
+#include "../../protocol1/handy.h"
+#include "../../protocol1/msg.h"
+#include "../extrameta.h"
+#include "../find.h"
+#include "backup_phase2.h"
+
+static int rs_loadsig_network_run(struct asfd *asfd,
+	rs_job_t *job, struct cntr *cntr)
+{
+	int ret=-1;
+	rs_buffers_t buf;
+	rs_result result;
+	rs_filebuf_t *in_fb=NULL;
+	memset(&buf, 0, sizeof(buf));
+
+	if(!(in_fb=rs_filebuf_new(NULL,
+		NULL, asfd, ASYNC_BUF_LEN, -1)))
+		goto end;
+
+	while(1)
+	{
+		iobuf_free_content(asfd->rbuf);
+		if(asfd->read(asfd)) goto end;
+		if(asfd->rbuf->cmd==CMD_MESSAGE
+		  || asfd->rbuf->cmd==CMD_WARNING)
+		{
+			log_recvd(asfd->rbuf, cntr, 0);
+			continue;
+		}
+		switch((result=rs_async(job, &buf, in_fb, NULL)))
+		{
+			case RS_BLOCKED:
+			case RS_RUNNING:
+				continue;
+			case RS_DONE:
+				ret=0;
+				goto end;
+			default:
+				logp("error in rs_async for sig: %d\n",
+					result);
+				goto end;
+		}
+	}
+
+end:
+	iobuf_free_content(asfd->rbuf);
+	rs_filebuf_free(&in_fb);
+	return ret;
+}
 
 static int load_signature(struct asfd *asfd,
-	rs_signature_t **sumset, struct conf **confs)
+	rs_signature_t **sumset, struct cntr *cntr)
 {
-	rs_result r;
 	rs_job_t *job;
 
-	job=rs_loadsig_begin(sumset);
-	if((r=rs_loadsig_network_run(asfd, job, get_cntr(confs[OPT_CNTR]))))
+	if(!(job=rs_loadsig_begin(sumset)))
 	{
-		rs_free_sumset(*sumset);
-		return r;
+		logp("could not start sig job.\n");
+		return -1;
 	}
-	if((r=rs_build_hash_table(*sumset))) return r;
+	if(rs_loadsig_network_run(asfd, job, cntr))
+		return -1;
+	if(rs_build_hash_table(*sumset))
+		return -1;
 	rs_job_free(job);
-	return r;
+	return 0;
 }
 
 static int load_signature_and_send_delta(struct asfd *asfd,
-	BFILE *bfd, unsigned long long *bytes, unsigned long long *sentbytes,
-	struct conf **confs)
+	struct BFILE *bfd, uint64_t *bytes, uint64_t *sentbytes,
+	struct cntr *cntr)
 {
-	rs_job_t *job;
-	rs_result r;
+	int ret=-1;
+	rs_job_t *job=NULL;
 	rs_signature_t *sumset=NULL;
 	uint8_t checksum[MD5_DIGEST_LENGTH];
 	rs_filebuf_t *infb=NULL;
@@ -31,88 +89,83 @@ static int load_signature_and_send_delta(struct asfd *asfd,
 	rs_buffers_t rsbuf;
 	memset(&rsbuf, 0, sizeof(rsbuf));
 
-	if(load_signature(asfd, &sumset, confs)) return -1;
+	if(load_signature(asfd, &sumset, cntr))
+		goto end;
 
 	if(!(job=rs_delta_begin(sumset)))
 	{
 		logp("could not start delta job.\n");
-		rs_free_sumset(sumset);
-		return RS_IO_ERROR;
+		goto end;
 	}
 
-	if(!(infb=rs_filebuf_new(asfd, bfd,
-		NULL, -1, ASYNC_BUF_LEN, bfd->datalen,
-		get_cntr(confs[OPT_CNTR])))
-	  || !(outfb=rs_filebuf_new(asfd, NULL,
-		NULL, asfd->fd, ASYNC_BUF_LEN, -1,
-		get_cntr(confs[OPT_CNTR]))))
+	if(!(infb=rs_filebuf_new(bfd,
+		NULL, NULL, ASYNC_BUF_LEN, bfd->datalen))
+	  || !(outfb=rs_filebuf_new(NULL,
+		NULL, asfd, ASYNC_BUF_LEN, -1)))
 	{
 		logp("could not rs_filebuf_new for delta\n");
-		rs_filebuf_free(&infb);
-		return -1;
+		goto end;
 	}
 
 	while(1)
 	{
-		rs_result delresult;
-		delresult=rs_async(job, &rsbuf, infb, outfb);
-		if(delresult==RS_DONE)
+		rs_result result;
+		switch((result=rs_async(job, &rsbuf, infb, outfb)))
 		{
-			r=delresult;
-			break;
-		}
-		else if(delresult==RS_BLOCKED || delresult==RS_RUNNING)
-		{
-			// Keep going
-		}
-		else
-		{
-			logp("error in rs_async for delta: %d\n", delresult);
-			r=delresult;
-			break;
-		}
-		// FIX ME: get it to read stuff (errors, for example) here too.
-		if(asfd->as->write(asfd->as)) return -1;
-	}
-
-	if(r!=RS_DONE)
-		logp("delta loop returned: %d\n", r);
-
-	if(r==RS_DONE)
-	{
-		*bytes=infb->bytes;
-		*sentbytes=outfb->bytes;
-		if(!MD5_Final(checksum, &(infb->md5)))
-		{
-			logp("MD5_Final() failed\n");
-			r=RS_IO_ERROR;
+			case RS_DONE:
+				*bytes=infb->bytes;
+				*sentbytes=outfb->bytes;
+				if(!MD5_Final(checksum, &(infb->md5)))
+				{
+					logp("MD5_Final() failed\n");
+					goto end;
+				}
+				if(write_endfile(asfd, *bytes, checksum))
+					goto end;
+				ret=0;
+				goto end;
+			case RS_BLOCKED:
+			case RS_RUNNING:
+				// FIX ME: get it to read stuff here too.
+				// (errors, for example)
+				if(asfd->as->write(asfd->as))
+					goto end;
+				continue;
+			default:
+				logp("error in rs_async for delta: %d\n",
+					result);
+				goto end;
 		}
 	}
+end:
 	rs_filebuf_free(&infb);
 	rs_filebuf_free(&outfb);
-	rs_job_free(job);
-	rs_free_sumset(sumset);
-
-	if(r==RS_DONE && write_endfile(asfd, *bytes, checksum))
-		return -1;
-
-	return r;
+	if(job) rs_job_free(job);
+	if(sumset) rs_free_sumset(sumset);
+	return ret;
 }
 
-static int send_whole_file_w(struct asfd *asfd,
+static enum send_e send_whole_file_w(struct asfd *asfd,
 	struct sbuf *sb, const char *datapth,
-	int quick_read, unsigned long long *bytes, const char *encpassword,
-	struct conf **confs, int compression, BFILE *bfd,
+	int quick_read, uint64_t *bytes, const char *encpassword,
+	struct cntr *cntr, int compression, struct BFILE *bfd,
 	const char *extrameta, size_t elen)
 {
 	if((compression || encpassword) && sb->path.cmd!=CMD_EFS_FILE)
-		return send_whole_file_gzl(asfd,
-		  sb->path.buf, datapth, quick_read, bytes, 
-		  encpassword, confs, compression, bfd, extrameta, elen);
+	{
+		int key_deriv=sb->encryption==ENCRYPTION_KEY_DERIVED;
+
+		return send_whole_file_gzl(asfd, datapth, quick_read, bytes,
+		  encpassword, cntr, compression, bfd, extrameta, elen,
+		  key_deriv, sb->protocol1->salt);
+	}
 	else
 		return send_whole_filel(asfd,
-		  sb->path.cmd, sb->path.buf, datapth, quick_read, bytes, 
-		  confs, bfd, extrameta, elen);
+#ifdef HAVE_WIN32
+		  sb->path.cmd,
+#endif
+		  datapth, quick_read, bytes,
+		  cntr, bfd, extrameta, elen);
 }
 
 static int forget_file(struct asfd *asfd, struct sbuf *sb, struct conf **confs)
@@ -128,7 +181,7 @@ static int forget_file(struct asfd *asfd, struct sbuf *sb, struct conf **confs)
 		rs_signature_t *sumset=NULL;
 		// The server will be sending us a signature.
 		// Munch it up then carry on.
-		if(load_signature(asfd, &sumset, confs)) return -1;
+		if(load_signature(asfd, &sumset, get_cntr(confs))) return -1;
 		else rs_free_sumset(sumset);
 	}
 	return 0;
@@ -140,32 +193,43 @@ static int size_checks(struct asfd *asfd, struct sbuf *sb, struct conf **confs)
 	  && sb->path.cmd!=CMD_ENC_FILE
 	  && sb->path.cmd!=CMD_EFS_FILE)
 		return 0;
-	if(get_ssize_t(confs[OPT_MIN_FILE_SIZE])
-	  && sb->statp.st_size<(boffset_t)get_ssize_t(confs[OPT_MIN_FILE_SIZE]))
+	if(get_uint64_t(confs[OPT_MIN_FILE_SIZE])
+	  && (uint64_t)sb->statp.st_size<get_uint64_t(confs[OPT_MIN_FILE_SIZE]))
 	{
-		logw(asfd, confs, "File size decreased below min_file_size after initial scan: %c:%s", sb->path.cmd, sb->path.buf);
+		logw(asfd, get_cntr(confs), "File size decreased below min_file_size after initial scan: %s\n", iobuf_to_printable(&sb->path));
 		return -1;
 	}
-	if(get_ssize_t(confs[OPT_MAX_FILE_SIZE])
-	  && sb->statp.st_size>(boffset_t)get_ssize_t(confs[OPT_MAX_FILE_SIZE]))
+	if(get_uint64_t(confs[OPT_MAX_FILE_SIZE])
+	  && (uint64_t)sb->statp.st_size>get_uint64_t(confs[OPT_MAX_FILE_SIZE]))
 	{
-		logw(asfd, confs, "File size increased above max_file_size after initial scan: %c:%s", sb->path.cmd, sb->path.buf);
+		logw(asfd, get_cntr(confs), "File size increased above max_file_size after initial scan: %s\n", iobuf_to_printable(&sb->path));
 		return -1;
 	}
 	return 0;
 }
 
 static int deal_with_data(struct asfd *asfd, struct sbuf *sb,
-	BFILE *bfd, struct conf **confs)
+	struct BFILE *bfd, struct conf **confs)
 {
 	int ret=-1;
 	int forget=0;
 	size_t elen=0;
 	char *extrameta=NULL;
-	unsigned long long bytes=0;
+	uint64_t bytes=0;
 	int conf_compression=get_int(confs[OPT_COMPRESSION]);
+	struct cntr *cntr=get_cntr(confs);
+	const char *enc_password=get_string(confs[OPT_ENCRYPTION_PASSWORD]);
 
 	sb->compression=conf_compression;
+	if(enc_password)
+	{
+		sb->encryption=ENCRYPTION_KEY_DERIVED;
+		if(!RAND_bytes((uint8_t *)&sb->protocol1->salt, 8))
+		{
+			logp("RAND_bytes() failed\n");
+			return -1;
+		}
+	}
 
 	iobuf_copy(&sb->path, asfd->rbuf);
 	iobuf_init(asfd->rbuf);
@@ -176,12 +240,17 @@ static int deal_with_data(struct asfd *asfd, struct sbuf *sb,
 	if(lstat(sb->path.buf, &sb->statp))
 #endif
 	{
-		logw(asfd, confs, "Path has vanished: %s", sb->path.buf);
-		if(forget_file(asfd, sb, confs)) goto error;
+		logw(asfd, cntr, "Path has vanished: %s\n",
+			iobuf_to_printable(&sb->path));
+		forget++;
 		goto end;
 	}
 
-	if(size_checks(asfd, sb, confs)) forget++;
+	if(size_checks(asfd, sb, confs))
+	{
+		forget++;
+		goto end;
+	}
 
 	sb->compression=in_exclude_comp(get_strlist(confs[OPT_EXCOM]),
 		sb->path.buf, conf_compression);
@@ -192,14 +261,11 @@ static int deal_with_data(struct asfd *asfd, struct sbuf *sb,
 	{
 		if(bfd->open_for_send(bfd, asfd,
 			sb->path.buf, sb->winattr,
-			get_int(confs[OPT_ATIME]), confs))
-				forget++;
-	}
-
-	if(forget)
-	{
-		if(forget_file(asfd, sb, confs)) goto error;
-		goto end;
+			get_int(confs[OPT_ATIME]), cntr, PROTO_1))
+		{
+			forget++;
+			goto end;
+		}
 	}
 
 	if(sb->path.cmd==CMD_METADATA
@@ -211,10 +277,18 @@ static int deal_with_data(struct asfd *asfd, struct sbuf *sb,
 #endif
 	  )
 	{
-		if(get_extrameta(asfd, bfd,
-			sb, &extrameta, &elen, confs))
+		if(get_extrameta(asfd,
+#ifdef HAVE_WIN32
+			bfd,
+#endif
+			sb->path.buf,
+			S_ISDIR(sb->statp.st_mode),
+			&extrameta, &elen, cntr))
 		{
-			logw(asfd, confs, "Meta data error for %s", sb->path.buf);
+			logw(asfd, cntr,
+				"Meta data error for %s\n",
+				iobuf_to_printable(&sb->path));
+			forget++;
 			goto end;
 		}
 		if(extrameta)
@@ -222,16 +296,17 @@ static int deal_with_data(struct asfd *asfd, struct sbuf *sb,
 #ifdef HAVE_WIN32
 	  		if(get_int(confs[OPT_STRIP_VSS]))
 			{
-				free(extrameta);
-				extrameta=NULL;
+				free_w(&extrameta);
 				elen=0;
 			}
 #endif
 		}
 		else
 		{
-			logw(asfd, confs,
-				"No meta data after all: %s", sb->path.buf);
+			logw(asfd, cntr,
+				"No meta data after all: %s\n",
+				iobuf_to_printable(&sb->path));
+			forget++;
 			goto end;
 		}
 	}
@@ -239,47 +314,53 @@ static int deal_with_data(struct asfd *asfd, struct sbuf *sb,
 	if(sb->path.cmd==CMD_FILE
 	  && sb->protocol1->datapth.buf)
 	{
-		unsigned long long sentbytes=0;
+		uint64_t sentbytes=0;
 		// Need to do sig/delta stuff.
 		if(asfd->write(asfd, &(sb->protocol1->datapth))
 		  || asfd->write(asfd, &sb->attr)
 		  || asfd->write(asfd, &sb->path)
 		  || load_signature_and_send_delta(asfd, bfd,
-			&bytes, &sentbytes, confs))
+			&bytes, &sentbytes, cntr))
 		{
 			logp("error in sig/delta for %s (%s)\n",
-				sb->path.buf, sb->protocol1->datapth.buf);
+				iobuf_to_printable(&sb->path),
+				iobuf_to_printable(&sb->protocol1->datapth));
+			forget++;
 			goto end;
 		}
-		else
-		{
-			cntr_add(get_cntr(confs[OPT_CNTR]), CMD_FILE_CHANGED, 1);
-			cntr_add_bytes(get_cntr(confs[OPT_CNTR]), bytes);
-			cntr_add_sentbytes(get_cntr(confs[OPT_CNTR]), sentbytes);
-		}
+		cntr_add(cntr, CMD_FILE_CHANGED, 1);
 	}
 	else
 	{
 		//logp("need to send whole file: %s\n", sb.path);
 		// send the whole file.
 
-		if((asfd->write(asfd, &sb->attr)
+		if(asfd->write(asfd, &sb->attr)
 		  || asfd->write(asfd, &sb->path))
-		  || send_whole_file_w(asfd, sb, NULL, 0, &bytes,
-			get_string(confs[OPT_ENCRYPTION_PASSWORD]),
-			confs, sb->compression,
+			goto end;
+
+		switch(send_whole_file_w(asfd, sb, NULL, 0, &bytes,
+			enc_password,
+			cntr, sb->compression,
 			bfd, extrameta, elen))
-				goto end;
-		else
 		{
-			cntr_add(get_cntr(confs[OPT_CNTR]), sb->path.cmd, 1);
-			cntr_add_bytes(get_cntr(confs[OPT_CNTR]), bytes);
-			cntr_add_sentbytes(get_cntr(confs[OPT_CNTR]), bytes);
+			case SEND_OK:
+				break;
+			case SEND_ERROR:
+				forget++;
+				break;
+			case SEND_FATAL:
+			default:
+				goto error;
 		}
+		cntr_add(cntr, sb->path.cmd, 1);
 	}
+	cntr_add_bytes(cntr, bytes);
 
 end:
 	ret=0;
+	if(forget && forget_file(asfd, sb, confs))
+		ret=-1;
 error:
 #ifdef HAVE_WIN32
 	// If using Windows do not close bfd - it needs
@@ -291,16 +372,15 @@ error:
 	bfd->close(bfd, asfd);
 #endif
 	sbuf_free_content(sb);
-	if(extrameta) free(extrameta);
+	free_w(&extrameta);
 	return ret;
 }
 
 static int parse_rbuf(struct asfd *asfd, struct sbuf *sb,
-	BFILE *bfd, struct conf **confs)
+	struct BFILE *bfd, struct conf **confs)
 {
 	static struct iobuf *rbuf;
 	rbuf=asfd->rbuf;
-	//printf("now %d: %c:%s\n", rbuf->len, rbuf->cmd, rbuf->buf);
 	if(rbuf->cmd==CMD_DATAPTH)
 	{
 		iobuf_move(&(sb->protocol1->datapth), rbuf);
@@ -312,15 +392,8 @@ static int parse_rbuf(struct asfd *asfd, struct sbuf *sb,
 		// and it is best to make it as fresh as
 		// possible.
 	}
-	else if(rbuf->cmd==CMD_FILE
-	  || rbuf->cmd==CMD_ENC_FILE
-	  || rbuf->cmd==CMD_METADATA
-	  || rbuf->cmd==CMD_ENC_METADATA
-	  || rbuf->cmd==CMD_VSS
-	  || rbuf->cmd==CMD_ENC_VSS
-	  || rbuf->cmd==CMD_VSS_T
-	  || rbuf->cmd==CMD_ENC_VSS_T
-	  || rbuf->cmd==CMD_EFS_FILE)
+	else if(iobuf_is_filedata(rbuf)
+	  || iobuf_is_vssdata(rbuf))
 	{
 		if(deal_with_data(asfd, sb, bfd, confs))
 			return -1;
@@ -328,7 +401,9 @@ static int parse_rbuf(struct asfd *asfd, struct sbuf *sb,
 	else if(rbuf->cmd==CMD_MESSAGE
 	  || rbuf->cmd==CMD_WARNING)
 	{
-		log_recvd(rbuf, confs, 0);
+		struct cntr *cntr=NULL;
+		if(confs) cntr=get_cntr(confs);
+		log_recvd(rbuf, cntr, 0);
 	}
 	else
 	{
@@ -345,26 +420,36 @@ static int do_backup_phase2_client(struct asfd *asfd,
 	// For efficiency, open Windows files for the VSS data, and do not
 	// close them until another time around the loop, when the actual
 	// data is read.
-	BFILE *bfd=NULL;
+	struct BFILE *bfd=NULL;
 	struct sbuf *sb=NULL;
-	struct iobuf *rbuf=asfd->rbuf;
+	struct iobuf *rbuf=NULL;
+	struct cntr *cntr=NULL;
+	if(confs) cntr=get_cntr(confs);
+
+	if(!asfd)
+	{
+		logp("%s() called without asfd!\n", __func__);
+		goto end;
+	}
+	rbuf=asfd->rbuf;
 
 	if(!(bfd=bfile_alloc())
-	  || !(sb=sbuf_alloc(confs)))
+	  || !(sb=sbuf_alloc(PROTO_1)))
 		goto end;
-	bfile_init(bfd, 0, confs);
+	bfile_init(bfd, 0, cntr);
 
 	if(!resume)
 	{
 		// Only do this bit if the server did not tell us to resume.
 		if(asfd->write_str(asfd, CMD_GEN, "backupphase2")
-		  || asfd->read_expect(asfd, CMD_GEN, "ok"))
+		  || asfd_read_expect(asfd, CMD_GEN, "ok"))
 			goto end;
 	}
-	else if(get_int(confs[OPT_SEND_CLIENT_CNTR]))
+	else
 	{
 		// On resume, the server might update the client with cntr.
-		if(cntr_recv(asfd, confs)) goto end;
+		if(cntr_recv(asfd, confs))
+			goto end;
 	}
 
 	while(1)
@@ -387,7 +472,7 @@ static int do_backup_phase2_client(struct asfd *asfd,
 
 end:
 	// It is possible for a bfd to still be open.
-	bfd->close(bfd, asfd);
+	if(bfd) bfd->close(bfd, asfd);
 	bfile_free(&bfd);
 	iobuf_free_content(rbuf);
 	sbuf_free(&sb);
@@ -398,14 +483,17 @@ int backup_phase2_client_protocol1(struct asfd *asfd,
 	struct conf **confs, int resume)
 {
 	int ret=0;
+	struct cntr *cntr=NULL;
+	if(confs) cntr=get_cntr(confs);
 
 	logp("Phase 2 begin (send backup data)\n");
-	printf("\n");
+	logfmt("\n");
 
 	ret=do_backup_phase2_client(asfd, confs, resume);
 
-	cntr_print_end(get_cntr(confs[OPT_CNTR]));
-	cntr_print(get_cntr(confs[OPT_CNTR]), ACTION_BACKUP);
+	cntr_print_end(cntr);
+	cntr_set_bytes(cntr, asfd);
+	cntr_print(cntr, ACTION_BACKUP);
 
 	if(ret) logp("Error in phase 2\n");
 	logp("Phase 2 end (send file data)\n");

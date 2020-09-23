@@ -6,7 +6,36 @@
 
 #define ASSERT(x)
 
+// MAX_PATH is Windows constatnt, usually 260, maybe changed in some Win10 update.
+// PATH_MAX is Posix constant
+// right method - it to call pathconf(), but such case lead to reworking lots of code;
+// and some buffers are better to allocate on stack, not on heap
+#ifndef MAX_PATH
+    #ifdef PATH_MAX
+        #define MAX_PATH           PATH_MAX
+    #else
+        #define MAX_PATH           260
+    #endif
+#endif
+
+// unicode enabling of win 32 needs some defines and functions
+
+// using an average of 3 bytes per character is probably fine in
+// practice but I believe that Windows actually uses UTF-16 encoding
+// as opposed to UCS2 which means characters 0x10000-0x10ffff are
+// valid and result in 4 byte UTF-8 encodings.
+#define MAX_PATH_UTF8    MAX_PATH*4  // strict upper bound on UTF-16 to UTF-8 conversion
+
+// from
+// http://msdn.microsoft.com/library/default.asp?url=/library/en-us/fileio/fs/getfileattributesex.asp
+// In the ANSI version of this function, the name is limited to
+// MAX_PATH characters. To extend this limit to 32,767 wide
+// characters, call the Unicode version of the function and prepend
+// "\\?\" to the path. For more information, see Naming a File.
+#define MAX_PATH_W 32767
+
 #ifdef HAVE_WIN32
+
 	#define WIN32_REPARSE_POINT  1 // Any odd dir except the next two.
 	#define WIN32_MOUNT_POINT    2 // Directory link to Volume.
 	#define WIN32_JUNCTION_POINT 3 // Directory link to a directory.
@@ -24,68 +53,11 @@
 	#endif
 #endif
 
-#ifdef ENABLE_NLS
-	#include <libintl.h>
-	#include <locale.h>
-	#ifndef _
-		#define _(s) gettext((s))
-	#endif
-	#ifndef N_
-		#define N_(s) (s)
-	#endif
-#else
-	#undef _
-	#undef N_
-	#undef textdomain
-	#undef bindtextdomain
-	#undef setlocale
-
-	#ifndef _
-		#define _(s) (s)
-	#endif
-	#ifndef N_
-		#define N_(s) (s)
-	#endif
-	#ifndef textdomain
-		#define textdomain(d)
-	#endif
-	#ifndef bindtextdomain
-		#define bindtextdomain(p, d)
-	#endif
-	#ifndef setlocale
-		#define setlocale(p, d)
-	#endif
-#endif
-
-#if defined(HAVE_WIN32)
-typedef uint64_t boffset_t;
-#else
-typedef off_t boffset_t;
-#endif
-
-// Use the following for strings not to be translated.
-#define NT_(s) (s)   
-
-#ifndef S_ISLNK
-#define S_ISLNK(m) (((m) & S_IFM) == S_IFLNK)
-#endif
-
-#ifdef TIME_WITH_SYS_TIME
-	#include <sys/time.h>
-	#include <time.h>
-#else
-	#ifdef HAVE_SYS_TIME_H
-		#include <sys/time.h>
-	#else
-		#include <time.h>
-	#endif
-#endif
-
 #ifndef O_BINARY
 	#define O_BINARY 0
 #endif
 
-inline uint8_t IsPathSeparator(int ch)
+static inline uint8_t IsPathSeparator(int ch)
 {
 	return
 #ifdef HAVE_WIN32

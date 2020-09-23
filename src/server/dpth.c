@@ -1,6 +1,7 @@
 #include "../burp.h"
 #include "../alloc.h"
 #include "../fsops.h"
+#include "../fzp.h"
 #include "../lock.h"
 #include "../log.h"
 #include "dpth.h"
@@ -14,6 +15,7 @@ void dpth_free(struct dpth **dpth)
 {
 	if(!dpth || !*dpth) return;
 	dpth_release_all(*dpth);
+	fzp_close(&(*dpth)->cfile_fzp);
 	free_w(&((*dpth)->base_path));
 	free_v((void **)dpth);
 }
@@ -23,9 +25,9 @@ int dpth_release_and_move_to_next_in_list(struct dpth *dpth)
 	int ret=0;
 	struct dpth_lock *next=NULL;
 
-	// Try to release (and unlink) the lock even if close_fp failed, just
+	// Try to release (and unlink) the lock even if fzp_close failed, just
 	// to be tidy.
-	if(close_fp(&dpth->fp)) ret=-1;
+	if(fzp_close(&dpth->fzp)) ret=-1;
 	if(lock_release(dpth->head->lock)) ret=-1;
 	lock_free(&dpth->head->lock);
 
@@ -40,7 +42,7 @@ int dpth_release_all(struct dpth *dpth)
 {
 	int ret=0;
 	if(!dpth) return 0;
-	if(dpth->fp && close_fp(&dpth->fp)) ret=-1;
+	if(dpth->fzp && fzp_close(&dpth->fzp)) ret=-1;
 	while(dpth->head)
 		if(dpth_release_and_move_to_next_in_list(dpth)) ret=-1;
 	return ret;
@@ -61,9 +63,9 @@ static int incr(uint16_t *component, uint16_t max)
 // Hmm, but ext3 only allows 32000 subdirs, although that many files are OK.
 int dpth_incr(struct dpth *dpth)
 {
-	if(incr(&dpth->tert, MAX_FILES_PER_DIR)
-	  || incr(&dpth->seco, dpth->max_storage_subdirs)
-	  || incr(&dpth->prim, dpth->max_storage_subdirs))
+	if(incr(&dpth->comp[2], MAX_FILES_PER_DIR)
+	  || incr(&dpth->comp[1], dpth->max_storage_subdirs)
+	  || incr(&dpth->comp[0], dpth->max_storage_subdirs))
 		return 0;
 	logp("No free data file entries out of the %d*%d*%d available!\n",
 		MAX_FILES_PER_DIR,

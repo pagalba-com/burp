@@ -1,5 +1,17 @@
-#include "include.h"
+#include "../../burp.h"
+#include "../../alloc.h"
+#include "../../asfd.h"
+#include "../../async.h"
 #include "../../bu.h"
+#include "../../cstat.h"
+#include "../../cntr.h"
+#include "../../handy.h"
+#include "../../iobuf.h"
+#include "../../log.h"
+#include "../../times.h"
+#include "json_input.h"
+#include "lline.h"
+#include "sel.h"
 #ifdef HAVE_WIN32
 #include <yajl/yajl_parse.h>
 #else
@@ -8,6 +20,8 @@
 
 static int map_depth=0;
 
+// FIX THIS: should pass around a ctx instead of keeping track of a bunch
+// of globals.
 static unsigned long number=0;
 static char *timestamp=NULL;
 static uint16_t flags=0;
@@ -22,8 +36,16 @@ static int in_counters=0;
 static int in_logslist=0;
 static int in_log_content=0;
 static struct bu **sselbu=NULL;
+// For server side log files.
 static struct lline *ll_list=NULL;
 static struct lline **sllines=NULL;
+// For recording 'loglines' in json input.
+static struct lline *jsll_list=NULL;
+// For recording warnings in json input.
+static struct lline *warning_list=NULL;
+static pid_t pid=-1;
+static int bno=0;
+static enum cntr_status phase=CNTR_STATUS_UNSET;
 
 static int is_wrap(const char *val, const char *key, uint16_t bit)
 {
@@ -35,34 +57,44 @@ static int is_wrap(const char *val, const char *key, uint16_t bit)
 	return 0;
 }
 
-static int input_integer(void *ctx, long long val)
+static int input_integer(__attribute__ ((unused)) void *ctx, long long val)
 {
-	if(in_counters)
+	if(!strcmp(lastkey, "pid"))
+	{
+		pid=(pid_t)val;
+		return 1;
+	}
+	else if(!strcmp(lastkey, "backup"))
+	{
+		bno=(int)val;
+		return 1;
+	}
+	else if(in_counters)
 	{
 		if(!strcmp(lastkey, "count"))
 		{
 			if(!cntr_ent) goto error;
-			cntr_ent->count=(unsigned long long)val;
+			cntr_ent->count=(uint64_t)val;
 		}
 		else if(!strcmp(lastkey, "changed"))
 		{
 			if(!cntr_ent) goto error;
-			cntr_ent->changed=(unsigned long long)val;
+			cntr_ent->changed=(uint64_t)val;
 		}
 		else if(!strcmp(lastkey, "same"))
 		{
 			if(!cntr_ent) goto error;
-			cntr_ent->same=(unsigned long long)val;
+			cntr_ent->same=(uint64_t)val;
 		}
 		else if(!strcmp(lastkey, "deleted"))
 		{
 			if(!cntr_ent) goto error;
-			cntr_ent->deleted=(unsigned long long)val;
+			cntr_ent->deleted=(uint64_t)val;
 		}
 		else if(!strcmp(lastkey, "scanned"))
 		{
 			if(!cntr_ent) goto error;
-			cntr_ent->phase1=(unsigned long long)val;
+			cntr_ent->phase1=(uint64_t)val;
 		}
 		else
 		{
@@ -88,17 +120,26 @@ static int input_integer(void *ctx, long long val)
 			return 1;
 		}
 	}
+	else
+	{
+		if(!strcmp(lastkey, "protocol"))
+		{
+			return 1;
+		}
+	}
 error:
-	logp("Unexpected integer: %s %llu\n", lastkey, val);
+	logp("Unexpected integer: '%s' %" PRIu64 "\n", lastkey, (uint64_t)val);
         return 0;
 }
 
-static int input_string(void *ctx, const unsigned char *val, size_t len)
+static int input_string(__attribute__ ((unused)) void *ctx,
+	const unsigned char *val, size_t len)
 {
 	char *str;
-	if(!(str=(char *)malloc_w(len+2, __func__)))
+	if(!(str=(char *)malloc_w(len+1, __func__)))
 		return 0;
 	snprintf(str, len+1, "%s", val);
+	str[len]='\0';
 
 	if(in_counters)
 	{
@@ -109,8 +150,8 @@ static int input_string(void *ctx, const unsigned char *val, size_t len)
 		}
 		else if(!strcmp(lastkey, "type"))
 		{
-			if(!current) goto error;
-			cntr_ent=current->cntr->ent[(uint8_t)*str];
+			if(!current || !current->cntrs) goto error;
+			cntr_ent=current->cntrs->ent[(uint8_t)*str];
 		}
 		else
 		{
@@ -121,7 +162,11 @@ static int input_string(void *ctx, const unsigned char *val, size_t len)
 	else if(!strcmp(lastkey, "name"))
 	{
 		if(cnew) goto error;
-		if(!(current=cstat_get_by_name(*cslist, str)))
+		if((current=cstat_get_by_name(*cslist, str)))
+		{
+			cntrs_free(&current->cntrs);
+		}
+		else
 		{
 			if(!(cnew=cstat_alloc())
 			  || cstat_init(cnew, str, NULL))
@@ -130,16 +175,26 @@ static int input_string(void *ctx, const unsigned char *val, size_t len)
 		}
 		goto end;
 	}
+	else if(!strcmp(lastkey, "labels"))
+	{
+		if(!current) goto error;
+		goto end;
+	}
 	else if(!strcmp(lastkey, "run_status"))
 	{
 		if(!current) goto error;
 		current->run_status=run_str_to_status(str);
 		goto end;
 	}
+	else if(!strcmp(lastkey, "action"))
+	{
+		// Ignore for now.
+		goto end;
+	}
 	else if(!strcmp(lastkey, "phase"))
 	{
 		if(!current) goto error;
-		current->cntr->cntr_status=cntr_str_to_status(str);
+		phase=cntr_str_to_status((const char *)str);
 		goto end;
 	}
 	else if(!strcmp(lastkey, "flags"))
@@ -173,6 +228,9 @@ static int input_string(void *ctx, const unsigned char *val, size_t len)
 	}
 	else if(!strcmp(lastkey, "logline"))
 	{
+		if(lline_add(&jsll_list, str))
+			goto error;
+		free_w(&str);
 		goto end;
 	}
 	else if(!strcmp(lastkey, "backup")
@@ -185,10 +243,18 @@ static int input_string(void *ctx, const unsigned char *val, size_t len)
 		// Log file contents.
 		if(lline_add(&ll_list, str))
 			goto error;
+		free_w(&str);
+		goto end;
+	}
+	else if(!strcmp(lastkey, "warning")) 
+	{
+		if(lline_add(&warning_list, str))
+			goto error;
+		free_w(&str);
 		goto end;
 	}
 error:
-	logp("Unexpected string: %s %s\n", lastkey, str);
+	logp("Unexpected string: '%s' '%s'\n", lastkey, str);
 	free_w(&str);
         return 0;
 end:
@@ -196,9 +262,11 @@ end:
 	return 1;
 }
 
-static int input_map_key(void *ctx, const unsigned char *val, size_t len)
+static int input_map_key(__attribute__((unused)) void *ctx,
+	const unsigned char *val, size_t len)
 {
 	snprintf(lastkey, len+1, "%s", val);
+	lastkey[len]='\0';
 //	logp("mapkey: %s\n", lastkey);
 	return 1;
 }
@@ -234,14 +302,14 @@ static int add_to_bu_list(void)
 	return 0;
 }
 
-static int input_start_map(void *ctx)
+static int input_start_map(__attribute__ ((unused)) void *ctx)
 {
 	map_depth++;
 	//logp("startmap: %d\n", map_depth);
 	return 1;
 }
 
-static int input_end_map(void *ctx)
+static int input_end_map(__attribute__ ((unused)) void *ctx)
 {
 	map_depth--;
 	//logp("endmap: %d\n", map_depth);
@@ -252,7 +320,7 @@ static int input_end_map(void *ctx)
 	return 1;
 }
 
-static int input_start_array(void *ctx)
+static int input_start_array(__attribute__ ((unused)) void *ctx)
 {
 	//logp("start arr\n");
 	if(!strcmp(lastkey, "backups"))
@@ -265,6 +333,19 @@ static int input_start_array(void *ctx)
 	}
 	else if(!strcmp(lastkey, "counters"))
 	{
+		struct cntr *cntr;
+		for(cntr=current->cntrs; cntr; cntr=cntr->next)
+			if(cntr->pid==pid)
+				break;
+		if(!cntr)
+		{
+			if(!(cntr=cntr_alloc())
+			  || cntr_init(cntr, current->name, pid))
+				return 0;
+			cstat_add_cntr_to_list(current, cntr);
+		}
+		cntr->bno=bno;
+		cntr->cntr_status=phase;
 		in_counters=1;
 	}
 	else if(!strcmp(lastkey, "list"))
@@ -377,21 +458,36 @@ static void merge_bu_lists(void)
 	}
 }
 
-static int input_end_array(void *ctx)
+static void update_live_counter_flag(void)
+{
+	struct bu *bu;
+	if(!current)
+		return;
+	for(bu=current->bu; bu; bu=bu->next)
+	{
+		struct cntr *cntr;
+		for(cntr=current->cntrs; cntr; cntr=cntr->next)
+			if(bu->bno==(uint64_t)cntr->bno)
+				bu->flags|=BU_LIVE_COUNTERS;
+	}
+}
+
+static int input_end_array(__attribute__ ((unused)) void *ctx)
 {
 	if(in_backups && !in_flags && !in_counters && !in_logslist)
 	{
 		in_backups=0;
 		if(add_to_bu_list()) return 0;
-		// Now may have two lists. Want to keep the old one is intact
+		// Now may have two lists. Want to keep the old one as intact
 		// as possible, so that we can keep a pointer to its entries
 		// in the ncurses stuff.
 		// Merge the new list into the old.
 		merge_bu_lists();
+		update_live_counter_flag();
 		bu_list=NULL;
 		if(cnew)
 		{
-			if(cstat_add_to_list(cslist, cnew)) return -1;
+			cstat_add_to_list(cslist, cnew);
 			cnew=NULL;
 		}
 		current=NULL;
@@ -437,26 +533,63 @@ static void do_yajl_error(yajl_handle yajl, struct asfd *asfd)
 	unsigned char *str;
 	str=yajl_get_error(yajl, 1,
 		(const unsigned char *)asfd->rbuf->buf, asfd->rbuf->len);
-	logp("yajl error: %s\n", (const char *)str);
-	yajl_free_error(yajl, str);
+	logp("yajl error: %s\n", str?(const char *)str:"unknown");
+	if(str) yajl_free_error(yajl, str);
+}
+
+static yajl_handle yajl=NULL;
+
+int json_input_init(void)
+{
+	if(!(yajl=yajl_alloc(&callbacks, NULL, NULL)))
+		return -1;
+	yajl_config(yajl, yajl_dont_validate_strings, 1);
+	return 0;
+}
+
+void json_input_free(void)
+{
+	if(!yajl) return;
+	yajl_free(yajl);
+	yajl=NULL;
+}
+
+struct lline *json_input_get_loglines(void)
+{
+	return jsll_list;
+}
+
+struct lline *json_input_get_warnings(void)
+{
+	return warning_list;
+}
+
+void json_input_clear_loglines(void)
+{
+	llines_free(&jsll_list);
+}
+
+void json_input_clear_warnings(void)
+{
+	llines_free(&warning_list);
 }
 
 // Client records will be coming through in alphabetical order.
 // FIX THIS: If a client is deleted on the server, it is not deleted from
 // clist.
+// return 0 for OK, -1 on error, 1 for json complete, 2 for json complete with
+// warnings.
 int json_input(struct asfd *asfd, struct sel *sel)
 {
-        static yajl_handle yajl=NULL;
 	cslist=&sel->clist;
 	sselbu=&sel->backup;
 	sllines=&sel->llines;
 
-	if(!yajl)
-	{
-		if(!(yajl=yajl_alloc(&callbacks, NULL, NULL)))
-			goto error;
-		yajl_config(yajl, yajl_dont_validate_strings, 1);
-	}
+	if(!yajl && json_input_init())
+		goto error;
+
+//printf("parse: '%s\n'", asfd->rbuf->buf);
+
 	if(yajl_parse(yajl, (const unsigned char *)asfd->rbuf->buf,
 		asfd->rbuf->len)!=yajl_status_ok)
 	{
@@ -467,19 +600,19 @@ int json_input(struct asfd *asfd, struct sel *sel)
 	if(!map_depth)
 	{
 		// Got to the end of the JSON object.
-		if(!sel->gotfirstresponse) sel->gotfirstresponse=1;
 		if(yajl_complete_parse(yajl)!=yajl_status_ok)
 		{
 			do_yajl_error(yajl, asfd);
 			goto error;
 		}
-		yajl_free(yajl);
-		yajl=NULL;
+		json_input_free();
+		if(warning_list)
+			return 2;
+		return 1;
 	}
 
 	return 0;
 error:
-	yajl_free(yajl);
-	yajl=NULL;
+	json_input_free();
 	return -1;
 }

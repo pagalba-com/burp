@@ -1,12 +1,24 @@
-#include "include.h"
-#include "../../cmd.h"
-#include "../../lock.h"
+#include "../../../burp.h"
+#include "../../../alloc.h"
+#include "../../../asfd.h"
+#include "../../../async.h"
+#include "../../../cmd.h"
+#include "../../../conf.h"
+#include "../../../fsops.h"
+#include "../../../lock.h"
+#include "../../../log.h"
+#include "../../../prepend.h"
+#include "champ_client.h"
+#include "champ_chooser.h"
+#include "champ_server.h"
 
 #include <sys/un.h>
 
-static int champ_chooser_fork(struct sdirs *sdirs, struct conf **confs)
+static int champ_chooser_fork(struct sdirs *sdirs, struct conf **confs,
+	int resume)
 {
 	pid_t childpid=-1;
+	int cret;
 
 	if(!get_int(confs[OPT_FORK]))
 	{
@@ -23,12 +35,15 @@ static int champ_chooser_fork(struct sdirs *sdirs, struct conf **confs)
 			return -1;
 		case 0:
 			// Child.
-			int cret;
-			set_logfp(NULL, confs);
-			switch(champ_chooser_server(sdirs, confs))
+			log_fzp_set(NULL, confs);
+			switch(champ_chooser_server(sdirs, confs, resume))
 			{
-				case 0: cret=0;
-				default: cret=1;
+				case 0:
+					cret=0;
+					break;
+				default:
+					cret=1;
+					break;
 			}
 			exit(cret);
 		default:
@@ -39,7 +54,8 @@ static int champ_chooser_fork(struct sdirs *sdirs, struct conf **confs)
 	return -1; // Not reached.
 }
 
-static int connect_to_champ_chooser(struct sdirs *sdirs, struct conf **confs)
+static int connect_to_champ_chooser(struct sdirs *sdirs, struct conf **confs,
+	int resume)
 {
 	int len;
 	int s=-1;
@@ -51,7 +67,8 @@ static int connect_to_champ_chooser(struct sdirs *sdirs, struct conf **confs)
 	{
 		// Champ chooser is not running.
 		// Try to fork a new champ chooser process.
-		if(champ_chooser_fork(sdirs, confs)) return -1;
+		if(champ_chooser_fork(sdirs, confs, resume))
+			return -1;
 	}
 
 	// Champ chooser should either be running now, or about to run.
@@ -64,8 +81,9 @@ static int connect_to_champ_chooser(struct sdirs *sdirs, struct conf **confs)
 
 	memset(&remote, 0, sizeof(struct sockaddr_un));
 	remote.sun_family=AF_UNIX;
-	strcpy(remote.sun_path, sdirs->champsock);
-	len=strlen(remote.sun_path)+sizeof(remote.sun_family);
+	snprintf(remote.sun_path, sizeof(remote.sun_path),
+		"%s", sdirs->champsock);
+	len=strlen(remote.sun_path)+sizeof(remote.sun_family)+1;
 
 	while(tries++<tries_max)
 	{
@@ -90,7 +108,7 @@ static int connect_to_champ_chooser(struct sdirs *sdirs, struct conf **confs)
 }
 
 struct asfd *champ_chooser_connect(struct async *as,
-	struct sdirs *sdirs, struct conf **confs)
+	struct sdirs *sdirs, struct conf **confs, int resume)
 {
 	int champsock=-1;
 	char *champname=NULL;
@@ -101,28 +119,28 @@ struct asfd *champ_chooser_connect(struct async *as,
 	// This may start up a new champ chooser. On a machine with multiple
 	// cores, it may be faster to do now, way before it is actually needed
 	// in phase2.
-	if((champsock=connect_to_champ_chooser(sdirs, confs))<0)
+	if((champsock=connect_to_champ_chooser(sdirs, confs, resume))<0)
 	{
 		logp("could not connect to champ chooser\n");
 		goto error;
 	}
 
-	if(!(chfd=setup_asfd(as, "champ chooser socket", &champsock, NULL,
-		ASFD_STREAM_STANDARD, ASFD_FD_SERVER_TO_CHAMP_CHOOSER, -1,
-			confs))) goto error;
+	if(!(chfd=setup_asfd(as, "champ chooser socket", &champsock,
+		/*listen*/"")))
+			goto error;
 
 	cname=get_string(confs[OPT_CNAME]);
 	if(!(champname=prepend_n("cname", cname, strlen(cname), ":")))
 			goto error;
 
 	if(chfd->write_str(chfd, CMD_GEN, champname)
-	  || chfd->read_expect(chfd, CMD_GEN, "cname ok"))
+	  || asfd_read_expect(chfd, CMD_GEN, "cname ok"))
 		goto error;
 
-	free(champname);
+	free_w(&champname);
 	return chfd;
 error:
-	free(champname);
+	free_w(&champname);
 	as->asfd_remove(as, chfd);
 	asfd_free(&chfd);
 	close_fd(&champsock);

@@ -42,8 +42,16 @@ static void str_to_bytes(const char *str, uint8_t *bytes, size_t len)
 			spos++;
 			continue;
 		}
+#if BYTE_ORDER == LITTLE_ENDIAN
 		bytes[bpos++] = hexmap1[(uint8_t)str[spos]]
 			| hexmap2[(uint8_t)str[spos+1]];
+#elif BYTE_ORDER == BIG_ENDIAN
+		bytes[bpos-bpos%4+3-bpos%4] = hexmap1[(uint8_t)str[spos]]
+			| hexmap2[(uint8_t)str[spos+1]];
+		bpos+=1;
+#else
+		#error byte order not supported
+#endif
 		spos+=2;
 	}
 }
@@ -55,35 +63,56 @@ void md5str_to_bytes(const char *md5str, uint8_t *bytes)
 
 char *bytes_to_md5str(uint8_t *bytes)
 {
-        static char str[64]="";
-        snprintf(str, sizeof(str),
-          "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9], bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15]);
+        static char str[64];
+        snprintf(str, sizeof(str), "%016" PRIx64 "%016" PRIx64,
+		htobe64(*(uint64_t *)bytes), htobe64(*(uint64_t *)(bytes+8)));
         return str;
 }
 
-void savepathstr_to_bytes(const char *savepathstr, uint8_t *bytes)
+uint64_t savepathstr_with_sig_to_uint64(const char *savepathstr)
 {
-	str_to_bytes(savepathstr, bytes, SAVE_PATH_LEN);
+	uint8_t b[sizeof(uint64_t)];
+	str_to_bytes(savepathstr, b, sizeof(b));
+	return htobe64(*(uint64_t *)&b);
 }
 
-char *bytes_to_savepathstr(uint8_t *bytes)
+static char *savepathstr_make(uint64_t *be_bytes)
 {
-        static char str[20]="";
+        static char str[15];
+	uint8_t *b=(uint8_t *)be_bytes;
         snprintf(str, sizeof(str), "%02X%02X/%02X%02X/%02X%02X",
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5]);
+                b[0], b[1], b[2], b[3], b[4], b[5]);
+	return str;
+}
+
+char *uint64_to_savepathstr(uint64_t bytes)
+{
+	uint64_t be_bytes=htobe64(bytes);
+	return savepathstr_make(&be_bytes);
+}
+
+char *uint64_to_savepathstr_with_sig(uint64_t bytes)
+{
+        static char str[20];
+	uint64_t be_bytes=htobe64(bytes);
+	uint8_t *b=(uint8_t *)&be_bytes;
+        snprintf(str, sizeof(str), "%02X%02X/%02X%02X/%02X%02X/%02X%02X",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
         return str;
 }
 
-char *bytes_to_savepathstr_with_sig(uint8_t *bytes)
+char *uint64_to_savepathstr_with_sig_uint(uint64_t bytes, uint16_t *sig)
 {
-        static char str[20]="";
-        snprintf(str, sizeof(str), "%02X%02X/%02X%02X/%02X%02X/%02X%02X",
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7]);
+	char *str;
+	uint64_t be_bytes=htobe64(bytes);
+	uint8_t *b=(uint8_t *)&be_bytes;
+	str=savepathstr_make(&be_bytes);
+	*sig = b[6] << 8;
+	*sig |= b[7];
         return str;
+}
+
+uint64_t uint64_to_savepath_hash_key(uint64_t bytes)
+{
+	return bytes & 0xFFFFFFFFFFFF0000;
 }

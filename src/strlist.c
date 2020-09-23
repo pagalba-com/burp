@@ -10,15 +10,17 @@
 static void strlist_free(struct strlist *strlist)
 {
 	if(!strlist) return;
-	if(strlist->path) free_w(&strlist->path);
-	if(strlist->re) regfree(strlist->re);
+	regex_free(&strlist->re);
+	free_w(&strlist->path);
 	free_v((void **)&strlist);
 }
 
 void strlists_free(struct strlist **strlist)
 {
 	struct strlist *s;
-	struct strlist *shead=*strlist;
+	struct strlist *shead;
+	if(!strlist) return;
+	shead=*strlist;
 	while(shead)
 	{
 		s=shead;
@@ -45,7 +47,7 @@ static struct strlist *strlist_alloc(const char *path, long flag)
 }
 
 static int do_strlist_add(struct strlist **strlist,
-	const char *path, long flag, int sorted)
+	const char *path, long flag, int sorted, int uniq)
 {
 	struct strlist *s=NULL;
 	struct strlist *slast=NULL;
@@ -59,6 +61,11 @@ static int do_strlist_add(struct strlist **strlist,
 	// find the last entry. Can this be made better?
 	for(s=*strlist; s; s=s->next)
 	{
+		if(uniq && !pathcmp(path, s->path))
+		{
+			strlist_free(slnew);
+			return 0;
+		}
 		if(sorted && pathcmp(path, s->path)<0) break;
 		slast=s;
 	}
@@ -79,19 +86,29 @@ static int do_strlist_add(struct strlist **strlist,
 int strlist_add(struct strlist **strlist,
 	const char *path, long flag)
 {
-	return do_strlist_add(strlist, path, flag, 0 /* unsorted */);
+	return do_strlist_add(strlist, path, flag, 0 /* unsorted */, 0 /* not uniq */);
 }
 
 int strlist_add_sorted(struct strlist **strlist,
 	const char *path, long flag)
 {
-	return do_strlist_add(strlist, path, flag, 1 /* sorted */);
+	return do_strlist_add(strlist, path, flag, 1 /* sorted */, 0 /* not uniq */);
+}
+
+int strlist_add_sorted_uniq(struct strlist **strlist,
+	const char *path, long flag)
+{
+	return do_strlist_add(strlist, path, flag, 1 /* sorted */, 1 /* uniq */);
 }
 
 int strlist_compile_regexes(struct strlist *strlist)
 {
         struct strlist *l;
-        for(l=strlist; l; l=l->next) compile_regex(&l->re, l->path);
+	// FIX THIS: when the regex does not compile, should remove the
+	// strlist entry completely.
+        for(l=strlist; l; l=l->next)
+		if(!(l->re=regex_compile(l->path)))
+			logp("unable to compile regex: %s\n", l->path);
 	return 0;
 }
 

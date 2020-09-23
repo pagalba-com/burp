@@ -1,62 +1,87 @@
-/* Client of the server status. Runs on the server machine and connects to the
-   burp server to get status information. */
-
-#include "include.h"
+#include "../../burp.h"
+#include "../../action.h"
+#include "../../alloc.h"
+#include "../../asfd.h"
+#include "../../async.h"
 #include "../../bu.h"
 #include "../../cmd.h"
+#include "../../cstat.h"
+#include "../../forkchild.h"
+#include "../../fsops.h"
+#include "../../fzp.h"
+#include "../../handy.h"
+#include "../../iobuf.h"
+#include "../../log.h"
+#include "../../times.h"
+#include "json_input.h"
+#include "lline.h"
+#include "sel.h"
+#include "status_client_ncurses.h"
 
 #ifdef HAVE_NCURSES_H
-#include "ncurses.h"
+#include <ncurses.h>
+#elif HAVE_NCURSES_NCURSES_H
+#include <ncurses/ncurses.h>
+#endif
+
 // So that the sighandler can call endwin():
 static enum action actg=ACTION_STATUS;
-#endif
 
 #define LEFT_SPACE	3
 #define TOP_SPACE	2
 
-static FILE *lfp=NULL;
+static struct fzp *lfzp=NULL;
 
-// For switching between seeing 'last backup' and counter summary on the front
-// screen.
-static uint8_t toggle=0;
-
-static void print_line(const char *string, int row, int col)
+#ifdef HAVE_NCURSES
+static void print_line_ncurses(const char *string, int row, int col)
 {
 	int k=0;
 	const char *cp=NULL;
-#ifdef HAVE_NCURSES_H
+	while(k<LEFT_SPACE) mvprintw(row+TOP_SPACE, k++, " ");
+	for(cp=string; (*cp && k<col); cp++)
+		mvprintw(row+TOP_SPACE, k++, "%c", *cp);
+	while(k<col) mvprintw(row+TOP_SPACE, k++, " ");
+}
+#endif
+
+static struct asfd *stdout_asfd=NULL;
+
+static void print_line_stdout(const char *string)
+{
+	int k=0;
+	while(k<LEFT_SPACE)
+	{
+		stdout_asfd->write_str(stdout_asfd, CMD_GEN, " ");
+		k++;
+	}
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, string);
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, "\n");
+}
+
+static void print_line(const char *string, int row, int col)
+{
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS)
 	{
-		while(k<LEFT_SPACE) mvprintw(row+TOP_SPACE, k++, " ");
-		for(cp=string; (*cp && k<col); cp++)
-			mvprintw(row+TOP_SPACE, k++, "%c", *cp);
-		while(k<col) mvprintw(row+TOP_SPACE, k++, " ");
+		print_line_ncurses(string, row, col);
 		return;
 	}
 #endif
-	while(k<LEFT_SPACE) { printf(" "); k++; }
-	for(cp=string; *cp; cp++)
-	{
-		printf("%c", *cp);
-		k++;
-#ifdef HAVE_NCURSES_H
-		if(actg==ACTION_STATUS && k<col) break;
-#endif
-	}
-	printf("\n");
+	print_line_stdout(string);
 }
 
 static char *get_bu_str(struct bu *bu)
 {
-	static char ret[32];
-	if(!bu) snprintf(ret, sizeof(ret), "never");
+	static char ret[38];
+	if(!bu) snprintf(ret, sizeof(ret), "%07d never", 0);
 	else if(!bu->bno) snprintf(ret, sizeof(ret), "%s", bu->timestamp);
-	else snprintf(ret, sizeof(ret), "%07lu %s", bu->bno, bu->timestamp);
+	else snprintf(ret, sizeof(ret), "%07" PRIu64 " %s",
+		bu->bno, bu->timestamp);
 	return ret;
 }
 
 static void client_summary(struct cstat *cstat,
-	int row, int col, int clientwidth, struct conf **confs)
+	int row, int col, int clientwidth)
 {
 	char msg[1024]="";
 	char fmt[64]="";
@@ -67,47 +92,8 @@ static void client_summary(struct cstat *cstat,
 	// Find the current backup.
 	cbu=bu_find_current(cstat->bu);
 
-	switch(cstat->run_status)
-	{
-		case RUN_STATUS_RUNNING:
-			if(toggle)
-			{
-				char f[64]="";
-				char b[64]="";
-				unsigned long long p=0;
-				unsigned long long t=0;
-				struct cntr *cntr=cstat->cntr;
-				struct cntr_ent *ent_gtotal=
-					cntr->ent[(uint8_t)CMD_GRAND_TOTAL];
-
-				t=ent_gtotal->count
-					+ent_gtotal->same
-					+ent_gtotal->changed;
-				if(ent_gtotal->phase1)
-					p=(t*100)/ent_gtotal->phase1;
-				snprintf(f, sizeof(f), " %llu/%llu %llu%%",
-					t, ent_gtotal->phase1, p);
-				if(cntr->byte)
-					snprintf(b, sizeof(b), "%s",
-						bytes_to_human(cntr->byte));
-				snprintf(msg, sizeof(msg), fmt,
-					cstat->name,
-					run_status_to_str(cstat),
-					f, b);
-				break;
-			}
-			// Else fall through.
-		case RUN_STATUS_IDLE:
-		case RUN_STATUS_SERVER_CRASHED:
-		case RUN_STATUS_CLIENT_CRASHED:
-		default:
-			snprintf(msg, sizeof(msg), fmt,
-				cstat->name,
-				run_status_to_str(cstat),
-				" last backup: ",
-				get_bu_str(cbu));
-			break;
-	}
+	snprintf(msg, sizeof(msg), fmt, cstat->name, run_status_to_str(cstat),
+		" last backup: ", get_bu_str(cbu));
 
 	if(*msg) print_line(msg, row, col);
 }
@@ -122,15 +108,15 @@ static void to_msg(char msg[], size_t s, const char *fmt, ...)
 }
 
 static void print_cntr_ent(const char *field,
-	unsigned long long a,
-	unsigned long long b,
-	unsigned long long c,
-	unsigned long long d,
-	unsigned long long e,
+	uint64_t a,
+	uint64_t b,
+	uint64_t c,
+	uint64_t d,
+	uint64_t e,
 	int *x, int col)
 {
 	char msg[256]="";
-	unsigned long long t=a+b+c;
+	uint64_t t=a+b+c;
 	if(!field || (!t && !d && !e)) return;
 
 /* FIX THIS.
@@ -138,31 +124,31 @@ static void print_cntr_ent(const char *field,
 	  || phase==STATUS_VERIFYING)
 	{
 		to_msg(msg, sizeof(msg),
-			"% 15s % 9s % 9llu % 9llu",
+			"% 15s % 9s % 9" PRIu64 " % 9" PRIu64,
 			field, "", t, e);
 	}
 	else
 	{
 */
 		to_msg(msg, sizeof(msg),
-			"% 15s % 9llu % 9llu % 9llu % 9llu % 9llu % 9llu",
+			"% 15s % 9" PRIu64 " % 9" PRIu64 " % 9" PRIu64 " % 9" PRIu64 " % 9" PRIu64 " % 9" PRIu64 "",
 			field, a, b, c, d, t, e);
 //	}
 	print_line(msg, (*x)++, col);
 /* FIX THIS
 	if(percent && e)
 	{
-	  unsigned long long p;
+	  uint64_t p;
 	  p=(t*100)/e;
 	  if(phase==STATUS_RESTORING
 	    || phase==STATUS_VERIFYING)
 	  {
-	    to_msg(msg, sizeof(msg), "% 15s % 9s % 9llu%% % 9s",
+	    to_msg(msg, sizeof(msg), "% 15s % 9s % 9" PRIu64 "%% % 9s",
 		"", "", p, "");
 	  }
 	  else
 	  {
-	    to_msg(msg, sizeof(msg), "% 15s % 9s % 9s % 9s % 9s % 9llu%% % 9s",
+	    to_msg(msg, sizeof(msg), "% 15s % 9s % 9s % 9s % 9s % 9" PRIu64 "%% % 9s",
 		"", "", "", "", "", p, "");
 	  print_line(msg, (*x)++, col);
 	}
@@ -189,11 +175,11 @@ static void table_header(int *x, int col)
 }
 
 /*
-static void print_detail2(const char *field, unsigned long long value1, const char *value2, int *x, int col)
+static void print_detail2(const char *field, uint64_t value1, const char *value2, int *x, int col)
 {
 	char msg[256]="";
 	if(!field || !value1 || !value2 || !*value2) return;
-	snprintf(msg, sizeof(msg), "%s: %llu%s", field, value1, value2);
+	snprintf(msg, sizeof(msg), "%s: %" PRIu64 "%s", field, value1, value2);
 	print_line(msg, (*x)++, col);
 }
 
@@ -322,9 +308,9 @@ static void detail(const char *cntrclient, char status, char phase, const char *
 
 		if(diff>0)
 		{
-			unsigned long long bytesleft=0;
-			unsigned long long byteswant=0;
-			unsigned long long bytesgot=0;
+			uint64_t bytesleft=0;
+			uint64_t byteswant=0;
+			uint64_t bytesgot=0;
 			float bytespersec=0;
 			byteswant=p1cntr->byte;
 			bytesgot=cntr->byte;
@@ -341,42 +327,67 @@ static void detail(const char *cntrclient, char status, char phase, const char *
 	}
 	if(path && *path)
 	{
-#ifdef HAVE_NCURSES_H
+		char pathstr[256]="";
+		snprintf(pathstr, sizeof(pathstr), "\n%s\n", path);
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS)
 		{
-			printw("\n%s\n", path);
+			printw("%s", pathstr);
 			return;
 		}
-#else
-		printf("\n%s\n", path);
 #endif
+		stdout_asfd->write_str(stdout_asfd, CMD_GEN, pathstr);
 	}
 }
 */
 
-static void screen_header(int row, int col)
+#ifdef HAVE_NCURSES
+static void screen_header_ncurses(const char *date, int l, int col)
 {
-	int c=0;
-	int l=0;
+	char v[32]="";
+	snprintf(v, sizeof(v), " %s monitor %s", PACKAGE_TARNAME, VERSION);
+	print_line(v, 0-TOP_SPACE, col);
+	mvprintw(0, col-l-1, date);
+}
+#endif
+
+static void screen_header_stdout(const char *date, int l, int col)
+{
+	size_t c=0;
+	char spaces[512]="";
+	char msg[64]="";
+	snprintf(msg, sizeof(msg), " %s status", PACKAGE_TARNAME);
+
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, "\n");
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, msg);
+	for(c=0;
+	  c<(col-strlen(msg)-l-1)
+		&& c<sizeof(spaces)-1; c++)
+			spaces[c]=' ';
+	spaces[c]='\0';
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, spaces);
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, date);
+	stdout_asfd->write_str(stdout_asfd, CMD_GEN, "\n\n");
+}
+
+static void screen_header(int col)
+{
+	int l;
 	const char *date=NULL;
-	time_t t=time(NULL);
-	date=getdatestr(t);
+#ifdef UTEST
+	date="1977-10-02 00:10:20";
+#else
+	date=gettimenow();
+#endif
 	l=strlen(date);
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS)
 	{
-		char v[32]="";
-		snprintf(v, sizeof(v), " burp monitor %s", VERSION);
-		print_line(v, 0-TOP_SPACE, col);
-		mvprintw(0, col-l-1, date);
+		screen_header_ncurses(date, l, col);
 		return;
 	}
 #endif
-
-	printf("\n burp status");
-
-	for(c=0; c<(int)(col-strlen(" burp status")-l-1); c++) printf(" ");
-	printf("%s\n\n", date);
+	screen_header_stdout(date, l, col);
 }
 
 static int need_status(struct sel *sel)
@@ -385,7 +396,8 @@ static int need_status(struct sel *sel)
 	time_t now=0;
 	time_t diff=0;
 
-	if(sel->page==PAGE_VIEW_LOG && sel->llines) return 0;
+	if(sel->page==PAGE_VIEW_LOG && sel->llines)
+		return 0;
 
 	// Only ask for an update every second.
 	now=time(NULL);
@@ -411,6 +423,7 @@ static const char *logop_to_text(uint16_t logop)
 		case BU_STATS_BACKUP:	return "Backup stats";
 		case BU_STATS_RESTORE:	return "Restore stats";
 		case BU_STATS_VERIFY:	return "Verify stats";
+		case BU_LIVE_COUNTERS:	return "Live counters";
 		default: return "";
 	}
 }
@@ -425,18 +438,24 @@ static void print_logs_list_line(struct sel *sel,
 	print_line(msg, (*x)++, col);
 
 	if(!sel->logop) sel->logop=bit;
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	if(sel->logop==bit) mvprintw(*x+TOP_SPACE-1, 1, "*");
 #endif
 }
 
-static void client_and_status(struct sel *sel, int *x, int col)
+static void print_client(struct sel *sel, int *x, int col)
 {
-	char msg[1024];
+	char msg[1024]="";
 	snprintf(msg, sizeof(msg), "Client: %s", sel->client->name);
 //		sel->client->cntr->ent[CMD_FILE]->phase1,
 //		sel->client->cntr->ent[CMD_FILE]->count);
 	print_line(msg, (*x)++, col);
+}
+
+static void client_and_status(struct sel *sel, int *x, int col)
+{
+	char msg[1024]="";
+	print_client(sel, x, col);
 	snprintf(msg, sizeof(msg),
 		"Status: %s", run_status_to_str(sel->client));
 	print_line(msg, (*x)++, col);
@@ -459,7 +478,7 @@ static void client_and_status_and_backup_and_log(struct sel *sel,
 	print_line(msg, (*x)++, col);
 }
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 static int selindex_from_cstat(struct sel *sel)
 {
 	int selindex=0;
@@ -499,6 +518,7 @@ static int selindex_from_lline(struct sel *sel)
 
 static void print_logs_list(struct sel *sel, int *x, int col)
 {
+	print_logs_list_line(sel, BU_LIVE_COUNTERS, x, col);
 	print_logs_list_line(sel, BU_MANIFEST, x, col);
 	print_logs_list_line(sel, BU_LOG_BACKUP, x, col);
 	print_logs_list_line(sel, BU_LOG_RESTORE, x, col);
@@ -509,15 +529,15 @@ static void print_logs_list(struct sel *sel, int *x, int col)
 }
 
 static void update_screen_clients(struct sel *sel, int *x, int col,
-	int winmin, int winmax, struct conf **confs)
+	int winmin, int winmax)
 {
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	int s=0;
 #endif
 	struct cstat *c;
 	int star_printed=0;
-	int max_cname=28*((float)col/100);
-#ifdef HAVE_NCURSES_H
+	int max_cname=23*((float)col/100);
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS_SNAPSHOT)
 #endif
 	{
@@ -528,7 +548,7 @@ static void update_screen_clients(struct sel *sel, int *x, int col,
 	}
 	for(c=sel->clist; c; c=c->next)
 	{
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS)
 		{
 			s++;
@@ -537,9 +557,9 @@ static void update_screen_clients(struct sel *sel, int *x, int col,
 		}
 #endif
 
-		client_summary(c, (*x)++, col, max_cname, confs);
+		client_summary(c, (*x)++, col, max_cname);
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS && sel->client==c)
 		{
 			mvprintw((*x)+TOP_SPACE-1, 1, "*");
@@ -550,19 +570,55 @@ static void update_screen_clients(struct sel *sel, int *x, int col,
 	if(!star_printed) sel->client=sel->clist;
 }
 
-static void update_screen_backups(struct sel *sel, int *x, int col,
+static char *get_extradesc(struct bu *b, struct cntr *cntrs)
+{
+	char *extradesc=NULL;
+	struct cntr *cntr=NULL;
+	if(b->flags & BU_CURRENT)
+	{
+		extradesc=strdup_w(" (current)", __func__);
+	}
+	else if(b->flags & BU_WORKING)
+	{
+		extradesc=strdup_w(" (working)", __func__);
+	}
+	else if(b->flags & BU_FINISHING)
+	{
+		extradesc=strdup_w(" (finishing)", __func__);
+	}
+	else
+	{
+		extradesc=strdup_w("", __func__);
+	}
+
+	for(cntr=cntrs; cntr; cntr=cntr->next)
+	{
+		char phase[32]="";
+		if(cntr->bno==b->bno)
+		{
+			snprintf(phase, sizeof(phase),
+				" %s, pid: %d",
+				cntr_status_to_str(cntr), cntr->pid);
+			if(astrcat(&extradesc, phase, __func__))
+				return NULL;
+		}
+	}
+	return extradesc;
+}
+
+static int update_screen_backups(struct sel *sel, int *x, int col,
 	int winmin, int winmax)
 {
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	int s=0;
 #endif
 	struct bu *b;
 	char msg[1024]="";
 	int star_printed=0;
-	const char *extradesc=NULL;
 	for(b=sel->client->bu; b; b=b->next)
 	{
-#ifdef HAVE_NCURSES_H
+		char *extradesc=NULL;
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS)
 		{
 			s++;
@@ -571,21 +627,17 @@ static void update_screen_backups(struct sel *sel, int *x, int col,
 		}
 #endif
 
-		if(b->flags & BU_CURRENT)
-			extradesc=" (current)";
-		else if(b->flags & BU_WORKING)
-			extradesc=" (working)";
-		else if(b->flags & BU_FINISHING)
-			extradesc=" (finishing)";
-		else extradesc="";
+		if(!(extradesc=get_extradesc(b, sel->client->cntrs)))
+			return -1;
 
 		snprintf(msg, sizeof(msg), "%s %s%s",
 				b==sel->client->bu?"Backup list:":
 				"            ",
 				get_bu_str(b),
 				extradesc);
+		free_w(&extradesc);
 		print_line(msg, (*x)++, col);
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS && sel->backup==b)
 		{
 			mvprintw((*x)+TOP_SPACE-1, 1, "*");
@@ -594,6 +646,7 @@ static void update_screen_backups(struct sel *sel, int *x, int col,
 #endif
 	}
 	if(!star_printed) sel->backup=sel->client->bu;
+	return 0;
 }
 
 static void update_screen_live_counter_table(struct cntr_ent *e,
@@ -630,21 +683,23 @@ static void update_screen_live_counter_single(struct cntr_ent *e,
 		default:
 			break;
 	}
-	snprintf(msg, sizeof(msg), "%19s: %12llu %s",
+	snprintf(msg, sizeof(msg), "%19s: %12" PRIu64 " %s",
 		e->label, e->count, bytes_human);
 	print_line(msg, (*x)++, col);
 }
 
-static void update_screen_live_counters(struct cstat *client, int *x, int col)
+static void update_screen_live_counters(struct cntr *cntr, int *x, int col)
 {
 	char msg[128]="";
 	struct cntr_ent *e;
-	struct cntr *cntr=client->cntr;
 	time_t start=(time_t)cntr->ent[(uint8_t)CMD_TIMESTAMP]->count;
 	time_t end=(time_t)cntr->ent[(uint8_t)CMD_TIMESTAMP_END]->count;
 	struct cntr_ent *gtotal=cntr->ent[(uint8_t)CMD_GRAND_TOTAL];
 
 	print_line("", (*x)++, col);
+	snprintf(msg, sizeof(msg), "       PID: %d (%s)",
+		cntr->pid, cntr_status_to_str(cntr));
+	print_line(msg, (*x)++, col);
 	snprintf(msg, sizeof(msg), "Start time: %s", getdatestr(start));
 	print_line(msg, (*x)++, col);
 	snprintf(msg, sizeof(msg), "  End time: %s", getdatestr(end));
@@ -652,21 +707,38 @@ static void update_screen_live_counters(struct cstat *client, int *x, int col)
 	snprintf(msg, sizeof(msg), "Time taken: %s", time_taken(end-start));
 	print_line(msg, (*x)++, col);
 	table_header(x, col);
-	for(e=client->cntr->list; e; e=e->next)
+	for(e=cntr->list; e; e=e->next)
 		update_screen_live_counter_table(e, x, col);
 	print_line("", (*x)++, col);
-	snprintf(msg, sizeof(msg), "%19s: %llu%%", "Percentage complete",
-	  ((gtotal->count+gtotal->same+gtotal->changed)*100)/gtotal->phase1);
-	print_line(msg, (*x)++, col);
+
+	if(gtotal->phase1)
+	{
+		snprintf(msg, sizeof(msg),
+			"%19s: %" PRIu64 "%%", "Percentage complete",
+			((gtotal->count+gtotal->same+gtotal->changed)*100)/gtotal->phase1);
+		print_line(msg, (*x)++, col);
+	}
 	print_line("", (*x)++, col);
-	for(e=client->cntr->list; e; e=e->next)
+	for(e=cntr->list; e; e=e->next)
 		update_screen_live_counter_single(e, x, col);
+}
+
+static void update_screen_live_counters_w(struct sel *sel, int *x, int col)
+{
+	struct cstat *client=sel->client;
+	struct cntr *cntr=NULL;
+	for(cntr=client->cntrs; cntr; cntr=cntr->next)
+	{
+		if(sel->backup
+		  && sel->backup->bno==cntr->bno)
+			update_screen_live_counters(cntr, x, col);
+	}
 }
 
 static void update_screen_view_log(struct sel *sel, int *x, int col,
 	int winmin, int winmax)
 {
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	int s=0;
 #endif
 	int o=0;
@@ -676,13 +748,12 @@ static void update_screen_view_log(struct sel *sel, int *x, int col,
 
 	if(sel->client
 	  && sel->backup
-	  && (sel->backup->flags & (BU_WORKING|BU_FINISHING))
-	  && (sel->logop & BU_STATS_BACKUP))
-		return update_screen_live_counters(sel->client, x, col);
+	  && (sel->logop & BU_LIVE_COUNTERS))
+		return update_screen_live_counters_w(sel, x, col);
 
 	for(l=sel->llines; l; l=l->next)
 	{
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS)
 		{
 			s++;
@@ -695,7 +766,7 @@ static void update_screen_view_log(struct sel *sel, int *x, int col,
 		for(cp=l->line, o=0; *cp && o<sel->offset; cp++, o++) { }
 		print_line(cp, (*x)++, col);
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 		if(actg==ACTION_STATUS && sel->lline==l)
 		{
 			mvprintw((*x)+TOP_SPACE-1, 1, "*");
@@ -706,24 +777,32 @@ static void update_screen_view_log(struct sel *sel, int *x, int col,
 	if(!star_printed) sel->lline=sel->llines;
 }
 
-static int update_screen(struct sel *sel, struct conf **confs)
+static int update_screen(struct sel *sel)
 {
 	int x=0;
 	int row=24;
 	int col=80;
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	int selindex=0;
 	static int selindex_last=0;
 #endif
 	static int winmin=0;
 	static int winmax=0;
 
-	screen_header(row, col);
+	screen_header(col);
 
-#ifdef HAVE_NCURSES_H
+	if(!sel->client) return 0;
+
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS)
 	{
 		getmaxyx(stdscr, row, col);
+		// Unit tests give -1 for row and column.
+		// Hack around it so that the unit tests still work.
+		if(row<0)
+			row=24;
+		if(col<0)
+			col=80;
 		//if(!winmax) winmax=row;
 		switch(sel->page)
 		{
@@ -756,7 +835,7 @@ static int update_screen(struct sel *sel, struct conf **confs)
 			break;
 	}
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS)
 	{
 		// Adjust sliding window appropriately.
@@ -804,23 +883,21 @@ static int update_screen(struct sel *sel, struct conf **confs)
 	switch(sel->page)
 	{
 		case PAGE_CLIENT_LIST:
-			update_screen_clients(sel, &x, col,
-				winmin, winmax, confs);
+			update_screen_clients(sel, &x, col, winmin, winmax);
 			break;
 		case PAGE_BACKUP_LIST:
-			update_screen_backups(sel, &x, col,
-				winmin, winmax);
+			if(update_screen_backups(sel, &x, col, winmin, winmax))
+				return -1;
 			break;
 		case PAGE_BACKUP_LOGS:
 			print_logs_list(sel, &x, col);
 			break;
 		case PAGE_VIEW_LOG:
-			update_screen_view_log(sel, &x, col,
-				winmin, winmax);
+			update_screen_view_log(sel, &x, col, winmin, winmax);
 			break;
 	}
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS)
 	{
 		// Blank any remainder of the screen.
@@ -833,7 +910,7 @@ static int update_screen(struct sel *sel, struct conf **confs)
 }
 
 static int request_status(struct asfd *asfd,
-	const char *client, struct sel *sel, struct conf **confs)
+	const char *client, struct sel *sel)
 {
 	char buf[256]="";
 	switch(sel->page)
@@ -846,7 +923,8 @@ static int request_status(struct asfd *asfd,
 			break;
 		case PAGE_BACKUP_LOGS:
 			if(sel->backup)
-				snprintf(buf, sizeof(buf), "c:%s:b:%lu\n",
+				snprintf(buf, sizeof(buf),
+					"c:%s:b:%" PRIu64 "\n",
 					client, sel->backup->bno);
 			break;
 		case PAGE_VIEW_LOG:
@@ -860,35 +938,31 @@ static int request_status(struct asfd *asfd,
 				lname="verify";
 			else if(sel->logop & BU_MANIFEST)
 				lname="manifest";
-			else if(sel->logop & BU_STATS_BACKUP)
-			{
-			// Hack so that it does not request the logs for live
-			// counters.
-			// FIX THIS: need to do something similar for
-			// restore/verify.
-				if(!sel->backup) break;
-				if(sel->client
-				  && sel->client->run_status==RUN_STATUS_RUNNING
-				  && sel->backup->flags
-					& (BU_WORKING|BU_FINISHING))
-				{
-					// Make sure a request is sent, so that
-					// the counters update.
-					snprintf(buf, sizeof(buf),
-						"c:%s:b:%lu\n",
-						client, sel->backup->bno);
-					break;
-				}
-				else
-					lname="backup_stats";
-			}
 			else if(sel->logop & BU_STATS_RESTORE)
 				lname="restore_stats";
 			else if(sel->logop & BU_STATS_VERIFY)
 				lname="verify_stats";
+			else if(sel->logop & BU_STATS_BACKUP)
+				lname="backup_stats";
+			else if(sel->logop & BU_LIVE_COUNTERS)
+			{
+				// Hack so that it does not request the logs
+				// for live counters.
+				if(!sel->backup
+				  || !sel->client
+				  || !sel->client->cntrs)
+					break;
+				// Make sure a request is sent, so that the
+				// counters update.
+				snprintf(buf, sizeof(buf),
+					"c:%s:b:%" PRIu64 "\n",
+					client, sel->backup->bno);
+				break;
+			}
 
 			if(sel->backup && lname)
-				snprintf(buf, sizeof(buf), "c:%s:b:%lu:l:%s\n",
+				snprintf(buf, sizeof(buf),
+					"c:%s:b:%" PRIu64 ":l:%s\n",
 					client, sel->backup->bno, lname);
 			break;
 		}
@@ -903,16 +977,24 @@ static int request_status(struct asfd *asfd,
 */
 	if(*buf)
 	{
-		if(lfp) logp("request: %s\n", buf);
+		if(lfzp) logp("request: %s\n", buf);
 		if(asfd->write_str(asfd, CMD_GEN /* ignored */, buf)) return -1;
 	}
 	return 0;
 }
 
+#ifdef HAVE_NCURSES
+static void ncurses_free(void)
+{
+	endwin();
+}
+#endif
+
 static void sighandler(int sig)
 {
-#ifdef HAVE_NCURSES_H
-	if(actg==ACTION_STATUS) endwin();
+#ifdef HAVE_NCURSES
+	if(actg==ACTION_STATUS)
+		ncurses_free();
 #endif
         logp("got signal: %d\n", sig);
 	if(sig==SIGPIPE) logp("Server may have too many active status clients.\n");
@@ -928,7 +1010,7 @@ static void setup_signals(void)
 	signal(SIGPIPE, &sighandler);
 }
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 static void left(struct sel *sel)
 {
 	switch(sel->page)
@@ -966,7 +1048,7 @@ static void right(struct sel *sel)
 			sel->page=PAGE_BACKUP_LOGS;
 			break;
 		case PAGE_BACKUP_LOGS:
-			if(lfp) logp("Option selected: 0x%04X\n", sel->logop);
+			if(lfzp) logp("Option selected: 0x%04X\n", sel->logop);
 			sel->page=PAGE_VIEW_LOG;
 			break;
 		case PAGE_VIEW_LOG:
@@ -978,29 +1060,33 @@ static void right(struct sel *sel)
 
 static void up_client(struct sel *sel)
 {
-	if(sel->client && sel->client->prev) sel->client=sel->client->prev;
+	if(sel->client && sel->client->prev)
+		sel->client=sel->client->prev;
 }
 
 static void down_client(struct sel *sel)
 {
-	if(sel->client && sel->client->next) sel->client=sel->client->next;
+	if(sel->client && sel->client->next)
+		sel->client=sel->client->next;
 }
 
 static void up_backup(struct sel *sel)
 {
-	if(sel->backup && sel->backup->prev) sel->backup=sel->backup->prev;
+	if(sel->backup && sel->backup->prev)
+		sel->backup=sel->backup->prev;
 }
 
 static void down_backup(struct sel *sel)
 {
-	if(sel->backup && sel->backup->next) sel->backup=sel->backup->next;
+	if(sel->backup && sel->backup->next)
+		sel->backup=sel->backup->next;
 }
 
 static void up_logs(struct sel *sel)
 {
 	int i=0;
 	uint16_t sh=sel->logop;
-	for(i=0; sh>BU_MANIFEST && i<16; i++)
+	for(i=0; sh>BU_LIVE_COUNTERS && i<16; i++)
 	{
 		sh=sh>>1;
 		if(sh & sel->backup->flags)
@@ -1028,12 +1114,14 @@ static void down_logs(struct sel *sel)
 
 static void up_view_log(struct sel *sel)
 {
-	if(sel->lline && sel->lline->prev) sel->lline=sel->lline->prev;
+	if(sel->lline && sel->lline->prev)
+		sel->lline=sel->lline->prev;
 }
 
 static void down_view_log(struct sel *sel)
 {
-	if(sel->lline && sel->lline->next) sel->lline=sel->lline->next;
+	if(sel->lline && sel->lline->next)
+		sel->lline=sel->lline->next;
 }
 
 static void up(struct sel *sel)
@@ -1122,9 +1210,7 @@ static void page_down_backup(struct sel *sel, int row)
 
 static void page_up(struct sel *sel)
 {
-	int row=0;
-	int col=0;
-	getmaxyx(stdscr, row, col);
+	int row=getmaxy(stdscr);
 	switch(sel->page)
 	{
 		case PAGE_CLIENT_LIST:
@@ -1142,9 +1228,7 @@ static void page_up(struct sel *sel)
 
 static void page_down(struct sel *sel)
 {
-	int row=0;
-	int col=0;
-	getmaxyx(stdscr, row, col);
+	int row=getmaxy(stdscr);
 	switch(sel->page)
 	{
 		case PAGE_CLIENT_LIST:
@@ -1160,13 +1244,13 @@ static void page_down(struct sel *sel)
 	}
 }
 
-static int parse_stdin_data(struct asfd *asfd, struct sel *sel, int count)
+static int parse_stdin_data(struct asfd *asfd, struct sel *sel)
 {
 	static int ch;
 	if(asfd->rbuf->len!=sizeof(ch))
 	{
-		logp("Unexpected input length in %s: %d\n",
-			__func__, asfd->rbuf->len);
+		logp("Unexpected input length in %s: %lu!=%zu\n",
+			__func__, (unsigned long)asfd->rbuf->len, sizeof(ch));
 		return -1;
 	}
 	memcpy(&ch, asfd->rbuf->buf, sizeof(ch));
@@ -1175,11 +1259,6 @@ static int parse_stdin_data(struct asfd *asfd, struct sel *sel, int count)
 		case 'q':
 		case 'Q':
 			return 1;
-		case 't':
-		case 'T':
-			if(toggle) toggle=0;
-			else toggle=1;
-			break;
 		case KEY_UP:
 		case 'k':
 		case 'K':
@@ -1218,31 +1297,56 @@ static int parse_stdin_data(struct asfd *asfd, struct sel *sel, int count)
 }
 #endif
 
-static int parse_data(struct asfd *asfd, struct sel *sel, int count)
+static int parse_data(struct asfd *asfd, struct sel *sel)
 {
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS && asfd->streamtype==ASFD_STREAM_NCURSES_STDIN)
-		return parse_stdin_data(asfd, sel, count);
+		return parse_stdin_data(asfd, sel);
 #endif
-	return json_input(asfd, sel);
+	switch(json_input(asfd, sel))
+	{
+		// 0 means carry on.
+		// 1 means it got to the end of the JSON statement.
+		// 2 means it got to the end but had warnings.
+		// Anything else means an error.
+		case 0: return 0;
+		case 1: return 0;
+		case 2:
+		{
+			// If we had a warning exit straight away. For example,
+			// if they specified '-C non-existent-client'.
+			return -1;
+		}
+		default: return -1;
+	}
 }
 
-static int main_loop(struct async *as, enum action act, struct conf **confs)
+#ifndef UTEST
+static
+#endif
+int status_client_ncurses_main_loop(struct async *as,
+	struct asfd *so_asfd, struct sel *sel,
+	const char *orig_client)
 {
 	int ret=-1;
 	char *client=NULL;
-	int count=0;
 	struct asfd *asfd=NULL;
-	struct asfd *sfd=as->asfd; // Server asfd.
+	struct asfd *sfd=NULL; // Server asfd.
 	int reqdone=0;
-	struct sel *sel=NULL;
-	const char *orig_client=get_string(confs[OPT_ORIG_CLIENT]);
+	int client_count=-1;
 
-	if(!(sel=(struct sel *)calloc_w(1, sizeof(struct sel), __func__)))
+	if(!sel
+	  || !as
+	  || !(stdout_asfd=so_asfd)
+	  || !(sfd=as->asfd))
+	{
+		logp("parameters not set up correctly in %s\n", __func__);
 		goto error;
+	}
+
 	sel->page=PAGE_CLIENT_LIST;
 
-	if(orig_client && !client)
+	if(orig_client)
 	{
 		client=strdup_w(orig_client, __func__);
 		sel->page=PAGE_BACKUP_LIST;
@@ -1255,12 +1359,20 @@ static int main_loop(struct async *as, enum action act, struct conf **confs)
 			char *req=NULL;
 			if(sel->page>PAGE_CLIENT_LIST)
 			{
-				if(client) req=client;
-				else if(sel->client) req=sel->client->name;
+				if(client)
+					req=client;
+				else if(sel->client)
+					req=sel->client->name;
 			}
-			if(request_status(sfd,
-				req, sel, confs)) goto error;
-			if(act==ACTION_STATUS_SNAPSHOT)
+			if(request_status(sfd, req?req:"", sel))
+				goto error;
+
+			// We only want to start on the client the user gave to
+			// us. Freeing it will allow the user to browse other
+			// clients thereafter.
+			free_w(&client);
+
+			if(actg==ACTION_STATUS_SNAPSHOT)
 				reqdone=1;
 		}
 
@@ -1280,50 +1392,60 @@ static int main_loop(struct async *as, enum action act, struct conf **confs)
 		}
 
 		for(asfd=as->asfd; asfd; asfd=asfd->next)
-			while(asfd->rbuf->buf)
 		{
-			switch(parse_data(asfd, sel, count))
+			while(asfd->rbuf->buf)
 			{
-				case 0: break;
-				case 1: goto end;
-				default: goto error;
+				switch(parse_data(asfd, sel))
+				{
+					case 0: break;
+					case 1: goto end;
+					default: goto error;
+				}
+				iobuf_free_content(asfd->rbuf);
+				if(asfd->parse_readbuf(asfd))
+					goto error;
 			}
-			iobuf_free_content(asfd->rbuf);
-			if(asfd->parse_readbuf(asfd))
-				goto error;
+
+			// Select things if they are not already selected.
+			if(sel->client)
+			{
+				if(!sel->backup)
+					sel->backup=sel->client->bu;
+			}
+			else
+				sel->client=sel->clist;
 		}
 
-		if(!sel->client) sel->client=sel->clist;
-		if(!sel->backup && sel->client) sel->backup=sel->client->bu;
-
-#ifdef HAVE_NCURSES_H
-		if(act==ACTION_STATUS
-		  && update_screen(sel, confs))
+#ifdef HAVE_NCURSES
+		if(actg==ACTION_STATUS
+		  && update_screen(sel))
 			goto error;
 		refresh();
 #endif
 
-		if(act==ACTION_STATUS_SNAPSHOT
-		  && sel->gotfirstresponse)
+		if(actg==ACTION_STATUS_SNAPSHOT)
 		{
-			if(update_screen(sel, confs))
-				goto error;
-			// FIX THIS - should probably set up stdout with an
-			// asfd.
-			printf("\n");
-			break;
+			int new_count=cstat_count(sel->clist);
+			if(new_count==client_count
+		  	  && sel->client)
+			{
+				if(update_screen(sel))
+					goto error;
+				stdout_asfd->write_str(stdout_asfd,
+					CMD_GEN, "\n");
+				break;
+			}
+			client_count=new_count;
 		}
 	}
 
 end:
 	ret=0;
 error:
-	// FIX THIS: should probably be freeing a bunch of stuff here.
-	free_v((void **)&sel);
 	return ret;
 }
 
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 static void ncurses_init(void)
 {
 	initscr();
@@ -1342,9 +1464,26 @@ static pid_t fork_monitor(int *csin, int *csout, struct conf **confs)
 {
 	int a=0;
 	char *args[12];
+	char procpath[32];
+	char buf[PATH_MAX];
+	char *monitor_exe;
 
-	// FIX THIS: get all args from configuration.
-	args[a++]=(char *)"/usr/sbin/burp";
+	monitor_exe=get_string(confs[OPT_MONITOR_EXE]);
+	snprintf(procpath, sizeof(procpath), "/proc/%d/exe", getpid());
+	if(monitor_exe && is_reg_lstat(monitor_exe)>0)
+		args[a++]=monitor_exe;
+	else if(!readlink_w(procpath, buf, sizeof(buf)))
+		args[a++]=(char *)buf;
+	else if(is_reg_lstat(prog_long)>0)
+		args[a++]=(char *)prog_long;
+	else
+	{
+		static char p[64]="";
+		snprintf(p, sizeof(p), "/usr/sbin/%s", PACKAGE_TARNAME);
+		logp("Using fallback monitor path: %s\n", p);
+		args[a++]=p;
+	}
+
 	args[a++]=(char *)"-c";
 	args[a++]=get_string(confs[OPT_CONFFILE]);
 	args[a++]=(char *)"-a";
@@ -1354,24 +1493,44 @@ static pid_t fork_monitor(int *csin, int *csout, struct conf **confs)
 	return forkchild_fd(csin, csout, NULL, args[0], args);
 }
 
-int status_client_ncurses(enum action act, struct conf **confs)
+int status_client_ncurses_init(enum action act)
 {
-	int csin=-1;
-	int csout=-1;
-        int ret=-1;
-	pid_t childpid=-1;
-	struct async *as=NULL;
-	const char *monitor_logfile=get_string(confs[OPT_MONITOR_LOGFILE]);
-
-#ifdef HAVE_NCURSES_H
-	actg=act; // So that the sighandler can call endwin().
-#else
+	actg=act;
+#ifndef HAVE_NCURSES
 	if(act==ACTION_STATUS)
 	{
 		printf("To use the live status monitor, you need to recompile with ncurses support.\n");
-		goto end;
+		return -1;
 	}
 #endif
+	return 0;
+}
+
+static void show_loglines(struct lline *llines, const char *prefix)
+{
+	struct lline *l;
+	for(l=llines; l; l=l->next)
+		logp("%s%s\n", prefix, l->line);
+}
+
+int status_client_ncurses(struct conf **confs)
+{
+        int ret=-1;
+	int csin=-1;
+	int csout=-1;
+	pid_t childpid=-1;
+	struct async *as=NULL;
+	const char *monitor_logfile=get_string(confs[OPT_MONITOR_LOGFILE]);
+	struct asfd *so_asfd=NULL;
+	struct sel *sel=NULL;
+	struct lline *llines=NULL;
+	struct lline *wlines=NULL;
+
+	if(json_input_init())
+		goto end;
+
+	if(!(sel=sel_alloc()))
+		goto end;
 
 	setup_signals();
 
@@ -1380,42 +1539,51 @@ int status_client_ncurses(enum action act, struct conf **confs)
 	if((childpid=fork_monitor(&csin, &csout, confs))<0)
 		goto end;
 //printf("childpid: %d\n", childpid);
-	set_non_blocking(csin);
-	set_non_blocking(csout);
 
 	if(!(as=async_alloc())
 	  || as->init(as, 0)
-	  || !setup_asfd(as, "monitor stdin", &csin, NULL,
-		ASFD_STREAM_LINEBUF, ASFD_FD_CLIENT_MONITOR_WRITE, -1, confs)
-	  || !setup_asfd(as, "monitor stdout", &csout, NULL,
-		ASFD_STREAM_LINEBUF, ASFD_FD_CLIENT_MONITOR_READ, -1, confs))
-			goto end;
+	  || !setup_asfd_linebuf_write(as, "monitor stdin", &csin)
+	  || !setup_asfd_linebuf_read(as, "monitor stdout", &csout))
+		goto end;
 //printf("ml: %s\n", monitor_logfile);
-#ifdef HAVE_NCURSES_H
+#ifdef HAVE_NCURSES
 	if(actg==ACTION_STATUS)
 	{
-		int stdinfd=fileno(stdin);
-		if(!setup_asfd(as, "stdin", &stdinfd, NULL,
-			ASFD_STREAM_NCURSES_STDIN, ASFD_FD_CLIENT_NCURSES_READ,
-			-1, confs))
-				goto end;
+		if(!setup_asfd_ncurses_stdin(as))
+			goto end;
 		ncurses_init();
 	}
 #endif
-	if(monitor_logfile
-	  && !(lfp=open_file(monitor_logfile, "wb")))
+	if(!(so_asfd=setup_asfd_stdout(as)))
 		goto end;
-	set_logfp_direct(lfp);
 
-	ret=main_loop(as, act, confs);
+	if(monitor_logfile
+	  && !(lfzp=fzp_open(monitor_logfile, "wb")))
+		goto end;
+	log_fzp_set_direct(lfzp);
+
+	ret=status_client_ncurses_main_loop(as, so_asfd, sel,
+		get_string(confs[OPT_ORIG_CLIENT]));
 end:
-#ifdef HAVE_NCURSES_H
-	if(actg==ACTION_STATUS) endwin();
+#ifdef HAVE_NCURSES
+	if(actg==ACTION_STATUS)
+		ncurses_free();
 #endif
-	if(ret) logp("%s exiting with error: %d\n", __func__, ret);
-	close_fp(&lfp);
+	llines=json_input_get_loglines();
+	wlines=json_input_get_warnings();
+	if(ret)
+	{
+		show_loglines(llines, "");
+		show_loglines(wlines, "WARNING: ");
+		logp("%s exiting with error: %d\n", __func__, ret);
+	}
+	json_input_clear_loglines();
+	json_input_clear_warnings();
+	json_input_free();
+	fzp_close(&lfzp);
 	async_asfd_free_all(&as);
 	close_fd(&csin);
 	close_fd(&csout);
+	sel_free(&sel);
 	return ret;
 }

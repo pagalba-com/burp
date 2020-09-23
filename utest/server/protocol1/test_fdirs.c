@@ -1,20 +1,25 @@
-#include <check.h>
-#include <stdio.h>
 #include "../../test.h"
+#include "../../builders/build_file.h"
 #include "../../../src/alloc.h"
 #include "../../../src/conf.h"
 #include "../../../src/conffile.h"
+#include "../../../src/fsops.h"
 #include "../../../src/server/protocol1/fdirs.h"
 #include "../../../src/server/sdirs.h"
+
+#define BASE	"utest_server_protocol1_fdirs"
 
 static struct conf **setup_confs(void)
 {
 	struct conf **confs;
+	const char *conffile=BASE "/burp.conf";
 	confs=confs_alloc();
 	confs_init(confs);
-	fail_unless(!conf_load_global_only_buf(MIN_SERVER_CONF, confs));
+	fail_unless(!recursive_delete(BASE));
+	build_file(conffile, MIN_SERVER_CONF);
+	fail_unless(!conf_load_global_only(conffile, confs));
 	set_string(confs[OPT_CNAME], "utestclient");
-	set_e_protocol(confs[OPT_PROTOCOL], PROTO_1);
+	set_protocol(confs, PROTO_1);
 	return confs;
 }
 
@@ -22,7 +27,7 @@ static struct sdirs *setup_sdirs(struct conf **confs)
 {
 	struct sdirs *sdirs;
 	fail_unless((sdirs=sdirs_alloc())!=NULL);
-	fail_unless(sdirs_init(sdirs, confs)==0);
+	fail_unless(sdirs_init_from_confs(sdirs, confs)==0);
 	return sdirs;
 }
 
@@ -36,10 +41,11 @@ static struct fdirs *setup(struct sdirs *sdirs)
 static void tear_down(struct fdirs **fdirs,
 	struct sdirs **sdirs, struct conf ***confs)
 {
+	fail_unless(!recursive_delete(BASE));
 	fdirs_free(fdirs);
 	sdirs_free(sdirs);
 	confs_free(confs);
-	fail_unless(free_count==alloc_count);
+	alloc_check();
 }
 
 #define CLIENTDIR	"/a/directory/utestclient"

@@ -1,12 +1,9 @@
 #include <check.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "test.h"
 #include "../src/alloc.h"
 #include "../src/conf.h"
-
-// Stuff pulled in from strlist.c:
-#include "../src/regexp.h"
-int compile_regex(regex_t **regex, const char *str) { return 0; }
 
 static void check_default(struct conf **c, enum conf_opt o)
 {
@@ -17,11 +14,7 @@ static void check_default(struct conf **c, enum conf_opt o)
 			break;
 		case OPT_LOCKFILE:
 		case OPT_PIDFILE:
-		case OPT_ADDRESS:
-		case OPT_PORT:
-		case OPT_STATUS_ADDRESS:
-		case OPT_STATUS_PORT:
-        	case OPT_SSL_CERT_CA:
+		case OPT_SSL_CERT_CA:
 		case OPT_SSL_CERT:
 		case OPT_SSL_KEY:
 		case OPT_SSL_KEY_PASSWORD:
@@ -33,6 +26,7 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_CA_SERVER_NAME:
 		case OPT_CA_BURP_CA:
 		case OPT_CA_CSR_DIR:
+		case OPT_CA_CRL:
 		case OPT_PEER_VERSION:
 		case OPT_CLIENT_LOCKDIR:
 		case OPT_MONITOR_LOGFILE:
@@ -46,7 +40,7 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_BACKUP:
 		case OPT_BACKUP2:
 		case OPT_RESTOREPREFIX:
-		case OPT_RESTORE_SPOOL:
+		case OPT_STRIP_FROM_PATH:
 		case OPT_BROWSEFILE:
 		case OPT_BROWSEDIR:
 		case OPT_B_SCRIPT_PRE:
@@ -57,6 +51,7 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_R_SCRIPT:
 		case OPT_RESTORE_PATH:
 		case OPT_ORIG_CLIENT:
+		case OPT_CONNECT_CLIENT:
 		case OPT_CONFFILE:
 		case OPT_USER:
 		case OPT_GROUP:
@@ -73,7 +68,11 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_DEDUP_GROUP:
 		case OPT_VSS_DRIVES:
 		case OPT_REGEX:
-		case OPT_RESTORE_CLIENT:
+		case OPT_SUPER_CLIENT:
+		case OPT_MONITOR_EXE:
+		case OPT_SEED_SRC:
+		case OPT_SEED_DST:
+		case OPT_RESTORE_LIST:
 			fail_unless(get_string(c[o])==NULL);
 			break;
 		case OPT_RATELIMIT:
@@ -84,6 +83,7 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_B_SCRIPT_POST_RUN_ON_FAIL:
 		case OPT_R_SCRIPT_POST_RUN_ON_FAIL:
 		case OPT_SEND_CLIENT_CNTR:
+		case OPT_READALL:
 		case OPT_BREAKPOINT:
 		case OPT_SYSLOG:
 		case OPT_PROGRESS_COUNTER:
@@ -93,8 +93,8 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_S_SCRIPT_POST_NOTIFY:
 		case OPT_S_SCRIPT_NOTIFY:
 		case OPT_HARDLINKED_ARCHIVE:
-        	case OPT_N_SUCCESS_WARNINGS_ONLY:
-        	case OPT_N_SUCCESS_CHANGES_ONLY:
+		case OPT_N_SUCCESS_WARNINGS_ONLY:
+		case OPT_N_SUCCESS_CHANGES_ONLY:
 		case OPT_CROSS_ALL_FILESYSTEMS:
 		case OPT_READ_ALL_FIFOS:
 		case OPT_READ_ALL_BLOCKDEVS:
@@ -103,35 +103,59 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_ATIME:
 		case OPT_SCAN_PROBLEM_RAISES_ERROR:
 		case OPT_OVERWRITE:
+		case OPT_CNAME_LOWERCASE:
 		case OPT_STRIP:
 		case OPT_MESSAGE:
+		case OPT_CA_CRL_CHECK:
+		case OPT_PORT_BACKUP:
+		case OPT_PORT_RESTORE:
+		case OPT_PORT_VERIFY:
+		case OPT_PORT_LIST:
+		case OPT_PORT_DELETE:
+		case OPT_MAX_RESUME_ATTEMPTS:
+		case OPT_FAIL_ON_WARNING:
+		case OPT_SSL_VERIFY_PEER_EARLY:
+		case OPT_FAILOVER_ON_BACKUP_ERROR:
+		case OPT_BACKUP_FAILOVERS_LEFT:
+		case OPT_N_FAILURE_BACKUP_WORKING_DELETION:
+		case OPT_MAX_PARALLEL_BACKUPS:
+		case OPT_TIMER_REPEAT_INTERVAL:
 			fail_unless(get_int(c[o])==0);
+			break;
+		case OPT_VSS_RESTORE:
+			fail_unless(get_int(c[o])==VSS_RESTORE_ON);
 			break;
 		case OPT_DAEMON:
 		case OPT_STDOUT:
 		case OPT_FORK:
+		case OPT_ENABLED:
 		case OPT_DIRECTORY_TREE:
 		case OPT_PASSWORD_CHECK:
 		case OPT_LIBRSYNC:
 		case OPT_VERSION_WARN:
 		case OPT_PATH_LENGTH_WARN:
+		case OPT_CNAME_FQDN:
 		case OPT_CLIENT_CAN_DELETE:
 		case OPT_CLIENT_CAN_DIFF:
 		case OPT_CLIENT_CAN_FORCE_BACKUP:
 		case OPT_CLIENT_CAN_LIST:
+		case OPT_CLIENT_CAN_MONITOR:
 		case OPT_CLIENT_CAN_RESTORE:
 		case OPT_CLIENT_CAN_VERIFY:
 		case OPT_SERVER_CAN_RESTORE:
+		case OPT_SERVER_CAN_OVERRIDE_INCLUDES:
 		case OPT_B_SCRIPT_RESERVED_ARGS:
 		case OPT_R_SCRIPT_RESERVED_ARGS:
+		case OPT_GLOB_AFTER_SCRIPT_PRE:
+		case OPT_ACL:
+		case OPT_XATTR:
+		case OPT_N_FAILURE_BACKUP_FAILOVERS_LEFT:
 			fail_unless(get_int(c[o])==1);
 			break;
 		case OPT_NETWORK_TIMEOUT:
 			fail_unless(get_int(c[o])==60*60*2);
 			break;
 		case OPT_SSL_COMPRESSION:
-		case OPT_MAX_CHILDREN:
-		case OPT_MAX_STATUS_CHILDREN:
 			fail_unless(get_int(c[o])==5);
 			break;
         	case OPT_COMPRESSION:
@@ -160,6 +184,7 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_N_SUCCESS_ARG:
 		case OPT_N_FAILURE_ARG:
 		case OPT_RESTORE_CLIENTS:
+		case OPT_SUPER_CLIENTS:
 		case OPT_KEEP:
 		case OPT_INCEXCDIR:
 		case OPT_INCLUDE:
@@ -170,11 +195,22 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_EXCEXT:
 		case OPT_INCREG:
 		case OPT_EXCREG:
+		case OPT_INCLOGIC:
+		case OPT_EXCLOGIC:
 		case OPT_EXCFS:
+		case OPT_INCFS:
 		case OPT_EXCOM:
 		case OPT_INCGLOB:
-        	case OPT_FIFOS:
-        	case OPT_BLOCKDEVS:
+		case OPT_FIFOS:
+		case OPT_BLOCKDEVS:
+		case OPT_LABEL:
+		case OPT_PORT:
+		case OPT_STATUS_PORT:
+		case OPT_LISTEN:
+		case OPT_LISTEN_STATUS:
+		case OPT_MAX_CHILDREN:
+		case OPT_MAX_STATUS_CHILDREN:
+		case OPT_SERVER_FAILOVER:
 			fail_unless(get_strlist(c[o])==NULL);
 			break;
 		case OPT_PROTOCOL:
@@ -184,19 +220,26 @@ static void check_default(struct conf **c, enum conf_opt o)
 		case OPT_SOFT_QUOTA:
 		case OPT_MIN_FILE_SIZE:
 		case OPT_MAX_FILE_SIZE:
-			fail_unless(get_ssize_t(c[o])==0);
+		case OPT_LIBRSYNC_MAX_SIZE:
+			fail_unless(get_uint64_t(c[o])==0);
 			break;
-        	case OPT_WORKING_DIR_RECOVERY_METHOD:
+		case OPT_RBLK_MEMORY_MAX:
+			fail_unless(get_uint64_t(c[o])==256*1024*1024);
+			break;
+		case OPT_SPARSE_SIZE_MAX:
+			fail_unless(get_uint64_t(c[o])==256*1024*1024);
+			break;
+		case OPT_WORKING_DIR_RECOVERY_METHOD:
 			fail_unless(get_e_recovery_method(c[o])==
 				RECOVERY_METHOD_DELETE);
 			break;
-        	case OPT_RSHASH:
+		case OPT_RSHASH:
 			fail_unless(get_e_rshash(c[o])==RSHASH_UNSET);
 			break;
 		case OPT_CNTR:
-			fail_unless(get_cntr(c[o])==NULL);
+			fail_unless(get_cntr(c)==NULL);
 			break;
-        	case OPT_MAX:
+		case OPT_MAX:
 			break;
 		// No default, so we get compiler warnings if something was
 		// missed.
@@ -206,14 +249,14 @@ static void check_default(struct conf **c, enum conf_opt o)
 START_TEST(test_conf_defaults)
 {
 	int i=0;
-        struct conf **confs=NULL;
-        confs=confs_alloc();
+	struct conf **confs=NULL;
+	fail_unless((confs=confs_alloc())!=NULL);
 	confs_init(confs);
 	for(i=0; i<OPT_MAX; i++)
 		check_default(confs, (enum conf_opt)i);
 	confs_free(&confs);
 	fail_unless(confs==NULL);
-	fail_unless(alloc_count==free_count);
+	alloc_check();
 }
 END_TEST
 

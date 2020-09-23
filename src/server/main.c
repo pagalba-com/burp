@@ -1,17 +1,31 @@
-#include "include.h"
+#include "../burp.h"
+#include "../asfd.h"
+#include "../async.h"
+#include "../cntr.h"
+#include "../conf.h"
+#include "../conffile.h"
+#include "../cstat.h"
+#include "../fsops.h"
+#include "../handy.h"
+#include "../iobuf.h"
 #include "../lock.h"
+#include "../log.h"
+#include "auth.h"
+#include "ca.h"
+#include "child.h"
+#include "main.h"
+#include "run_action.h"
 #include "monitor/status_server.h"
 
-#include <netdb.h>
-
-// FIX THIS: Should be able to configure multiple addresses and ports.
-#define LISTEN_SOCKETS	32
+#ifdef HAVE_SYSTEMD
+#include  <systemd/sd-daemon.h>
+#endif
 
 static int hupreload=0;
 static int hupreload_logged=0;
 static int gentleshutdown=0;
 static int gentleshutdown_logged=0;
-static int sigchld=0;
+static struct fzp *devnull;
 
 // These will also be used as the exit codes of the program and are therefore
 // unsigned integers.
@@ -22,159 +36,182 @@ enum serret
 	SERVER_ERROR=1
 };
 
-static void huphandler(int sig)
+static void huphandler(__attribute__ ((unused)) int sig)
 {
 	hupreload=1;
 	// Be careful about not logging inside a signal handler.
 	hupreload_logged=0;
 }
 
-static void usr2handler(int sig)
+static void usr2handler(__attribute__ ((unused)) int sig)
 {
 	gentleshutdown=1;
 	// Be careful about not logging inside a signal handler.
 	gentleshutdown_logged=0;
 }
 
-static void init_fds(int *fds)
-{
-	for(int i=0; i<LISTEN_SOCKETS; i++) fds[i]=-1;
-}
-
-static void close_fds(int *fds)
-{
-	for(int i=0; i<LISTEN_SOCKETS; i++) close_fd(&(fds[i]));
-}
-
 // Remove any exiting child pids from our list.
-// FIX THIS.
 static void chld_check_for_exiting(struct async *mainas)
 {
 	pid_t p;
 	int status;
 	struct asfd *asfd;
-	if((p=waitpid(-1, &status, WNOHANG))<=0) return;
 
-	// Logging a message here appeared to occasionally lock burp up on a
-	// Ubuntu server that I used to use.
-	//logp("child pid %d exited\n", p);
-	for(asfd=mainas->asfd; asfd; asfd=asfd->next)
+	while((p=waitpid(-1, &status, WNOHANG))>0)
 	{
-		if(p!=asfd->pid) continue;
-		mainas->asfd_remove(mainas, asfd);
-		asfd_free(&asfd);
-		break;
+		// Logging a message here appeared to occasionally lock burp up
+		// on a Ubuntu server that I used to use.
+		for(asfd=mainas->asfd; asfd; asfd=asfd->next)
+		{
+			if(p!=asfd->pid) continue;
+			mainas->asfd_remove(mainas, asfd);
+			asfd_free(&asfd);
+			break;
+		}
 	}
 }
 
-static int init_listen_socket(const char *address, const char *port,
-	int alladdr, int *fds)
+static void *get_in_addr(struct sockaddr *sa)
 {
-	int i;
+#ifdef HAVE_IPV6
+	if(sa->sa_family==AF_INET6)
+		return &(((struct sockaddr_in6*)sa)->sin6_addr);
+#endif
+	return &(((struct sockaddr_in*)sa)->sin_addr);
+}
+
+static void log_listen_socket(const char *desc,
+	struct addrinfo *rp, const char *port, int max_children)
+{
+#ifdef HAVE_IPV6
+	char addr[INET6_ADDRSTRLEN]="";
+#else
+	char addr[INET_ADDRSTRLEN]="";
+#endif
+	inet_ntop(rp->ai_family, get_in_addr((struct sockaddr *)rp->ai_addr),
+		addr, sizeof(addr));
+	logp("%s %s:%s (max %d)\n",
+		desc, addr, port, max_children);
+}
+
+static int split_addr(char **address, char **port)
+{
+	char *cp;
+	if(!(cp=strrchr(*address, ':')))
+	{
+		logp("Could not parse '%s'\n", *address);
+		return -1;
+	}
+	*cp='\0';
+	*port=cp+1;
+	return 0;
+}
+
+static int init_listen_socket(struct strlist *address,
+	struct async *mainas, enum asfd_fdtype fdtype, const char *desc)
+{
+	int fd=-1;
 	int gai_ret;
 	struct addrinfo hints;
-	struct addrinfo *rp=NULL;
 	struct addrinfo *info=NULL;
+	struct asfd *newfd=NULL;
+	char *a=NULL;
+	char *port=NULL;
 
-	close_fds(fds);
+	if(!(a=strdup_w(address->path, __func__)))
+		goto error;
+	if(split_addr(&a, &port))
+		goto error;
 
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family=AF_UNSPEC;
 	hints.ai_socktype=SOCK_STREAM;
 	hints.ai_protocol=IPPROTO_TCP;
 	hints.ai_flags=AI_NUMERICHOST;
-	//if(alladdr) hints.ai_flags|=AI_PASSIVE;
+	hints.ai_flags|=AI_PASSIVE;
 
-	if((gai_ret=getaddrinfo(address, port, &hints, &info)))
+	if((gai_ret=getaddrinfo(a, port, &hints, &info)))
 	{
-		logp("unable to getaddrinfo on port %s: %s\n",
-			port, gai_strerror(gai_ret));
-		return -1;
+		logp("unable to getaddrinfo on %s: %s\n",
+			address->path, gai_strerror(gai_ret));
+		goto error;
 	}
 
-	i=0;
-	for(rp=info; rp && i<LISTEN_SOCKETS; rp=rp->ai_next)
+	// Just try to use the first one in info, it should be good enough.
+	fd=socket(info->ai_family, info->ai_socktype, info->ai_protocol);
+	if(fd<0)
 	{
-		fds[i]=socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-		if(fds[i]<0)
-		{
-			logp("unable to create socket on port %s: %s\n",
-				port, strerror(errno));
-			continue;
-		}
-		reuseaddr(fds[i]);
-		if(bind(fds[i], rp->ai_addr, rp->ai_addrlen))
-		{
-			logp("unable to bind socket on port %s: %s\n",
-				port, strerror(errno));
-			close(fds[i]);
-			fds[i]=-1;
-			continue;
-		}
-
+		logp("unable to create socket on %s: %s\n",
+			address->path, strerror(errno));
+		goto error;
+	}
+	set_keepalive(fd, 1);
 #ifdef HAVE_IPV6
-		if(rp->ai_family==AF_INET6)
-		{
-			// Attempt to say that it should not listen on IPv6
-			// only.
-			int optval=0;
-			setsockopt(fds[i], IPPROTO_IPV6, IPV6_V6ONLY,
-				&optval, sizeof(optval));
-		}
-#endif
-
-		// Say that we are happy to accept connections.
-		if(listen(fds[i], 5)<0)
-		{
-			close_fd(&(fds[i]));
-			logp("could not listen on main socket %d\n", port);
-			return -1;
-		}
-
-#ifdef HAVE_WIN32
-		{
-			u_long ioctlArg=0;
-			ioctlsocket(fds[i], FIONBIO, &ioctlArg);
-		}
-#endif
-		i++;
-	}
-
-	freeaddrinfo(info);
-
-	if(!i)
+	if(info->ai_family==AF_INET6)
 	{
-		logp("could not listen on address: %s\n", address);
-#ifdef HAVE_IPV6
-		if(strchr(address, ':'))
-			logp("maybe check whether your OS has IPv6 enabled.\n");
+		// Attempt to say that it should not listen on IPv6
+		// only.
+		int optval=0;
+		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+			&optval, sizeof(optval));
+	}
 #endif
-		return -1;
+	reuseaddr(fd);
+	if(bind(fd, info->ai_addr, info->ai_addrlen))
+	{
+		logp("unable to bind socket on %s: %s\n",
+			address->path, strerror(errno));
+		goto error;
 	}
 
+	// Say that we are happy to accept connections.
+	if(listen(fd, 5)<0)
+	{
+		logp("could not listen on address %s: %s\n",
+			address->path, strerror(errno));
+		goto error;
+	}
+
+	log_listen_socket(desc, info, port, address->flag);
+	if(!(newfd=setup_asfd(mainas, desc, &fd, address->path)))
+		goto end;
+	newfd->fdtype=fdtype;
+
+	goto end;
+error:
+	free_w(&a);
+	if(info)
+		freeaddrinfo(info);
+	return -1;
+end:
+	free_w(&a);
+	if(info)
+		freeaddrinfo(info);
 	return 0;
 }
 
-static void sigchld_handler(int sig)
+static int init_listen_sockets(struct strlist *addresses,
+	struct async *mainas, enum asfd_fdtype fdtype, const char *desc)
 {
-	sigchld=1;
+	struct strlist *a;
+	for(a=addresses; a; a=a->next)
+		if(init_listen_socket(a, mainas, fdtype, desc))
+			return -1;
+	return 0;
 }
 
-int setup_signals(int oldmax_children, int max_children,
-	int oldmax_status_children, int max_status_children)
+void setup_signals(void)
 {
 	// Ignore SIGPIPE - we are careful with read and write return values.
 	signal(SIGPIPE, SIG_IGN);
 
-	setup_signal(SIGCHLD, sigchld_handler);
 	setup_signal(SIGHUP, huphandler);
 	setup_signal(SIGUSR2, usr2handler);
-
-	return 0;
 }
 
-static int run_child(int *cfd, SSL_CTX *ctx,
-	int status_wfd, int status_rfd, const char *conffile, int forking)
+static int run_child(int *cfd, SSL_CTX *ctx, struct sockaddr_storage *addr,
+	int status_wfd, int status_rfd, const char *conffile, int forking,
+	const char *peer_addr)
 {
 	int ret=-1;
 	int ca_ret=0;
@@ -185,12 +222,14 @@ static int run_child(int *cfd, SSL_CTX *ctx,
 	struct cntr *cntr=NULL;
 	struct async *as=NULL;
 	const char *cname=NULL;
+	struct asfd *asfd=NULL;
+	int is_status_server=0;
 
 	if(!(confs=confs_alloc())
 	  || !(cconfs=confs_alloc()))
 		goto end;
 
-	set_peer_env_vars(*cfd);
+	set_peer_env_vars(addr);
 
 	// Reload global config, in case things have changed. This means that
 	// the server does not need to be restarted for most conf changes.
@@ -210,36 +249,43 @@ static int run_child(int *cfd, SSL_CTX *ctx,
 	}
 	SSL_set_bio(ssl, sbio, sbio);
 
-	/* Do not try to check peer certificate straight away.
-	   Clients can send a certificate signing request when they have
-	   no certificate. */
-	SSL_set_verify(ssl, SSL_VERIFY_PEER
-		/* | SSL_VERIFY_FAIL_IF_NO_PEER_CERT */, 0);
+	/* Check peer certificate straight away if the "verify_peer_early"
+	   option is enabled. Otherwise clients may send a certificate signing
+	   request when they have no certificate. */
+	SSL_set_verify(ssl, SSL_VERIFY_PEER |
+		(get_int(confs[OPT_SSL_VERIFY_PEER_EARLY])?SSL_VERIFY_FAIL_IF_NO_PEER_CERT:0),
+		0);
 
-	if(SSL_accept(ssl)<=0)
-	{
-		logp_ssl_err("SSL_accept\n");
+	if(ssl_do_accept(ssl))
 		goto end;
-	}
 	if(!(as=async_alloc())
 	  || as->init(as, 0)
-	  || !setup_asfd(as, "main socket",
-		cfd, ssl, ASFD_STREAM_STANDARD, ASFD_FD_CHILD_MAIN, -1, confs))
-			goto end;
+	  || !(asfd=setup_asfd_ssl(as, "main socket", cfd, ssl)))
+		goto end;
+	asfd->set_timeout(asfd, get_int(confs[OPT_NETWORK_TIMEOUT]));
+	asfd->ratelimit=get_float(confs[OPT_RATELIMIT]);
+	asfd->peer_addr=peer_addr;
 
 	if(authorise_server(as->asfd, confs, cconfs)
 	  || !(cname=get_string(cconfs[OPT_CNAME])) || !*cname)
 	{
 		// Add an annoying delay in case they are tempted to
 		// try repeatedly.
-		log_and_send(as->asfd, "unable to authorise on server");
 		sleep(1);
+		log_and_send(as->asfd, "unable to authorise on server");
+		goto end;
+	}
+
+	if(!get_int(cconfs[OPT_ENABLED]))
+	{
+		sleep(1);
+		log_and_send(as->asfd, "client not enabled on server");
 		goto end;
 	}
 
 	// Set up counters. Have to wait until here to get cname.
 	if(!(cntr=cntr_alloc())
-	  || cntr_init(cntr, cname))
+	  || cntr_init(cntr, cname, getpid()))
 		goto end;
 	set_cntr(confs[OPT_CNTR], cntr);
 	set_cntr(cconfs[OPT_CNTR], cntr);
@@ -264,21 +310,33 @@ static int run_child(int *cfd, SSL_CTX *ctx,
 		goto end;
 	}
 
-	/* Now it is time to check the certificate. */ 
-	if(ssl_check_cert(ssl, cconfs))
+	/* Now it is time to check the certificate. */
+	if(ssl_check_cert(ssl, confs, cconfs))
 	{
 		log_and_send(as->asfd, "check cert failed on server");
 		goto end;
 	}
-
-	if(status_rfd>=0 && !setup_asfd(as, "status server parent socket",
-		&status_rfd, NULL,
-		ASFD_STREAM_STANDARD, ASFD_FD_CHILD_PIPE_READ, -1, cconfs))
+	if(status_rfd>=0)
+	{
+		is_status_server=1;
+		if(!setup_asfd(as, "status server parent socket", &status_rfd,
+			/*listen*/""))
+				goto end;
+                if(!client_can_monitor(cconfs))
+		{
+			logp("Not allowing monitor request from %s\n", cname);
+			if(as->asfd->write_str(asfd, CMD_GEN,
+				"Monitor is not allowed"))
+					ret=-1;
 			goto end;
+		}
+	}
 
-	ret=child(as, status_wfd, confs, cconfs);
+	ret=child(as, is_status_server, status_wfd, confs, cconfs);
 end:
 	*cfd=-1;
+	if(as && asfd_flush_asio(as->asfd))
+		ret=-1;
 	async_asfd_free_all(&as); // This closes cfd for us.
 	logp("exit child\n");
 	if(cntr) cntr_free(&cntr);
@@ -295,41 +353,107 @@ end:
 	return ret;
 }
 
+static struct strlist *find_listen_in_conf(struct conf **confs,
+	enum conf_opt listen_opt, const char *listen)
+{
+	struct strlist *l;
+	for(l=get_strlist(confs[listen_opt]); l; l=l->next)
+		if(!strcmp(listen, l->path))
+			return l;
+	logp("Could not find %s in %s confs\n",
+		listen, confs[listen_opt]->field);
+	return NULL;
+}
+
 static int chld_check_counts(struct conf **confs, struct asfd *asfd)
 {
-	int c_count=0;
-	int sc_count=0;
+	long count=0;
 	struct asfd *a;
-
-	// Need to count status children separately from normal children.
-	for(a=asfd->as->asfd; a; a=a->next)
-	{
-		switch(a->fdtype)
-		{
-			case ASFD_FD_SERVER_PIPE_READ:
-				c_count++; break;
-			case ASFD_FD_SERVER_PIPE_WRITE:
-				sc_count++; break;
-			default:
-				break;
-		}
-	}
+	struct strlist *listen;
+	enum conf_opt listen_opt;
 
 	switch(asfd->fdtype)
 	{
 		case ASFD_FD_SERVER_LISTEN_MAIN:
-			if(c_count<get_int(confs[OPT_MAX_CHILDREN]))
-				break;
-			logp("Too many child processes.\n");
-			return -1;
+			listen_opt=OPT_LISTEN;
+			if(!(listen=find_listen_in_conf(confs,
+				listen_opt, asfd->listen)))
+					return -1;
+			break;
 		case ASFD_FD_SERVER_LISTEN_STATUS:
-			if(sc_count<get_int(confs[OPT_MAX_STATUS_CHILDREN]))
-				break;
-			logp("Too many status child processes.\n");
-			return -1;
+			listen_opt=OPT_LISTEN_STATUS;
+			if(!(listen=find_listen_in_conf(confs,
+				listen_opt, asfd->listen)))
+					return -1;
+			break;
 		default:
 			logp("Unexpected fdtype in %s: %d.\n",
 				__func__, asfd->fdtype);
+			return -1;
+	}
+
+	for(a=asfd->as->asfd; a; a=a->next)
+		if(a!=asfd
+		  && !strcmp(asfd->listen, a->listen))
+			count++;
+
+	logp("%d/%d child processes running on %s %s\n",
+		(int)count, (int)listen->flag,
+		confs[listen_opt]->field, asfd->listen);
+	if(count<listen->flag)
+		logp("Child %d available\n", (int)count+1);
+	else
+	{
+		logp("No spare children available.\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static struct asfd *setup_parent_child_pipe(struct async *as,
+	const char *desc,
+	int *fd_to_use, int *fd_to_close, pid_t childpid, const char *listen,
+	enum asfd_fdtype fdtype)
+{
+	struct asfd *newfd;
+	close_fd(fd_to_close);
+	if(!(newfd=setup_asfd(as, desc, fd_to_use, listen)))
+		return NULL;
+	newfd->pid=childpid;
+	newfd->fdtype=fdtype;
+	return newfd;
+}
+
+static int setup_parent_child_pipes(struct asfd *asfd,
+	pid_t childpid, int *rfd, int *wfd)
+{
+	struct asfd *newfd;
+	struct async *as=asfd->as;
+	switch(asfd->fdtype)
+	{
+		case ASFD_FD_SERVER_LISTEN_MAIN:
+			logp("forked child on %s: %d\n",
+				asfd->listen, childpid);
+			if(!(newfd=setup_parent_child_pipe(as,
+				"pipe from child",
+				rfd, wfd, childpid, asfd->listen,
+				ASFD_FD_SERVER_PIPE_READ)))
+					return -1;
+			return 0;
+		case ASFD_FD_SERVER_LISTEN_STATUS:
+			logp("forked status child on %s: %d\n",
+				asfd->listen, childpid);
+			if(!(newfd=setup_parent_child_pipe(as,
+				"pipe to status child",
+				wfd, rfd, childpid, asfd->listen,
+				ASFD_FD_SERVER_PIPE_WRITE)))
+					return -1;
+			newfd->attempt_reads=0;
+			return 0;
+		default:
+			logp("Strange fdtype after fork: %d\n",
+				asfd->fdtype);
 			return -1;
 	}
 
@@ -343,8 +467,10 @@ static int process_incoming_client(struct asfd *asfd, SSL_CTX *ctx,
 	pid_t childpid;
 	int pipe_rfd[2];
 	int pipe_wfd[2];
+        uint16_t peer_port=0;
+        char peer_addr[INET6_ADDRSTRLEN]="";
 	socklen_t client_length=0;
-	struct sockaddr_in client_name;
+	struct sockaddr_storage client_name;
 	enum asfd_fdtype fdtype=asfd->fdtype;
 	int forking=get_int(confs[OPT_FORK]);
 
@@ -360,8 +486,14 @@ static int process_incoming_client(struct asfd *asfd, SSL_CTX *ctx,
 	}
 	reuseaddr(cfd);
 
+        if(get_address_and_port(&client_name,
+		peer_addr, INET6_ADDRSTRLEN, &peer_port))
+                	return -1;
+        logp("Connect from peer: %s:%d\n", peer_addr, peer_port);
+
 	if(!forking)
-		return run_child(&cfd, ctx, -1, -1, conffile, forking);
+		return run_child(&cfd, ctx,
+			&client_name, -1, -1, conffile, forking, peer_addr);
 
 	if(chld_check_counts(confs, asfd))
 	{
@@ -415,9 +547,9 @@ static int process_incoming_client(struct asfd *asfd, SSL_CTX *ctx,
 			confs_free_content(confs);
 			confs_init(confs);
 
-			ret=run_child(&cfd, ctx, pipe_rfd[1],
+			ret=run_child(&cfd, ctx, &client_name, pipe_rfd[1],
 			  fdtype==ASFD_FD_SERVER_LISTEN_STATUS?pipe_wfd[0]:-1,
-			  conffile, forking);
+			  conffile, forking, peer_addr);
 
 			close(pipe_rfd[1]);
 			close(pipe_wfd[0]);
@@ -430,42 +562,8 @@ static int process_incoming_client(struct asfd *asfd, SSL_CTX *ctx,
 			close(pipe_wfd[0]); // close read end
 			close_fd(&cfd);
 
-			switch(asfd->fdtype)
-			{
-				case ASFD_FD_SERVER_LISTEN_MAIN:
-					logp("forked child: %d\n", childpid);
-	  				if(!setup_asfd(asfd->as,
-						"pipe from child",
-						&pipe_rfd[0], NULL,
-						ASFD_STREAM_STANDARD,
-						ASFD_FD_SERVER_PIPE_READ,
-						childpid,
-						confs)) return -1;
-					// Do not need to write to normal
-					// children.
-					close(pipe_wfd[1]);
-					break;
-				case ASFD_FD_SERVER_LISTEN_STATUS:
-					logp("forked status server child: %d\n",
-						childpid);
-					// Do not need to read from status
-					// children.
-					close(pipe_rfd[0]);
-	  				if(!setup_asfd(asfd->as,
-						"pipe to status child",
-						&pipe_wfd[1], NULL,
-						ASFD_STREAM_STANDARD,
-						ASFD_FD_SERVER_PIPE_WRITE,
-						childpid,
-						confs)) return -1;
-					break;
-				default:
-					logp("Strange fdtype after fork: %d\n",
-						asfd->fdtype);
-					return -1;
-			}
-
-			return 0;
+			return setup_parent_child_pipes(asfd, childpid,
+				&pipe_rfd[0], &pipe_wfd[1]);
 	}
 }
 
@@ -508,98 +606,273 @@ static int daemonise(void)
 		return -1;
 	}
 
-	/* close std* */
-	close(STDIN_FILENO);
 	close(STDOUT_FILENO);
 	close(STDERR_FILENO);
+	// It turns out that if I close stdin (fd=0), and have exactly one
+	// listen address configured (listen=0.0.0.0:4971), with no
+	// listen_status configured, then the socket file descriptor will be 0.
+	// In this case, select() in async.c will raise an exception on fd=0.
+	// It does not raise an exception if you have a socket fd 0 and 1
+	// (ie, two listen addresses).
+	// Seems like a linux bug to me. Anyway, hack around it by immediately
+	// opening /dev/null, so that the sockets can never get fd=0.
+	close(STDIN_FILENO);
+	devnull=fzp_open("/dev/null", "w");
 
 	return 0;
 }
 
-static int relock(struct lock *lock)
+static int extract_client_name(struct asfd *asfd)
 {
-	int tries=5;
-	for(; tries>0; tries--)
+	size_t l;
+	const char *cp=NULL;
+	const char *dp=NULL;
+
+	if(asfd->client)
+		return 0;
+	if(!(dp=strchr(asfd->rbuf->buf, '\t')))
+		return 0;
+	dp++;
+	if(!(cp=strchr(dp, '\t')))
+		return 0;
+	cp++;
+	l=cp-dp;
+	if(!(asfd->client=malloc_w(l+1, __func__)))
+		return -1;
+	snprintf(asfd->client, l, "%s", dp);
+	return 0;
+}
+
+int server_get_working(struct async *mainas)
+{
+	static int working=0;
+	struct asfd *a=NULL;
+
+	if(!mainas)
+		return working;
+
+	working=0;
+	for(a=mainas->asfd; a; a=a->next)
 	{
-		lock_get(lock);
-		switch(lock->status)
+		switch(a->cntr_status)
 		{
-			case GET_LOCK_GOT: return 0;
-			case GET_LOCK_NOT_GOT:
-				sleep(2);
+		case CNTR_STATUS_SCANNING:
+		case CNTR_STATUS_BACKUP:
+			++working;
+			break;
+		default:;
+		}
+	}
+	return working;
+}
+
+static void extract_client_cntr_status(struct asfd *asfd)
+{
+	if(strncmp(asfd->rbuf->buf, "cntr", strlen("cntr")))
+		return;
+
+	struct cntr cntr={};
+	char *path=NULL;
+
+	asfd->cntr_status=!str_to_cntr(asfd->rbuf->buf, &cntr, &path)
+					? cntr.cntr_status
+					: CNTR_STATUS_UNSET;
+	free_w(&path);
+}
+
+static int write_to_status_children(struct async *mainas, struct iobuf *iobuf)
+{
+	size_t wlen;
+	struct asfd *scfd=NULL;
+
+	// One of the child processes is giving us information.
+	// Try to append it to any of the status child pipes.
+	for(scfd=mainas->asfd; scfd; scfd=scfd->next)
+	{
+		if(scfd->fdtype!=ASFD_FD_SERVER_PIPE_WRITE)
+			continue;
+		wlen=iobuf->len;
+		switch(scfd->append_all_to_write_buffer(scfd, iobuf))
+		{
+			case APPEND_OK:
+				// Hack - the append function
+				// will set the length to zero
+				// on success. Set it back for
+				// the next status child pipe.
+				iobuf->len=wlen;
 				break;
-			case GET_LOCK_ERROR:
+			case APPEND_BLOCKED:
+				break;
 			default:
-				logp("Error when trying to re-get lockfile after forking.\n");
 				return -1;
 		}
 	}
-	logp("Unable to re-get lockfile after forking.\n");
-	return -1;
-}
-
-// FIX THIS: should probably put this stuff in a separate file and get the
-// conf stuff to use it too.
-struct oldnet
-{
-	char *address;
-	char *status_address;
-	char *port;
-	char *status_port;
-};
-
-static int oldnet_init(struct oldnet *oldnet, struct conf **confs)
-{
-	const char *port=get_string(confs[OPT_PORT]);
-	const char *address=get_string(confs[OPT_ADDRESS]);
-	const char *status_port=get_string(confs[OPT_STATUS_PORT]);
-	const char *status_address=get_string(confs[OPT_STATUS_ADDRESS]);
-
-	if(port
-	  && !(oldnet->port=strdup_w(port, __func__)))
-		return -1;
-	if(status_port
-	  && !(oldnet->status_port=strdup_w(status_port, __func__)))
-		return -1;
-	if(address
-	  && !(oldnet->address=strdup_w(address, __func__)))
-		return -1;
-	if(status_address
-	  && !(oldnet->status_address=strdup_w(status_address, __func__)))
-		return -1;
+	// Free the information, even if we did not manage to append it. That
+	// should be OK, more will be along soon.
+	iobuf_free_content(iobuf);
 	return 0;
 }
 
-static void oldnet_free_contents(struct oldnet *oldnet)
+static int update_status_child_client_lists(struct async *mainas)
 {
-	free_w(&oldnet->address);
-	free_w(&oldnet->status_address);
-	free_w(&oldnet->port);
-	free_w(&oldnet->status_port);
+	int ret=-1;
+	char *buf=NULL;
+	struct asfd *a=NULL;
+	struct iobuf wbuf;
+
+	if(!(buf=strdup_w("clients", __func__)))
+		goto end;
+	for(a=mainas->asfd; a; a=a->next)
+	{
+		if(a->fdtype!=ASFD_FD_SERVER_PIPE_READ
+		  || !a->client)
+			continue;
+		if(astrcat(&buf, "\t", __func__))
+			goto end;
+		if(astrcat(&buf, a->client, __func__))
+			goto end;
+	}
+
+	iobuf_set(&wbuf, CMD_GEN, buf, strlen(buf));
+
+	ret=write_to_status_children(mainas, &wbuf);
+end:
+	return ret;
 }
 
-static int ports_changed(const char *old, const char *latest)
+static int maybe_update_status_child_client_lists(struct async *mainas)
 {
-	if((!old && latest)
-	  || (old && latest && strcmp(old, latest)))
-		return 1;
+	time_t now=0;
+	time_t diff=0;
+	static time_t lasttime=0;
+	struct asfd *asfd=NULL;
+
+	// If we have no status server child processes, do not bother.
+	for(asfd=mainas->asfd; asfd; asfd=asfd->next)
+		if(asfd->fdtype==ASFD_FD_SERVER_PIPE_WRITE)
+			break;
+	if(!asfd)
+		return 0;
+
+	// Only update every 5 seconds.
+	now=time(NULL);
+	diff=now-lasttime;
+	if(diff<5)
+	{
+		// Might as well do this in case they fiddled their
+		// clock back in time.
+		if(diff<0) lasttime=now;
+		return 0;
+	}
+	lasttime=now;
+
+	return update_status_child_client_lists(mainas);
+}
+
+#ifdef HAVE_SYSTEMD
+static int check_addr_for_desc(
+	const struct strlist *addresses,
+	int fd,
+	const char **addr
+) {
+	int port;
+	int ret=-1;
+	char *a=NULL;
+	char *portstr;
+	const struct strlist *address;
+
+	for(address=addresses; address; address=address->next)
+	{
+		free_w(&a);
+		if(!(a=strdup_w(address->path, __func__)))
+			goto end;
+		if(split_addr(&a, &portstr))
+			goto end;
+		port=strtoul(portstr, NULL, 10);
+		if(sd_is_socket_inet(fd, AF_UNSPEC, 0, -1, port))
+		{
+			*addr=address->path;
+			return 0;
+		}
+	}
+end:
+	free_w(&a);
+	return ret;
+}
+
+static int socket_activated_init_listen_sockets(
+	struct async *mainas,
+	struct strlist *addresses,
+	struct strlist *addresses_status
+) {
+	int n=0;
+
+        n=sd_listen_fds(0);
+	if(n<0)
+	{
+		logp("sd_listen_fds() error: %d %s\n",
+			n, strerror(errno));
+		return -1;
+	}
+	else if(!n)
+		return 0;
+
+	logp("Socket activated\n");
+
+	for(int fdnum=SD_LISTEN_FDS_START;
+		fdnum<SD_LISTEN_FDS_START+n; fdnum++)
+	{
+		int fd=-1;
+		const char *desc=NULL;
+		const char *addr=NULL;
+		struct asfd *newfd=NULL;
+		enum asfd_fdtype fdtype=ASFD_FD_SERVER_LISTEN_MAIN;
+
+		if(!check_addr_for_desc(addresses,
+			fdnum, &addr))
+		{
+			desc="server by socket activation";
+			fdtype=ASFD_FD_SERVER_LISTEN_MAIN;
+		}
+		else if(!check_addr_for_desc(addresses_status,
+			fdnum, &addr))
+		{
+			desc="server status by socket activation";
+			fdtype=ASFD_FD_SERVER_LISTEN_STATUS;
+		}
+		else
+		{
+			logp("Strange socket activation fd: %d\n", fdnum);
+			return -1;
+		}
+
+		fd=fdnum;
+		if(!(newfd=setup_asfd(mainas, desc, &fd, addr)))
+			return -1;
+		newfd->fdtype=fdtype;
+
+		// We are definitely in socket activation mode now. Use
+		// gentleshutdown to make it exit when all child fds are gone.
+		gentleshutdown++;
+		gentleshutdown_logged++;
+	}
+
 	return 0;
 }
+#endif
 
-static int run_server(struct conf **confs, const char *conffile,
-	int *rfds, int *sfds, struct oldnet *oldnet)
+static int run_server(struct conf **confs, const char *conffile)
 {
-	int i=0;
+#ifdef HAVE_SYSTEMD
+	int socket_activated = 0;
+#endif
 	int ret=-1;
 	SSL_CTX *ctx=NULL;
-	int found_normal_child=0;
 	struct asfd *asfd=NULL;
-	struct asfd *scfd=NULL;
 	struct async *mainas=NULL;
-	const char *port=get_string(confs[OPT_PORT]);
-	const char *address=get_string(confs[OPT_ADDRESS]);
-	const char *status_port=get_string(confs[OPT_STATUS_PORT]);
-	const char *status_address=get_string(confs[OPT_STATUS_ADDRESS]);
+	struct strlist *addresses=get_strlist(confs[OPT_LISTEN]);
+	struct strlist *addresses_status=get_strlist(confs[OPT_LISTEN_STATUS]);
+	int max_parallel_backups=get_int(confs[OPT_MAX_PARALLEL_BACKUPS]);
 
 	if(!(ctx=ssl_initialise_ctx(confs)))
 	{
@@ -612,35 +885,27 @@ static int run_server(struct conf **confs, const char *conffile,
 		goto end;
 	}
 
-	if(ports_changed(oldnet->address, address)
-	  || ports_changed(oldnet->port, port))
-	{
-		if(init_listen_socket(address, port, 1, rfds)) goto end;
-	}
-	if(ports_changed(oldnet->status_address, status_address)
-	  || ports_changed(oldnet->status_port, status_port))
-	{
-		if(init_listen_socket(status_address, status_port, 0, sfds))
-			goto end;
-	}
-
 	if(!(mainas=async_alloc())
 	  || mainas->init(mainas, 0))
 		goto end;
 
-	for(i=0; i<LISTEN_SOCKETS && rfds[i]!=-1; i++)
-		if(!setup_asfd(mainas,
-		  "main server socket", &rfds[i], NULL,
-		  ASFD_STREAM_STANDARD, ASFD_FD_SERVER_LISTEN_MAIN, -1, confs))
+#ifdef HAVE_SYSTEMD
+	if(socket_activated_init_listen_sockets(mainas,
+		addresses, addresses_status)==-1)
 			goto end;
-	for(i=0; i<LISTEN_SOCKETS && sfds[i]!=-1; i++)
-		if(!setup_asfd(mainas,
-		  "main server status socket", &sfds[i], NULL,
-		  ASFD_STREAM_STANDARD, ASFD_FD_SERVER_LISTEN_STATUS, -1, confs))
-			goto end;
+#endif
+	if(!mainas->asfd)
+	{
+		if(init_listen_sockets(addresses, mainas,
+			ASFD_FD_SERVER_LISTEN_MAIN, "server")
+		  || init_listen_sockets(addresses_status, mainas,
+			ASFD_FD_SERVER_LISTEN_STATUS, "server status"))
+				goto end;
+	}
 
 	while(!hupreload)
 	{
+		int removed;
 		switch(mainas->read_write(mainas))
 		{
 			case 0:
@@ -650,13 +915,18 @@ static int run_server(struct conf **confs, const char *conffile,
 					{
 						// Incoming client.
 						asfd->new_client=0;
+
+						// Update 'working' counter.
+						if(max_parallel_backups)
+							server_get_working(mainas);
+
 						if(process_incoming_client(asfd,
 							ctx, conffile, confs))
 								goto end;
 						if(!get_int(confs[OPT_FORK]))
 						{
 							gentleshutdown++;
-							ret=1;
+							ret=0; // process_incoming_client() finished without errors
 							goto end;
 						}
 						continue;
@@ -664,7 +934,7 @@ static int run_server(struct conf **confs, const char *conffile,
 				}
 				break;
 			default:
-				int removed=0;
+				removed=0;
 				// Maybe one of the fds had a problem.
 				// Find and remove it and carry on if possible.
 				for(asfd=mainas->asfd; asfd; )
@@ -692,52 +962,63 @@ static int run_server(struct conf **confs, const char *conffile,
 		for(asfd=mainas->asfd; asfd; asfd=asfd->next)
 		{
 			if(asfd->fdtype!=ASFD_FD_SERVER_PIPE_READ
-			  || !asfd->rbuf->buf) continue;
-			// One of the child processes is giving us information.
-			// Try to append it to any of the status child pipes.
-			for(scfd=mainas->asfd; scfd; scfd=scfd->next)
-			{
-				if(scfd->fdtype!=ASFD_FD_SERVER_PIPE_WRITE)
-					continue;
-				switch(scfd->append_all_to_write_buffer(scfd,
-					asfd->rbuf))
-				{
-					case APPEND_OK:
-					case APPEND_BLOCKED:
-						break;
-					default:
-						goto end;
-				}
-			}
-			// Free the information, even if we did not manage
-			// to append it. That should be OK, more will be along
-			// soon.
-			iobuf_free_content(asfd->rbuf);
+			  || !asfd->rbuf->buf)
+				continue;
+
+//printf("got info from child: %s\n", asfd->rbuf->buf);
+			if(extract_client_name(asfd))
+				goto end;
+
+			if(max_parallel_backups)
+				extract_client_cntr_status(asfd);
+
+			if(write_to_status_children(mainas, asfd->rbuf))
+				goto end;
 		}
 
-		if(sigchld)
-		{
-			chld_check_for_exiting(mainas);
-			sigchld=0;
-		}
+		if(maybe_update_status_child_client_lists(mainas))
+			goto end;
 
-		// Leave if we had a SIGUSR1 and there are no children running.
+		chld_check_for_exiting(mainas);
+
 		if(gentleshutdown)
 		{
+			int n=0;
 			if(!gentleshutdown_logged)
 			{
 				logp("got SIGUSR2 gentle reload signal\n");
 				logp("will shut down once children have exited\n");
 				gentleshutdown_logged++;
 			}
-// FIX THIS:
-// found_normal_child=chld_add_fd_to_normal_sets(confs, &fsr, &fse, &mfd);
-			else if(!found_normal_child)
+
+			for(asfd=mainas->asfd; asfd; asfd=asfd->next)
 			{
-				logp("all children have exited - shutting down\n");
+				if(asfd->pid<=0)
+					continue;
+				n++;
+				break;
+			}
+			if(!n)
+			{
+				logp("All children have exited\n");
 				break;
 			}
 		}
+
+#ifdef HAVE_SYSTEMD
+		if (socket_activated) {
+			// count the number of running childs
+			int n = 0;
+			for(asfd=mainas->asfd; asfd; asfd=asfd->next) {
+				if (asfd->pid > 1)
+					n++;
+			}
+			if (n <= 0) {
+				gentleshutdown++;
+				break;
+			}
+                }
+#endif
 	}
 
 	if(hupreload) logp("got SIGHUP reload signal\n");
@@ -753,19 +1034,8 @@ int server(struct conf **confs, const char *conffile,
 	struct lock *lock, int generate_ca_only)
 {
 	enum serret ret=SERVER_ERROR;
-	int rfds[LISTEN_SOCKETS]; // Sockets for clients to connect to.
-	int sfds[LISTEN_SOCKETS]; // Status server sockets.
-	struct oldnet oldnet;
 
 	//return champ_test(confs);
-
-	// Only close and reopen listening sockets if the ports changed.
-	// Otherwise you get an "unable to bind listening socket on port X"
-	// error, and the server stops.
-	memset(&oldnet, 0, sizeof(oldnet));
-
-	init_fds(rfds);
-	init_fds(sfds);
 
 	if(ca_server_setup(confs)) goto error;
 	if(generate_ca_only)
@@ -776,26 +1046,24 @@ int server(struct conf **confs, const char *conffile,
 
 	if(get_int(confs[OPT_FORK]) && get_int(confs[OPT_DAEMON]))
 	{
-		if(daemonise() || relock(lock)) goto error;
+		if(daemonise()
+		// Need to write the new pid to the already open lock fd.
+		  || lock_write_pid(lock))
+			goto error;
 	}
 
 	ssl_load_globals();
 
 	while(!gentleshutdown)
 	{
-		if(run_server(confs, conffile, rfds, sfds, &oldnet))
+		if(run_server(confs, conffile))
 			goto error;
 
 		if(hupreload && !gentleshutdown)
 		{
-			oldnet_free_contents(&oldnet);
-			if(oldnet_init(&oldnet, confs))
-				goto error;
 			if(reload(confs, conffile,
-				0, // Not first time.
-				get_int(confs[OPT_MAX_CHILDREN]),
-				get_int(confs[OPT_MAX_STATUS_CHILDREN]),
-				0)) // Not JSON output.
+				0 // Not first time.
+				))
 					goto error;
 		}
 		hupreload=0;
@@ -804,9 +1072,7 @@ int server(struct conf **confs, const char *conffile,
 end:
 	ret=SERVER_OK;
 error:
-	close_fds(rfds);
-	close_fds(sfds);
-	oldnet_free_contents(&oldnet);
+	fzp_close(&devnull);
 
 // FIX THIS: Have an enum for a return value, so that it is more obvious what
 // is happening, like client.c does.

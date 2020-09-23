@@ -1,9 +1,19 @@
-#include "include.h"
-#include "cmd.h"
+#include "../burp.h"
+#include "../alloc.h"
+#include "../asfd.h"
+#include "../async.h"
+#include "../cmd.h"
+#include "../cntr.h"
+#include "../iobuf.h"
+#include "../log.h"
+#include "../prepend.h"
+#include "../sbuf.h"
+#include "handy.h"
+#include "msg.h"
 
 static int do_write(struct asfd *asfd,
-	BFILE *bfd, uint8_t *out, size_t outlen,
-	char **metadata, unsigned long long *sent)
+	struct BFILE *bfd, uint8_t *out, size_t outlen,
+	char **metadata, uint64_t *sent)
 {
 	int ret=0;
 	if(metadata)
@@ -25,7 +35,8 @@ static int do_write(struct asfd *asfd,
 	{
 		if((ret=bfd->write(bfd, out, outlen))<=0)
 		{
-			logp("error when appending %d: %d\n", outlen, ret);
+			logp("error when appending %lu: %d\n",
+				(unsigned long)outlen, ret);
 			asfd->write_str(asfd, CMD_ERROR, "write failed");
 			return -1;
 		}
@@ -35,10 +46,10 @@ static int do_write(struct asfd *asfd,
 }
 
 static int do_inflate(struct asfd *asfd,
-	z_stream *zstrm, BFILE *bfd,
+	z_stream *zstrm, struct BFILE *bfd,
 	uint8_t *out, uint8_t *buftouse, size_t lentouse,
 	char **metadata, const char *encpassword, int enccompressed,
-	unsigned long long *sent)
+	uint64_t *sent)
 {
 	int zret=Z_OK;
 	unsigned have=0;
@@ -89,8 +100,8 @@ static int do_inflate(struct asfd *asfd,
 
 struct winbuf
 {
-	unsigned long long *rcvd;
-	unsigned long long *sent;
+	uint64_t *rcvd;
+	uint64_t *sent;
 	struct cntr *cntr;
 	struct asfd *asfd;
 };
@@ -139,8 +150,8 @@ static DWORD WINAPI read_efs(PBYTE pbData, PVOID pvCallbackContext, PULONG ulLen
 }
 
 static int transfer_efs_in(struct asfd *asfd,
-	BFILE *bfd, unsigned long long *rcvd,
-	unsigned long long *sent, struct cntr *cntr)
+	struct BFILE *bfd, uint64_t *rcvd,
+	uint64_t *sent, struct cntr *cntr)
 {
 	int ret=0;
 	struct winbuf mybuf;
@@ -157,10 +168,14 @@ static int transfer_efs_in(struct asfd *asfd,
 #endif
 
 int transfer_gzfile_inl(struct asfd *asfd,
-	struct sbuf *sb, const char *path, BFILE *bfd,
-	unsigned long long *rcvd, unsigned long long *sent,
+#ifdef HAVE_WIN32
+	struct sbuf *sb,
+#endif
+	struct BFILE *bfd,
+	uint64_t *rcvd, uint64_t *sent,
 	const char *encpassword, int enccompressed,
-	struct conf **confs, char **metadata)
+	struct cntr *cntr, char **metadata,
+	int key_deriv, uint64_t salt)
 {
 	int quit=0;
 	int ret=-1;
@@ -180,8 +195,7 @@ int transfer_gzfile_inl(struct asfd *asfd,
 
 #ifdef HAVE_WIN32
 	if(sb && sb->path.cmd==CMD_EFS_FILE)
-		return transfer_efs_in(asfd, bfd, rcvd, sent,
-			get_cntr(confs[OPT_CNTR]));
+		return transfer_efs_in(asfd, bfd, rcvd, sent, cntr);
 #endif
 
 	//if(!MD5_Init(&md5))
@@ -202,7 +216,8 @@ int transfer_gzfile_inl(struct asfd *asfd,
 		return -1;
 	}
 
-	if(encpassword && !(enc_ctx=enc_setup(0, encpassword)))
+	if(encpassword
+	  && !(enc_ctx=enc_setup(0, encpassword, key_deriv, salt)))
 	{
 		inflateEnd(&zstrm);
 		return -1;
@@ -216,14 +231,14 @@ int transfer_gzfile_inl(struct asfd *asfd,
 			if(enc_ctx)
 			{
 				EVP_CIPHER_CTX_cleanup(enc_ctx);
-				free(enc_ctx);
+				EVP_CIPHER_CTX_free(enc_ctx);
+				enc_ctx=NULL;
 			}
 			inflateEnd(&zstrm);
 			return -1;
 		}
 		(*rcvd)+=rbuf->len;
 
-		//logp("transfer in: %c:%s\n", rbuf->cmd, rbuf->buf);
 		switch(rbuf->cmd)
 		{
 			case CMD_APPEND: // append
@@ -337,7 +352,7 @@ int transfer_gzfile_inl(struct asfd *asfd,
 				break;
 			case CMD_MESSAGE:
 			case CMD_WARNING:
-				log_recvd(rbuf, confs, 0);
+				log_recvd(rbuf, cntr, 0);
 				break;
 			default:
 				iobuf_log_unexpected(rbuf, __func__);
@@ -350,7 +365,8 @@ int transfer_gzfile_inl(struct asfd *asfd,
 	if(enc_ctx)
 	{
 		EVP_CIPHER_CTX_cleanup(enc_ctx);
-		free(enc_ctx);
+		EVP_CIPHER_CTX_free(enc_ctx);
+		enc_ctx=NULL;
 	}
 
 	iobuf_free_content(rbuf);

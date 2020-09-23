@@ -1,0 +1,70 @@
+{
+    "clients": [
+        {
+            "name": "cli1",
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+                {
+                    "number": 2,
+                    "timestamp": 31622400,
+                    "flags": [
+                        "current",
+                        "manifest"
+                    ]
+                },
+                {
+                    "number": 3,
+                    "timestamp": 31708800,
+                    "flags": [
+                        "finishing"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "cli2",
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+                {
+                    "number": 2,
+                    "timestamp": 31622400,
+                    "flags": [
+                        "current",
+                        "manifest"
+                    ]
+                },
+                {
+                    "number": 3,
+                    "timestamp": 31708800,
+                    "flags": [
+                        "finishing"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "cli3",
+            "run_status": "unknown",
+            "protocol": 1,
+            "backups": [
+                {
+                    "number": 2,
+                    "timestamp": 31622400,
+                    "flags": [
+                        "current",
+                        "manifest"
+                    ]
+                },
+                {
+                    "number": 3,
+                    "timestamp": 31708800,
+                    "flags": [
+                        "finishing"
+                    ]
+                }
+            ]
+        }
+    ]
+}

@@ -7,6 +7,8 @@
 #include "burp.h"
 #include "cmd.h"
 #include "action.h"
+#include "bu.h"
+#include "server/sdirs.h"
 
 #define CNTR_ENT_SIZE	256
 
@@ -19,6 +21,10 @@
 #define CNTR_STATUS_STR_VERIFYING	"verifying"
 #define CNTR_STATUS_STR_DELETING	"deleting"
 #define CNTR_STATUS_STR_DIFFING		"diffing"
+
+struct asfd;
+struct conf;
+struct cstat;
 
 enum cntr_status
 {
@@ -44,11 +50,11 @@ struct cntr_ent
 	char *field;
 	char *label;
 	uint8_t flags;
-	unsigned long long count;
-	unsigned long long changed;
-	unsigned long long same;
-	unsigned long long deleted;
-	unsigned long long phase1;
+	uint64_t count;
+	uint64_t changed;
+	uint64_t same;
+	uint64_t deleted;
+	uint64_t phase1;
 	cntr_ent_t *next;
 };
 
@@ -61,10 +67,10 @@ struct cntr
 	struct cntr_ent *ent[CNTR_ENT_SIZE];
 
 	// These should have their own individual cmd entries.
-	unsigned long long warning;
-	unsigned long long byte;
-	unsigned long long recvbyte;
-	unsigned long long sentbyte;
+	uint64_t warning;
+	uint64_t byte;
+	uint64_t recvbyte;
+	uint64_t sentbyte;
 
 	// Buffer to use for the forked child to write statuses to the parent.
 	size_t str_max_len;
@@ -73,44 +79,65 @@ struct cntr
 	enum cntr_status cntr_status;
 
 	char *cname;
+	// For list management in status server.
+	int pid;
+	int found;
+	int bno;
+
+	struct cntr *next;
 };
 
 extern struct cntr *cntr_alloc(void);
-extern int cntr_init(struct cntr *cntr, const char *cname);
+extern int cntr_init(struct cntr *cntr, const char *cname, pid_t pid);
 extern void cntr_free(struct cntr **cntr);
+extern void cntrs_free(struct cntr **cntrs);
 
-extern const char *bytes_to_human(unsigned long long counter);
+extern const char *bytes_to_human(uint64_t counter);
+extern void cntr_set_bytes(struct cntr *cntr, struct asfd *asfd);
 extern void cntr_print(struct cntr *cntr, enum action act);
 extern int cntr_stats_to_file(struct cntr *cntr,
-	const char *directory, enum action act, struct conf **conf);
+	const char *directory, enum action act);
 extern void cntr_print_end(struct cntr *c);
 extern void cntr_print_end_phase1(struct cntr *c);
 extern void cntr_add(struct cntr *c, char ch, int print);
+extern void cntr_add_new(struct cntr *c, char ch);
 extern void cntr_add_same(struct cntr *c, char ch);
 extern void cntr_add_changed(struct cntr *c, char ch);
 extern void cntr_add_deleted(struct cntr *c, char ch);
-extern void cntr_add_bytes(struct cntr *c, unsigned long long bytes);
-extern void cntr_add_sentbytes(struct cntr *c, unsigned long long bytes);
-extern void cntr_add_recvbytes(struct cntr *c, unsigned long long bytes);
+extern void cntr_add_bytes(struct cntr *c, uint64_t bytes);
 
 extern void cntr_add_phase1(struct cntr *c,
 	char ch, int print);
 extern void cntr_add_val(struct cntr *c,
-	char ch, unsigned long long val, int print);
+	char ch, uint64_t val);
 extern void cntr_add_same_val(struct cntr *c,
-	char ch, unsigned long long val);
+	char ch, uint64_t val);
 extern void cntr_add_changed_val(struct cntr *c,
-	char ch, unsigned long long val);
+	char ch, uint64_t val);
 
 #ifndef HAVE_WIN32
 extern size_t cntr_to_str(struct cntr *cntr, const char *path);
-extern int cntr_send(struct cntr *cntr);
+extern int cntr_send_bu(struct asfd *asfd,
+	struct bu *bu, struct conf **confs,
+	enum cntr_status cntr_status);
+extern int cntr_send_sdirs(struct asfd *asfd,
+	struct sdirs *sdirs, struct conf **confs,
+	enum cntr_status cntr_status);
 #endif
 
-extern int str_to_cntr(const char *str, struct cstat *cstat, char **path);
+extern int str_to_cntr(const char *str, struct cntr *cntr, char **path);
 extern int cntr_recv(struct asfd *asfd, struct conf **conf);
 
 extern const char *cntr_status_to_str(struct cntr *cntr);
-extern cntr_status cntr_str_to_status(const char *str);
+extern enum cntr_status cntr_str_to_status(const char *str);
+extern const char *cntr_status_to_action_str(struct cntr *cntr);
+
+extern int extract_client_pid_bno(char *buf,
+	char **cname, pid_t *pid, int *bno);
+
+extern int check_fail_on_warning(
+	int fail_on_warning,
+	struct cntr_ent *warn_ent
+);
 
 #endif

@@ -67,11 +67,11 @@ int VSSInit(void)
 	{
 		switch(g_MinorVersion)
 		{
-			case 1: 
+			case 1:
 				g_pVSSClient=new VSSClientXP();
 				atexit(VSSCleanup);
 				return 0;
-			case 2: 
+			case 2:
 				g_pVSSClient=new VSSClient2003();
 				atexit(VSSCleanup);
 				return 0;
@@ -99,7 +99,7 @@ BOOL VSSPathConvert(const char *szFilePath,
 
 BOOL VSSPathConvertW(const wchar_t *szFilePath,
 	wchar_t *szShadowPath, int nBuflen)
-{ 
+{
 	return g_pVSSClient->GetShadowPathW(szFilePath, szShadowPath, nBuflen);
 }
 
@@ -107,12 +107,10 @@ VSSClient::VSSClient(void)
 {
 	m_bCoInitializeCalled=false;
 	m_bCoInitializeSecurityCalled=false;
-	m_dwContext=0; // VSS_CTX_BACKUP;
-	m_bDuringRestore=false;
 	m_bBackupIsInitialized=false;
 	m_pVssObject=NULL;
-	m_pAlistWriterState=New(alist(10, not_owned_by_alist));
-	m_pAlistWriterInfoText=New(alist(10, owned_by_alist));
+	m_pAlistWriterState=new alist(10, not_owned_by_alist);
+	m_pAlistWriterInfoText=new alist(10, owned_by_alist);
 	m_uidCurrentSnapshotSet=GUID_NULL;
 	memset(m_wszUniqueVolumeName, 0, sizeof(m_wszUniqueVolumeName));
 	memset(m_szShadowCopyName, 0, sizeof(m_szShadowCopyName));
@@ -120,7 +118,7 @@ VSSClient::VSSClient(void)
 
 VSSClient::~VSSClient(void)
 {
-	// Release the IVssBackupComponents interface 
+	// Release the IVssBackupComponents interface
 	// WARNING: this must be done BEFORE calling CoUninitialize()
 	if(m_pVssObject)
 	{
@@ -136,10 +134,9 @@ VSSClient::~VSSClient(void)
 	if(m_bCoInitializeCalled) CoUninitialize();
 }
 
-BOOL VSSClient::InitializeForBackup(void)
+BOOL VSSClient::InitializeForBackup(struct asfd *asfd, struct cntr *cntr)
 {
-	//return Initialize (VSS_CTX_BACKUP);
-	return Initialize(0);
+	return Initialize(asfd, cntr);
 }
 
 static char *bstrncat(char *dest, const char *src, int maxlen)
@@ -160,7 +157,7 @@ BOOL VSSClient::GetShadowPath(const char *szFilePath,
 	bIsValidName=strlen(szFilePath)>3;
 	if(bIsValidName)
 		bIsValidName &= isalpha(szFilePath[0]) &&
-			szFilePath[1]==':' && 
+			szFilePath[1]==':' &&
 			szFilePath[2]=='\\';
 
 	if(bIsValidName)
@@ -182,7 +179,7 @@ BOOL VSSClient::GetShadowPath(const char *szFilePath,
 
 	snprintf(szShadowPath, nBuflen, "%s", szFilePath);
 	errno=EINVAL;
-	return FALSE;   
+	return FALSE;
 }
 
 BOOL VSSClient::GetShadowPathW(const wchar_t *szFilePath,
@@ -196,7 +193,7 @@ BOOL VSSClient::GetShadowPathW(const wchar_t *szFilePath,
 	bIsValidName=wcslen(szFilePath)>3;
 	if(bIsValidName)
 		bIsValidName &= iswalpha(szFilePath[0]) &&
-			szFilePath[1]==':' && 
+			szFilePath[1]==':' &&
 			szFilePath[2] == '\\';
 
 	if(bIsValidName)
@@ -214,7 +211,7 @@ BOOL VSSClient::GetShadowPathW(const wchar_t *szFilePath,
 
 	wcsncpy(szShadowPath, szFilePath, nBuflen);
 	errno=EINVAL;
-	return FALSE;   
+	return FALSE;
 }
 
 
@@ -232,7 +229,7 @@ const char* VSSClient::GetWriterInfo(int nIndex)
 
 const int VSSClient::GetWriterState(int nIndex)
 {
-	alist *pV=(alist *)m_pAlistWriterState;   
+	alist *pV=(alist *)m_pAlistWriterState;
 	return (intptr_t)pV->get(nIndex);
 }
 
@@ -242,7 +239,7 @@ void VSSClient::AppendWriterInfo(int nState, const char *pszInfo)
 	alist *pS=(alist *)m_pAlistWriterState;
 
 	pT->push(strdup(pszInfo));
-	pS->push((void*)nState);   
+	pS->push((void*)(intptr_t)nState);
 }
 
 void VSSClient::DestroyWriterInfo(void)
@@ -251,7 +248,7 @@ void VSSClient::DestroyWriterInfo(void)
 	alist *pS=(alist *)m_pAlistWriterState;
 
 	while(!pT->empty()) free(pT->pop());
-	while(!pS->empty()) pS->pop();      
+	while(!pS->empty()) pS->pop();
 }
 
 #endif

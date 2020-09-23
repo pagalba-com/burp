@@ -1,10 +1,22 @@
-#include "include.h"
+#include "burp.h"
+#include "alloc.h"
+#include "asfd.h"
+#include "async.h"
+#include "berrno.h"
 #include "cmd.h"
+#include "fsops.h"
+#include "fzp.h"
+#include "handy.h"
 #include "hexmap.h"
+#include "iobuf.h"
+#include "log.h"
+#include "msg.h"
+#include "prepend.h"
+#include "protocol1/handy.h"
+#include "protocol2/blk.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <netdb.h>
 
 #ifdef HAVE_WIN32
 #include <winsock2.h>
@@ -13,7 +25,7 @@
 
 // return -1 for error, 0 for OK, 1 if the client wants to interrupt the
 // transfer.
-int do_quick_read(struct asfd *asfd, const char *datapth, struct conf **confs)
+int do_quick_read(struct asfd *asfd, const char *datapth, struct cntr *cntr)
 {
 	int r=0;
 	struct iobuf *rbuf;
@@ -25,7 +37,7 @@ int do_quick_read(struct asfd *asfd, const char *datapth, struct conf **confs)
 		if(rbuf->cmd==CMD_MESSAGE
 		  || rbuf->cmd==CMD_WARNING)
 		{
-			log_recvd(rbuf, confs, 0);
+			log_recvd(rbuf, cntr, 0);
 		}
 		else if(rbuf->cmd==CMD_INTERRUPT)
 		{
@@ -45,22 +57,10 @@ int do_quick_read(struct asfd *asfd, const char *datapth, struct conf **confs)
 	return r;
 }
 
-static char *get_endfile_str(unsigned long long bytes)
-{
-	static char endmsg[128]="";
-	snprintf(endmsg, sizeof(endmsg), "%"PRIu64 ":", (uint64_t)bytes);
-	return endmsg;
-}
-
-static int write_endfile(struct asfd *asfd, unsigned long long bytes)
-{
-	return asfd->write_str(asfd, CMD_END_FILE, get_endfile_str(bytes));
-}
-
-int send_whole_file_gz(struct asfd *asfd,
-	const char *fname, const char *datapth, int quick_read,
-	unsigned long long *bytes, struct conf **confs,
-	int compression, FILE *fp)
+static int send_whole_file_gz(struct asfd *asfd,
+	const char *datapth, int quick_read,
+	uint64_t *bytes, struct cntr *cntr,
+	int compression, struct fzp *fzp)
 {
 	int ret=0;
 	int zret=0;
@@ -73,8 +73,6 @@ int send_whole_file_gz(struct asfd *asfd,
 
 	struct iobuf wbuf;
 
-//logp("send_whole_file_gz: %s%s\n", fname, extrameta?" (meta)":"");
-
 	/* allocate deflate state */
 	strm.zalloc = Z_NULL;
 	strm.zfree = Z_NULL;
@@ -85,7 +83,7 @@ int send_whole_file_gz(struct asfd *asfd,
 
 	do
 	{
-		strm.avail_in=fread(in, 1, ZCHUNK, fp);
+		strm.avail_in=fzp_read(fzp, in, ZCHUNK);
 		if(!compression && !strm.avail_in) break;
 
 		*bytes+=strm.avail_in;
@@ -129,7 +127,7 @@ int send_whole_file_gz(struct asfd *asfd,
 			if(quick_read && datapth)
 			{
 				int qr;
-				if((qr=do_quick_read(asfd, datapth, confs))<0)
+				if((qr=do_quick_read(asfd, datapth, cntr))<0)
 				{
 					ret=-1;
 					break;
@@ -168,7 +166,7 @@ cleanup:
 
 	if(!ret)
 	{
-		return write_endfile(asfd, *bytes);
+		return write_endfile(asfd, *bytes, NULL);
 	}
 //logp("end of send\n");
 	return ret;
@@ -202,43 +200,42 @@ void add_fd_to_sets(int fd, fd_set *read_set, fd_set *write_set, fd_set *err_set
 	if(fd > *max_fd) *max_fd = fd;
 }
 
-int set_peer_env_vars(int cfd)
-{
-// ARGH. Does not build on Windows.
 #ifndef HAVE_WIN32
-	int port=0;
-	socklen_t len;
+int get_address_and_port(struct sockaddr_storage *addr,
+	char *addrstr, size_t len, uint16_t *port)
+{
 	struct sockaddr_in *s4;
 	struct sockaddr_in6 *s6;
-	struct sockaddr_storage addr;
+
+	switch(addr->ss_family)
+	{
+		case AF_INET:
+			s4=(struct sockaddr_in *)addr;
+			inet_ntop(AF_INET, &s4->sin_addr, addrstr, len);
+			*port=ntohs(s4->sin_port);
+			break;
+		case AF_INET6:
+			s6=(struct sockaddr_in6 *)addr;
+			inet_ntop(AF_INET6, &s6->sin6_addr, addrstr, len);
+			*port=ntohs(s6->sin6_port);
+			break;
+		default:
+			logp("unknown addr.ss_family: %d\n", addr->ss_family);
+			return -1;
+	}
+	return 0;
+}
+#endif
+
+int set_peer_env_vars(struct sockaddr_storage *addr)
+{
+#ifndef HAVE_WIN32
+	uint16_t port=0;
 	char portstr[16]="";
 	char addrstr[INET6_ADDRSTRLEN]="";
 
-	len=sizeof(addr);
-	if(getpeername(cfd, (struct sockaddr*)&addr, &len))
-	{
-		logp("getpeername error: %s\n", strerror(errno));
+	if(get_address_and_port(addr, addrstr, INET6_ADDRSTRLEN, &port))
 		return -1;
-	}
-
-	switch(addr.ss_family)
-	{
-		case AF_INET:
-			s4=(struct sockaddr_in *)&addr;
-			inet_ntop(AF_INET,
-				&s4->sin_addr, addrstr, sizeof(addrstr));
-			port=ntohs(s4->sin_port);
-			break;
-		case AF_INET6:
-			s6=(struct sockaddr_in6 *)&addr;
-			inet_ntop(AF_INET6,
-				&s6->sin6_addr, addrstr, sizeof(addrstr));
-			port=ntohs(s6->sin6_port);
-			break;
-		default:
-			logp("unknown addr.ss_family: %d\n", addr.ss_family);
-			return -1;
-	}
 
 	if(setenv("REMOTE_ADDR",  addrstr, 1))
 	{
@@ -256,6 +253,19 @@ int set_peer_env_vars(int cfd)
 	return 0;
 }
 
+int set_keepalive(int fd, int value)
+{
+	int keepalive=value;
+	if(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
+		(char *)&keepalive, sizeof(keepalive)))
+	{
+		logp("setsockopt keepalive=%d failed: %s\n",
+			value, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 int init_client_socket(const char *host, const char *port)
 {
 	int rfd=-1;
@@ -270,6 +280,8 @@ int init_client_socket(const char *host, const char *port)
 	hints.ai_flags = 0;
 	hints.ai_protocol = 0;
 
+	logp("Connecting to %s:%s\n", host?host:"loopback", port);
+
 	if((gai_ret=getaddrinfo(host, port, &hints, &result)))
 	{
 		logp("getaddrinfo: %s\n", gai_strerror(gai_ret));
@@ -280,14 +292,15 @@ int init_client_socket(const char *host, const char *port)
 	{
 		rfd=socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if(rfd<0) continue;
+		set_keepalive(rfd, 1);
 		if(connect(rfd, rp->ai_addr, rp->ai_addrlen) != -1) break;
 		close_fd(&rfd);
 	}
 	freeaddrinfo(result);
 	if(!rp)
 	{
-		/* host==NULL and AI_PASSIVE not set -> loopback */
-		logp("could not connect to %s:%s\n",
+		// host==NULL and AI_PASSIVE not set -> loopback
+		logp("Could not connect to %s:%s\n",
 			host?host:"loopback", port);
 		close_fd(&rfd);
 		return -1;
@@ -322,25 +335,21 @@ void setup_signal(int sig, void handler(int sig))
 	sigaction(sig, &sa, NULL);
 }
 
-char *comp_level(struct conf **confs)
-{
-	static char comp[8]="";
-	snprintf(comp, sizeof(comp), "wb%d", get_int(confs[OPT_COMPRESSION]));
-	return comp;
-}
-
 /* Function based on src/lib/priv.c from bacula. */
-int chuser_and_or_chgrp(struct conf **confs)
+int chuser_and_or_chgrp(const char *user, const char *group, int readall)
 {
-#if defined(HAVE_PWD_H) && defined(HAVE_GRP_H)
-	char *user=get_string(confs[OPT_USER]);
-	char *group=get_string(confs[OPT_GROUP]);
+#ifdef HAVE_WIN32
+	return 0;
+#else
 	struct passwd *passw = NULL;
 	struct group *grp = NULL;
 	gid_t gid;
 	uid_t uid;
 	char *username=NULL;
 
+	// Allow setting readall=1 without setting user
+	if(readall && !user)
+		user="nobody";
 	if(!user && !group) return 0;
 
 	if(user)
@@ -373,22 +382,29 @@ int chuser_and_or_chgrp(struct conf **confs)
 		{
 			logp("could not find group '%s': %s\n", group,
 				strerror(errno));
-			free(username);
-			return -1;
+			goto err;
 		}
 		gid=grp->gr_gid;
+	} else {
+		// Resolve gid to group name for logp()
+		if (!(grp=getgrgid(gid)))
+		{
+			logp("could not find group for gid %d: %s\n", gid,
+				strerror(errno));
+			goto err;
+		}
+		group=grp->gr_name;
+		grp=NULL;
 	}
 	if(gid!=getgid() // do not do it if we already have the same gid.
 	  && initgroups(username, gid))
 	{
 		if(grp)
-			logp("could not initgroups for group '%s', user '%s': %s\n", group, user, strerror(errno));
+			logp("could not initgroups for group '%s', user '%s': %s\n", group, username, strerror(errno));
 		else
-			logp("could not initgroups for user '%s': %s\n", user, strerror(errno));
-		free(username);
-		return -1;
+			logp("could not initgroups for user '%s': %s\n", username, strerror(errno));
+		goto err;
 	}
-	free(username);
 	if(grp)
 	{
 		if(gid!=getgid() // do not do it if we already have the same gid
@@ -396,61 +412,54 @@ int chuser_and_or_chgrp(struct conf **confs)
 		{
 			logp("could not set group '%s': %s\n", group,
 				strerror(errno));
-			return -1;
+			goto err;
 		}
 	}
-	if(uid!=getuid() // do not do it if we already have the same uid
+	if (readall)
+	{
+#ifdef ENABLE_KEEP_READALL_CAPS_SUPPORT
+		cap_t caps;
+		// Make capabilities pass through setreuid
+		if(prctl(PR_SET_KEEPCAPS, 1))
+		{
+			logp("prctl(PR_SET_KEEPCAPS) failed: %s\n", strerror(errno));
+			goto err;
+		}
+		if(setreuid(uid, uid))
+		{
+			logp("Could not switch to user=%s (uid=%u): %s\n", username, uid, strerror(errno));
+			goto err;
+		}
+		// `ep' is Effective and Permitted
+		caps=cap_from_text("cap_dac_read_search=ep");
+		if(!caps)
+		{
+			logp("cap_from_text() failed: %s\n", strerror(errno));
+			goto err;
+		}
+		if(cap_set_proc(caps) < 0)
+		{
+			logp("cap_set_proc() failed: %s\n", strerror(errno));
+			goto err;
+		}
+		cap_free(caps);
+		logp("Privileges switched to %s keeping readall capability.\n", username);
+#else
+		logp("Keep readall capabilities is not implemented on this platform yet\n");
+		goto err;
+#endif
+	} else if(uid!=getuid() // do not do it if we already have the same uid
 	  && setuid(uid))
 	{
 		logp("could not set specified user '%s': %s\n", username,
 			strerror(errno));
-		return -1;
+		goto err;
 	}
-#endif
 	return 0;
-}
-
-const char *getdatestr(time_t t)
-{
-	static char buf[32]="";
-	const struct tm *ctm=NULL;
-
-	if(!t) return "never";
-
-	ctm=localtime(&t);
-
-	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", ctm);
-	return buf;
-}
-
-const char *time_taken(time_t d)
-{
-	static char str[32]="";
-	int seconds=0;
-	int minutes=0;
-	int hours=0;
-	int days=0;
-	char ss[4]="";
-	char ms[4]="";
-	char hs[4]="";
-	char ds[4]="";
-	seconds=d % 60;
-	minutes=(d/60) % 60;
-	hours=(d/60/60) % 24;
-	days=(d/60/60/24);
-	if(days)
-	{
-		snprintf(ds, sizeof(ds), "%02d:", days);
-		snprintf(hs, sizeof(hs), "%02d:", hours);
-	}
-	else if(hours)
-	{
-		snprintf(hs, sizeof(hs), "%02d:", hours);
-	}
-	snprintf(ms, sizeof(ms), "%02d:", minutes);
-	snprintf(ss, sizeof(ss), "%02d", seconds);
-	snprintf(str, sizeof(str), "%s%s%s%s", ds, hs, ms, ss);
-	return str;
+err:
+	free_w(&username);
+	return -1;
+#endif
 }
 
 // Not in dpth.c so that Windows client can see it.
@@ -481,45 +490,50 @@ long version_to_long(const char *version)
 	  || !(tok2=strtok(NULL, "."))
 	  || !(tok3=strtok(NULL, ".")))
 	{
-		free(copy);
+		free_w(&copy);
 		return -1;
 	}
 	ret+=atol(tok3);
 	ret+=atol(tok2)*100;
 	ret+=atol(tok1)*100*100;
-	free(copy);
+	free_w(&copy);
 	return ret;
 }
 
-/* These receive_a_file() and send_file() functions are for use by extra_comms
-   and the CA stuff, rather than backups/restores. */
-int receive_a_file(struct asfd *asfd, const char *path, struct conf **confs)
+/* These receive_a_file() and send_a_file() functions are for use by
+   extra_comms and the CA stuff, rather than backups/restores. */
+int receive_a_file(struct asfd *asfd, const char *path, struct cntr *cntr)
 {
 	int ret=-1;
-	BFILE *bfd=NULL;
-	unsigned long long rcvdbytes=0;
-	unsigned long long sentbytes=0;
+	struct BFILE *bfd=NULL;
+	uint64_t rcvdbytes=0;
+	uint64_t sentbytes=0;
 
 	if(!(bfd=bfile_alloc())) goto end;
-	bfile_init(bfd, 0, confs);
+	bfile_init(bfd, 0, cntr);
 #ifdef HAVE_WIN32
 	bfd->set_win32_api(bfd, 0);
+#else
+	bfd->set_vss_strip(bfd, 0);
 #endif
 	if(bfd->open(bfd, asfd, path,
+#ifdef O_NOFOLLOW
+		O_NOFOLLOW |
+#endif
 		O_WRONLY | O_CREAT | O_TRUNC | O_BINARY,
 		S_IRUSR | S_IWUSR))
 	{
-		berrno be;
+		struct berrno be;
 		berrno_init(&be);
 		logp("Could not open for writing %s: %s\n",
 			path, berrno_bstrerror(&be, errno));
 		goto end;
 	}
 
-	ret=transfer_gzfile_in(asfd, path, bfd, &rcvdbytes, &sentbytes, confs);
+	ret=transfer_gzfile_in(asfd, bfd, &rcvdbytes, &sentbytes);
 	if(bfd->close(bfd, asfd))
 	{
-		logp("error closing %s in receive_a_file\n", path);
+		logp("error closing %s in %s\n", path, __func__);
 		goto end;
 	}
 	logp("Received: %s\n", path);
@@ -533,79 +547,305 @@ end:
 /* Windows will use this function, when sending a certificate signing request.
    It is not using the Windows API stuff because it needs to arrive on the
    server side without any junk in it. */
-int send_a_file(struct asfd *asfd, const char *path, struct conf **confs)
+int send_a_file(struct asfd *asfd, const char *path, struct cntr *cntr)
 {
 	int ret=0;
-	FILE *fp=NULL;
-	unsigned long long bytes=0;
-	if(!(fp=open_file(path, "rb"))
-	  || send_whole_file_gz(asfd, path, "datapth", 0, &bytes,
-		confs, 9 /*compression*/, fp))
+	struct fzp *fzp=NULL;
+	uint64_t bytes=0;
+	if(!(fzp=fzp_open(path, "rb"))
+	  || send_whole_file_gz(asfd, "datapth", 0, &bytes,
+		cntr, 9 /*compression*/, fzp))
 	{
 		ret=-1;
 		goto end;
 	}
 	logp("Sent %s\n", path);
 end:
-	close_fp(&fp);
+	fzp_close(&fzp);
 	return ret;
-}
-
-static void get_fingerprint_from_str(const char *str, struct blk *blk)
-{
-	// FIX THIS.
-	char tmp[17]="";
-	snprintf(tmp, sizeof(tmp), "%s", str);
-	blk->fingerprint=strtoull(tmp, 0, 16);
-}
-
-static void get_fingerprint_and_md5sum(struct iobuf *iobuf, struct blk *blk)
-{
-	get_fingerprint_from_str(iobuf->buf, blk);
-	md5str_to_bytes(iobuf->buf+16, blk->md5sum);
-}
-
-int split_sig(struct iobuf *iobuf, struct blk *blk)
-{
-	if(iobuf->len!=CHECKSUM_LEN)
-	{
-		logp("Signature wrong length: %u!=%u\n",
-			iobuf->len, CHECKSUM_LEN);
-		return -1;
-	}
-	memcpy(&blk->fingerprint, iobuf->buf, FINGERPRINT_LEN);
-	memcpy(blk->md5sum, iobuf->buf+FINGERPRINT_LEN, MD5_DIGEST_LENGTH);
-	return 0;
-}
-	
-int split_sig_from_manifest(struct iobuf *iobuf, struct blk *blk)
-{
-	if(iobuf->len!=67)
-	{
-		logp("Signature with save_path wrong length: %u\n", iobuf->len);
-		logp("%s\n", iobuf->buf);
-		return -1;
-	}
-	get_fingerprint_and_md5sum(iobuf, blk);
-	savepathstr_to_bytes(iobuf->buf+48, blk->savepath);
-	return 0;
-}
-
-int get_fingerprint(struct iobuf *iobuf, struct blk *blk)
-{
-	if(iobuf->len!=16)
-	{
-		logp("Fingerprint wrong length: %u!=%u\n",
-			iobuf->len, FINGERPRINT_LEN);
-		return -1;
-	}
-	get_fingerprint_from_str(iobuf->buf, blk);
-	return 0;
 }
 
 int strncmp_w(const char *s1, const char *s2)
 {
 	return strncmp(s1, s2, strlen(s2));
+}
+
+char *strreplace_w(char *orig, char *search, char *replace, const char *func)
+{
+	char *result=NULL; // the return string
+	char *ins;         // the next insert point
+	char *tmp;         // varies
+	int len_rep;       // length of replace (the string to replace search with)
+	int len_search;    // length of search (the string to look for)
+	int len_front;     // distance between rep and end of last rep
+	int count;         // number of replacements
+
+	// sanity checks and initialization
+	if(!orig || !search) goto end;
+	len_search = strlen(search);
+	if(len_search==0)
+		goto end;
+	if(!replace)
+		len_rep=0;
+	else
+		len_rep=strlen(replace);
+
+	// count the number of replacements needed
+	ins=orig;
+	for(count=0; (tmp=strstr(ins, search)); ++count)
+		ins=tmp+len_search;
+
+	tmp=result=(char *)malloc_w(strlen(orig)+(len_rep-len_search)*count+1, func);
+
+	if(!result) goto end;
+
+	while(count--)
+	{
+		ins=strstr(orig, search);
+		len_front=ins-orig;
+		tmp=strncpy(tmp, orig, len_front)+len_front;
+		tmp=strcpy(tmp, replace)+len_rep;
+		orig+=len_front+len_search; // move to next "end of rep"
+	}
+	strcpy(tmp, orig);
+end:
+	return result;
+}
+
+static int charcount_noescaped(const char *orig, char search, int repeat)
+{
+	int count=0;
+	int len;
+	int i;
+	char quote='\0';
+	char prev='\0';
+	if(!orig) return count;
+	len=strlen(orig);
+	for(count=0, i=0; i<len; i++)
+	{
+		if(quote=='\0' && (orig[i]=='\'' || orig[i]=='"'))
+			quote=orig[i];
+		else if(quote!='\0' && orig[i]==quote)
+		{
+			// ignore escaped quote
+			if(i>0 && orig[i-1]=='\\')
+				goto loop_tail;
+			quote='\0';
+		}
+		else if(quote=='\0' && orig[i]==search)
+		{
+			// ignore escaped char
+			if(i>0 && orig[i-1]=='\\')
+				goto loop_tail;
+			if(repeat || prev!=orig[i])
+				count++;
+		}
+loop_tail:
+		prev=orig[i];
+	}
+	return count;
+}
+
+char *charreplace_noescaped_w(const char *orig, char search, const char *replace, int *count, const char *func)
+{
+	char *result=NULL;
+	char *tmp;
+	char quote='\0';
+	int nb_repl=0;  // number of replacement
+	int i;
+	int len;
+	int len_replace;
+	int len_dest;
+
+	if(!orig || !search) goto end;
+
+	len=strlen(orig);
+	len_replace=strlen(replace);
+
+	if(!(nb_repl=charcount_noescaped(orig, search, 1)))
+	{
+		result=strdup_w(orig, func);
+		goto end;
+	}
+
+	len_dest=len+((len_replace-1)*nb_repl)+1;
+	tmp=result=(char *)malloc_w(len_dest, func);
+	if(!result) goto end;
+
+	quote='\0';
+	for(i=0; i<len; i++)
+	{
+		if(quote=='\0' && (orig[i]=='\'' || orig[i]=='"'))
+			quote=orig[i];
+		else if(quote!='\0' && orig[i]==quote)
+		{
+			if(i<=0 || orig[i-1]!='\\')
+				quote='\0';
+		}
+		else if(quote=='\0' && orig[i]==search)
+		{
+			if(i<=0 || orig[i-1]!='\\')
+			{
+				tmp=(char *)memcpy(tmp, replace, len_replace);
+				tmp+=len_replace;
+				continue;
+			}
+		}
+		*tmp=orig[i];
+		tmp++;
+	}
+	*tmp='\0';
+end:
+	*count=nb_repl;
+	return result;
+}
+
+/*
+ * Returns NULL-terminated list of tokens found in string src,
+ * also sets *size to number of tokens found (list length without final NULL).
+ * On failure returns NULL. List itself and tokens are dynamically allocated.
+ * Calls to strtok with delimiters in second argument are used (see its docs),
+ * but neither src nor delimiters arguments are altered.
+ */
+char **strsplit_w(const char *src, const char *delimiters, size_t *size, const char *func)
+{
+	size_t allocated;
+	char *init=NULL;
+	char **ret=NULL;
+
+	*size=0;
+	if(!(init=strdup_w(src, func))) goto end;
+	if(!(ret=(char **)malloc_w((allocated=10)*sizeof(char *), func)))
+		goto end;
+	for(char *tmp=strtok(init, delimiters); tmp; tmp=strtok(NULL, delimiters))
+	{
+		// Check if space is present for another token and terminating NULL.
+		if(allocated<*size+2)
+		{
+			if(!(ret=(char **)realloc_w(ret,
+				(allocated=*size+11)*sizeof(char *), func)))
+					goto end;
+		}
+		if(!(ret[(*size)++]=strdup_w(tmp, func)))
+		{
+			ret=NULL;
+			goto end;
+		}
+	}
+	ret[*size]=NULL;
+
+end:
+	free_w(&init);
+	return ret;
+}
+
+static char *strip_whitespace_w(const char *src, const char *func)
+{
+	char *ret=NULL;
+	char *ptr=(char *)src;
+	int len=strlen(src);
+	int size;
+	if(*ptr!=' ' && ptr[len-1]!=' ')
+	{
+		if(!(ret=strdup_w(src, func))) goto end;
+		return ret;
+	}
+	for(; *ptr==' '; ptr++);
+	size=strlen(ptr);
+	for(; ptr[size-1]==' '; --size);
+	if(!(ret=(char *)malloc_w(size+2, func))) goto end;
+	ret=strncpy(ret, ptr, size);
+	ret[size]='\0';
+end:
+	return ret;
+}
+
+// same as strsplit_w except the delimiter is a single char and if the delimiter
+// is inside quotes or escaped with '\' it is ignored.
+char **charsplit_noescaped_w(const char *src, char delimiter, size_t *size, const char *func)
+{
+	char **ret=NULL;
+	char *ptr=NULL;
+	char *buf;
+	char *end;
+	char quote='\0';
+	char prev='\0';
+	int count;
+	int i, j, k;
+	int len;
+
+	if(!src) goto end;
+	ptr=strip_whitespace_w(src, func);
+	buf=ptr;
+	len=strlen(ptr);
+	if(!(count=charcount_noescaped(ptr, delimiter, 0)))
+		goto end;
+	// need one more space than the number of delimiters
+	count++;
+	if(!(ret=(char **)malloc_w((count+1)*sizeof(char *), func)))
+		goto error;
+	*size=(size_t)count;
+	for(i=0, j=0, k=0; i<len; i++)
+	{
+		if(quote=='\0' && (ptr[i]=='\'' || ptr[i]=='"'))
+			quote=ptr[i];
+		else if(quote!='\0' && ptr[i]==quote)
+		{
+			if(i<=0 || ptr[i-1]!='\\')
+				quote='\0';
+		}
+		else if(quote=='\0' && ptr[i]==delimiter)
+		{
+			if(i<=0 || ptr[i-1]!='\\')
+			{
+				if(prev==ptr[i])
+					buf++;
+				else
+				{
+					char *tmp;
+					int tmp_len=j+1;
+					if(k>0) buf++;
+					if(!(tmp=(char *)malloc_w(
+						tmp_len, func)))
+							goto error;
+					tmp=strncpy(tmp, buf, tmp_len);
+					tmp[tmp_len-1]='\0';
+					ret[k]=tmp;
+					buf+=j;
+					j=0;
+					k++;
+				}
+				goto loop_tail;
+			}
+		}
+		j++;
+loop_tail:
+		prev=ptr[i];
+	}
+	while(*buf==delimiter && *(buf-1)!='\\') buf++;
+	if(!(end=(char *)malloc_w(j+1, func)))
+		goto error;
+	end=strncpy(end, buf, j+1);
+	end[j]='\0';
+	ret[k]=end;
+	ret[k+1]=NULL;
+end:
+	free_w(&ptr);
+	return ret;
+error:
+	free_w(&ptr);
+	free_list_w(&ret, *size);
+	return NULL;
+}
+
+void free_list_w(char ***list, size_t size)
+{
+	char **l=*list;
+	if(!l) return;
+	size_t i;
+	for(i=0; i<size; i++)
+		if(l[i]) free_w(&l[i]);
+	free_v((void **)list);
 }
 
 // Strip any trailing slashes (unless it is '/').
@@ -624,10 +864,9 @@ void strip_trailing_slashes(char **str)
 	}
 }
 
-int breakpoint(struct conf **confs, const char *func)
+int breakpoint(int breakpoint, const char *func)
 {
-	logp("Breakpoint %d hit in %s\n",
-		get_int(confs[OPT_BREAKPOINT]), func);
+	logp("Breakpoint %d hit in %s\n", breakpoint, func);
 	return -1;
 }
 
@@ -639,3 +878,19 @@ void convert_backslashes(char **path)
 	for(p=*path; *p; p++) if(*p=='\\') *p='/';
 }
 #endif
+
+char *strlwr(char *s)
+{
+	char *tmp=s;
+	for(;*tmp;++tmp) *tmp=tolower((unsigned char)*tmp);
+	return s;
+}
+
+void strip_fqdn(char **fqdn)
+{
+	char *tmp;
+	if(!fqdn || !*fqdn)
+		return;
+	if((tmp=strchr(*fqdn, '.')))
+		*tmp='\0';
+}

@@ -1,7 +1,7 @@
 #include "burp.h"
 #include "cmd.h"
 
-static char *cmd_to_text(enum cmd cmd)
+char *cmd_to_text(enum cmd cmd)
 {
 	static char buf[256];
 	size_t len=sizeof(buf);
@@ -62,6 +62,8 @@ static char *cmd_to_text(enum cmd cmd)
 			snprintf(buf, len, "Path to a manifest"); break;
 		case CMD_FINGERPRINT:
 			snprintf(buf, len, "Fingerprint part of a signature"); break;
+		case CMD_SAVE_PATH:
+			snprintf(buf, len, "Save path part of a signature"); break;
 
 		// For the status server/client */
 
@@ -78,7 +80,7 @@ static char *cmd_to_text(enum cmd cmd)
 		case CMD_BYTES_SENT:
 			snprintf(buf, len, "Bytes sent"); break;
 
-		// Legacy.
+		// Protocol1 only.
 		case CMD_DATAPTH:
 			snprintf(buf, len, "Path to data on the server"); break;
 		case CMD_VSS:
@@ -89,6 +91,7 @@ static char *cmd_to_text(enum cmd cmd)
 			snprintf(buf, len, "Windows VSS footer"); break;
 		case CMD_ENC_VSS_T:
 			snprintf(buf, len, "Encrypted windows VSS footer"); break;
+
 		// No default so that we get compiler warnings when we forget
 		// to add new ones here.
 	}
@@ -112,11 +115,15 @@ int cmd_is_filedata(enum cmd cmd)
 		|| cmd==CMD_ENC_FILE
 		|| cmd==CMD_METADATA
 		|| cmd==CMD_ENC_METADATA
-		|| cmd==CMD_VSS
+		|| cmd==CMD_EFS_FILE;
+}
+
+int cmd_is_vssdata(enum cmd cmd)
+{
+	return     cmd==CMD_VSS
 		|| cmd==CMD_ENC_VSS
 		|| cmd==CMD_VSS_T
-		|| cmd==CMD_ENC_VSS_T
-		|| cmd==CMD_EFS_FILE;
+		|| cmd==CMD_ENC_VSS_T;
 }
 
 int cmd_is_link(enum cmd cmd)
@@ -131,9 +138,23 @@ int cmd_is_endfile(enum cmd cmd)
 
 int cmd_is_encrypted(enum cmd cmd)
 {
-	return cmd==CMD_ENC_FILE
-	 || cmd==CMD_ENC_METADATA
-	 || cmd==CMD_ENC_VSS
-	 || cmd==CMD_ENC_VSS_T
-	 || cmd==CMD_EFS_FILE;
+	return     cmd==CMD_ENC_FILE
+		|| cmd==CMD_ENC_METADATA
+		|| cmd==CMD_ENC_VSS
+		|| cmd==CMD_ENC_VSS_T
+		|| cmd==CMD_EFS_FILE;
+}
+
+int cmd_is_metadata(enum cmd cmd)
+{
+	return cmd_is_vssdata(cmd)
+		|| cmd==CMD_METADATA
+		|| cmd==CMD_ENC_METADATA;
+}
+
+int cmd_is_estimatable(enum cmd cmd)
+{
+	return     cmd==CMD_FILE
+		|| cmd==CMD_ENC_FILE
+		|| cmd==CMD_EFS_FILE;
 }
